@@ -4,6 +4,7 @@
 pub mod elevenlabs;
 pub mod openai_compat;
 pub mod openrouter;
+pub mod scribe_rt;
 pub mod whisper_local;
 
 use crate::AppState;
@@ -80,6 +81,12 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
             key: secrets::get(KeyName::Elevenlabs).ok_or_else(|| anyhow::anyhow!("Add an ElevenLabs API key first"))?,
             opts: st.elevenlabs.clone(),
         }),
+        // The live provider's batch path (Retry, the fallback after a failed socket): MAI, else Scribe v2 batch.
+        SttProvider::ElevenLabsRealtime => {
+            let mut b = s.clone();
+            b.stt.provider = batch_for_realtime(secrets::get(KeyName::Openrouter).is_some() && !st.openrouter_model.is_empty());
+            return build(&b, state);
+        }
     };
     if !st.local_fallback {
         return Ok(primary);
@@ -91,6 +98,29 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
         Some(ctx) => Box::new(WithFallback { primary, local: whisper_local::Whisper::new(ctx) }),
         None => primary,
     })
+}
+
+/// The batch STT behind Scribe Realtime: MAI when the OpenRouter key exists, else Scribe v2 batch (same key).
+pub fn batch_for_realtime(openrouter: bool) -> SttProvider {
+    if openrouter { SttProvider::OpenRouter } else { SttProvider::ElevenLabs }
+}
+
+/// The STT of voice-control commands: the explicit choice, else (auto) Scribe Realtime when the ElevenLabs key is
+/// saved, else the dictation provider.
+pub fn command_provider(s: &Settings, elevenlabs_key: bool) -> SttProvider {
+    match &s.command.stt {
+        Some(p) => p.clone(),
+        None if elevenlabs_key => SttProvider::ElevenLabsRealtime,
+        None => s.stt.provider.clone(),
+    }
+}
+
+/// The realtime session options, or None when the ElevenLabs key is missing. `keyterms`: dictionary words
+/// (commands always send them, vc-feedback 18a; dictation follows the Send keyterms toggle).
+pub fn realtime_opts(s: &Settings, rate: u32, hints: &Hints, keyterms: bool) -> Option<scribe_rt::Opts> {
+    let key = secrets::get(KeyName::Elevenlabs)?;
+    let keyterms = if keyterms { crate::dictionary::keyterms(hints, 50) } else { vec![] };
+    Some(scribe_rt::Opts { url: scribe_rt::URL.into(), key, rate, language: Some(s.language.clone()), keyterms })
 }
 
 struct WithFallback {
@@ -245,6 +275,10 @@ fn run_test(app: &AppHandle, which: &str) -> anyhow::Result<String> {
     let state = app.state::<AppState>();
     let mut s = state.settings.read().unwrap().clone();
     match which {
+        "stt" if s.stt.provider == SttProvider::ElevenLabsRealtime => {
+            let o = realtime_opts(&s, 16000, &Hints::default(), false).ok_or_else(|| anyhow::anyhow!("Add an ElevenLabs API key first"))?;
+            Ok(scribe_rt::transcribe(o, &jfk(), false, Duration::from_secs(20))?.0)
+        }
         "stt" => {
             s.stt.local_fallback = false; // test the provider itself
             let t = build(&s, &state)?;

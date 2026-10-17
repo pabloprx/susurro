@@ -46,15 +46,15 @@ let settings: C.Settings = {
     local_model: "",
     timeout_ms: 8000,
   },
-  styles: { style: "casual", raw_apps: fresh ? [] : ["com.todesktop.230313mzl4w4u92", "com.apple.Terminal"] },
+  styles: { style: "casual", raw_apps: fresh ? [] : ["com.todesktop.230313mzl4w4u92", "com.apple.Terminal"], strip_inverted: true, inverted_apps: [] },
   dictionary: { fuzzy: true },
   spoken_punctuation: true,
-  paste: { restore_clipboard: true, restore_delay_ms: 350, press_enter_command: false },
+  paste: { restore_clipboard: true, restore_delay_ms: 350, press_enter_command: true },
   recording: { max_seconds: 600, sounds: true },
   overlay: { show_idle: true },
   privacy: { store_history: true, store_audio: true, audio_retention_days: 14 },
   autostart: false,
-  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-oss-120b" },
+  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-oss-120b", stt: null },
 };
 
 let pillRect: C.PtRect | null = null;
@@ -840,7 +840,7 @@ async function command(instruction = "open my DM with Ana", risky = false) {
 }
 
 // ---------------- voice control v2: live session (VOICE_CONTROL_V2 1, 3) ----------------
-const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, last_said: "" };
+const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, paused: false, last_said: "" };
 let liveNow: C.LiveState = LIVE_OFF;
 const live = (p: Partial<C.LiveState>) => mockEmit("command_live", (liveNow = { ...liveNow, on: true, ...p }));
 const ago = (ms: number) => T0 - ms;
@@ -882,7 +882,7 @@ const LIVE_STATES: Record<string, { live: Partial<C.LiveState>; step?: C.Command
     step: cmd("pick", { instruction: "open the second channel", op: "click", action: "click", marks: MARKS, target: 20, choices: [[20, 0.56], [19, 0.31], [18, 0.08]], order: 1 }),
   },
   "live-paused": {
-    live: { queue: ["paste"], took_over: true, last_said: "and paste it in the search box" },
+    live: { queue: ["paste"], took_over: true, paused: true, last_said: "and paste it in the search box" },
     step: cmd("done", { instruction: "copy the link", op: "copy", action: "copy", marks: MARKS, target: 32, order: 1 }),
   },
 };
@@ -1074,7 +1074,7 @@ if (inBrowser) Object.assign(window, {
     /** Voice control v2: a scripted live session; live(patch) emits command_live; takeOver() = Pablo moved the mouse. */
     liveSession,
     live,
-    takeOver: () => live({ took_over: true }),
+    takeOver: () => live({ took_over: true, paused: true }),
     recents: openRecents,
     /** How many listeners an event has (tests wait for the page to subscribe before they emit). */
     listens: (event: string) => listeners.get(event)?.size ?? 0,

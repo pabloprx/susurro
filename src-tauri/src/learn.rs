@@ -151,6 +151,31 @@ pub fn entry_for(s: &Suggestion, entries: &[DictEntry]) -> DictEntryInput {
     }
 }
 
+/// Pure: the entry that makes `heard` a correction of `word` (voice correct_word). None = the dictionary has it already.
+/// Err = not learned: one of the 300 most frequent words as the heard form ("the" -> "Jev") would rewrite every dictation.
+pub fn correction_for(word: &str, heard: &str, entries: &[DictEntry]) -> Result<Option<DictEntryInput>, String> {
+    let (wk, hk) = (key(word), key(heard));
+    let has = entries.iter().any(|e| e.kind == DictKind::Word && key(&e.text) == wk && (wk == hk || e.aliases.iter().any(|a| key(a) == hk)));
+    if has {
+        return Ok(None);
+    }
+    if heard.split_whitespace().all(|w| dictionary::is_top(&norm(bare(w)), 300)) {
+        return Err(format!("\"{heard}\" is a common word, so it stays out of the dictionary"));
+    }
+    Ok(Some(entry_for(&Suggestion { word: word.into(), heard: heard.into() }, entries)))
+}
+
+/// Voice correction: saves `heard` as a correction of `word` (a new word if needed).
+pub fn add_correction(app: &AppHandle, word: &str, heard: &str) -> Result<(), String> {
+    let state = app.state::<crate::AppState>();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let entries = dictionary::load(&db).map_err(|e| e.to_string())?;
+    match correction_for(word, heard, &entries)? {
+        Some(e) => dictionary::upsert(&db, &e).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
 /// Pure: the part of `now` that holds what was `base[start..end]` (the pasted span), by trimming the
 /// common prefix and suffix. Edits outside the span widen it with extra words; the diff treats them as inserts.
 pub fn current_span(base: &str, start: usize, end: usize, now: &str) -> String {
@@ -311,6 +336,19 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correction_for_adds_once() {
+        let e = |id, text: &str, aliases: &[&str]| DictEntry { id, kind: DictKind::Word, text: text.into(), aliases: aliases.iter().map(|a| a.to_string()).collect(), expansion: None, exact_only: false, starred: false, uses: 0, created_at: id };
+        let es = vec![e(1, "Jev", &[]), e(2, "Contaflow", &["conta flow"])];
+        let got = correction_for("Jev", "Jeff", &es).unwrap().unwrap();
+        assert_eq!((got.id, got.aliases.as_slice()), (Some(1), &["Jeff".to_string()][..]), "the seeded word gets the correction");
+        assert_eq!(correction_for("Contaflow", "conta flow", &es), Ok(None), "already known");
+        assert!(correction_for("Jev", "the", &es).is_err() && correction_for("Jev", "es", &es).is_err(), "a common word is never learned");
+        let new = correction_for("TypeSafe", "type safe", &es).unwrap().unwrap();
+        assert_eq!((new.id, new.text.as_str()), (None, "TypeSafe"));
+        assert!(dictionary::validate(&got, &es).is_ok());
+    }
 
     fn s(word: &str, heard: &str) -> Suggestion {
         Suggestion { word: word.into(), heard: heard.into() }

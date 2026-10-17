@@ -83,7 +83,7 @@ function viewOf(s: SessionState, step: Step | null, live: LiveState | null): Vie
   if (isLive(live)) {
     if (isPick(live.pending) || step?.status === "pick") return "cmd-pick";
     if (live.pending || step?.status === "confirm") return "cmd-confirm";
-    if (live.took_over) return "cmd-paused";
+    if (live.paused) return "cmd-paused";
     if (live.buffer.trim()) return "cmd-live";
     if (step && CMD_LIVE[step.status]) return CMD_LIVE[step.status]!;
     return "cmd-listening";

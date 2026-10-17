@@ -40,6 +40,10 @@ pub struct Opts<'a> {
     /// Raw app: no LLM, no style rules, corrections kept.
     pub raw_app: bool,
     pub press_enter_command: bool,
+    /// Drop ¿ ¡ (Styles.strip_inverted, unless the app is in Styles.inverted_apps).
+    pub strip_inverted: bool,
+    /// Some = the app takes slash commands at the start of a dictation (terminals, Claude): the known names.
+    pub slash: Option<&'a [String]>,
 }
 
 pub type Stt<'a> = &'a dyn Fn(&SttRequest) -> anyhow::Result<SttOutput>;
@@ -69,15 +73,28 @@ pub fn run(clip: &Clip, o: &Opts, d: &Dictionary, stt: Stt, clean: Cleaner) -> O
             (raw, done.press_enter) = (t, true);
         }
     }
-    if o.raw_app {
-        let a = d.apply(&raw);
+    // "slash compact keep the tests" -> "/compact" + the rest, which is cleaned like any dictation.
+    let (cmd, mut body) = match o.slash.and_then(|names| crate::slash::split(&raw, names)) {
+        Some((c, r)) => (Some(c), r),
+        None => (None, raw.clone()),
+    };
+    if o.strip_inverted {
+        body = text::strip_inverted(&body);
+    }
+    if body.trim().is_empty() {
+        done.final_text = String::new();
+    } else if o.raw_app {
+        let a = d.apply(&body);
         done.used = a.matches.iter().map(|m| m.entry_id).collect();
         done.final_text = a.text;
     } else {
-        let p = d.prepare(&raw);
+        let p = d.prepare(&body);
         // Backtrack and style rules run on the placeholder text: a snippet expansion is pasted as typed.
-        let style = |t: &str| text::style_rules(t, o.style.clone(), &hints.terms);
-        let no_llm = || Dictionary::expand(&style(&text::backtrack_rules(&p.text)), &p.slots).map_or_else(|| d.apply(&raw).text, |(t, _)| t);
+        let style = |t: &str| {
+            let t = text::style_rules(t, o.style.clone(), &hints.terms);
+            if o.strip_inverted { text::strip_inverted(&t) } else { t }
+        };
+        let no_llm = || Dictionary::expand(&style(&text::backtrack_rules(&p.text)), &p.slots).map_or_else(|| d.apply(&body).text, |(t, _)| t);
         let llm = if p.standalone { None } else { clean.map(|c| c(&p.text, &hints)) };
         done.used = p.used.clone();
         match llm {
@@ -99,6 +116,9 @@ pub fn run(clip: &Clip, o: &Opts, d: &Dictionary, stt: Stt, clean: Cleaner) -> O
             }
             None => done.final_text = no_llm(),
         }
+    }
+    if let Some(c) = cmd {
+        done.final_text = crate::slash::join(&c, &done.final_text);
     }
     if done.final_text.trim().is_empty() && !done.press_enter {
         return Outcome::Skip(Some("Heard nothing".into()));
@@ -144,7 +164,7 @@ mod tests {
     }
 
     fn opts() -> Opts<'static> {
-        Opts { language: None, style: Style::Formal, raw_app: false, press_enter_command: true }
+        Opts { language: None, style: Style::Formal, raw_app: false, press_enter_command: true, strip_inverted: true, slash: None }
     }
 
     fn says(t: &'static str) -> impl Fn(&SttRequest) -> anyhow::Result<SttOutput> {
@@ -247,6 +267,66 @@ mod tests {
         let d = text_of(run(&clip(0.5, 1000), &opts(), &dict(), &stt, None));
         assert_eq!(d.notes, vec!["Used local whisper: 503".to_string()]);
         assert!(d.fell_back, "the History label reads the flag, not the note text");
+    }
+
+    // ---------- next-queue 2, 3, 6, 7, 8: one table, EN/ES ----------
+
+    fn seeded() -> Dictionary {
+        let es = crate::dictionary::SEEDS
+            .iter()
+            .enumerate()
+            .map(|(i, (t, a))| DictEntry { id: i as i64 + 1, kind: DictKind::Word, text: t.to_string(), aliases: a.iter().map(|x| x.to_string()).collect(), expansion: None, exact_only: false, starred: false, uses: 0, created_at: i as i64 })
+            .collect();
+        Dictionary::new(es, DictOpts::default())
+    }
+
+    #[test]
+    fn text_rules_table() {
+        let names: Vec<String> = ["compact", "review", "btw", "ponytail-review", "ponytail", "lights-out"].map(String::from).to_vec();
+        let term = Some(names.as_slice());
+        // (STT text, style, slash names, press enter, final text)
+        let cases: &[(&str, Style, Option<&[String]>, bool, &str)] = &[
+            // 3: press enter at the end only
+            ("Run the tests, presenter.", Style::Formal, None, true, "Run the tests"),
+            ("The TV presenter said hello.", Style::Formal, None, false, "The TV presenter said hello."),
+            ("Nos vemos, dale enter.", Style::Formal, None, true, "Nos vemos"),
+            // 6: ¿ ¡ dropped
+            ("¿cómo estás?", Style::Formal, None, false, "cómo estás?"),
+            ("Hola, ¡qué bueno verte!", Style::Formal, None, false, "Hola, qué bueno verte!"),
+            // 7: slang and its spoken forms
+            ("Jajaja equis de", Style::Formal, None, false, "jajaja xd"),
+            ("Me salió seis siete", Style::Formal, None, false, "Me salió 67"),
+            ("That is six seven lol", Style::Formal, None, false, "That is 67 lol"),
+            ("Cachai bro, w t f", Style::Formal, None, false, "cachai bro, wtf"),
+            // 2: lowercase keeps periods, commas and dictionary casing
+            ("Hola. Le escribí a OpenRouter, a Jev y a Contaflow.", Style::Lowercase, None, false, "hola. le escribí a OpenRouter, a Jev y a Contaflow."),
+            ("I use Ghostty. It is fast.", Style::Lowercase, None, false, "i use Ghostty. it is fast."),
+            // 8: slash commands at the start, in a terminal only
+            ("By the way, what does this do?", Style::Formal, term, false, "/btw what does this do?"),
+            ("I said by the way that it works.", Style::Formal, term, false, "I said by the way that it works."),
+            ("By the way, what does this do?", Style::Formal, None, false, "By the way, what does this do?"),
+            ("Por cierto, ¿esto compila?", Style::Formal, term, false, "/btw esto compila?"),
+            ("Slash ponytail review", Style::Formal, term, false, "/ponytail-review"),
+            ("slash compact, keep the tests. press enter", Style::Formal, term, true, "/compact keep the tests."),
+            ("Slash deploy staging", Style::Formal, term, false, "/deploy-staging"),
+            ("Slash review the diff.", Style::Lowercase, term, false, "/review the diff."),
+        ];
+        for (input, style, slash, enter, want) in cases {
+            let o = Opts { style: style.clone(), slash: *slash, ..opts() };
+            let d = text_of(run(&clip(0.5, 1000), &o, &seeded(), &says(input), None));
+            assert_eq!((d.final_text.as_str(), d.press_enter), (*want, *enter), "input: {input:?}");
+        }
+        // inverted marks kept when asked (an exception app)
+        let o = Opts { strip_inverted: false, ..opts() };
+        assert_eq!(text_of(run(&clip(0.5, 1000), &o, &seeded(), &says("¿cómo estás?"), None)).final_text, "¿cómo estás?");
+        // the LLM sees only the words after the command, and its ¿ is dropped
+        let clean = |t: &str, _: &Hints| -> anyhow::Result<String> {
+            assert_eq!(t, "what changed?");
+            Ok("¿What changed?".into())
+        };
+        let o = Opts { slash: term, ..opts() };
+        let d = text_of(run(&clip(0.5, 1000), &o, &seeded(), &says("By the way what changed?"), Some(&clean)));
+        assert_eq!(d.final_text, "/btw What changed?");
     }
 
     // ---------- adversarial (2026-10-17 review) ----------

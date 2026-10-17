@@ -81,6 +81,9 @@ pub fn command_log() -> Vec<CommandStep> {
 // ---------- abort / confirm / pick (session.rs and live.rs set these) ----------
 
 static ABORT: AtomicBool = AtomicBool::new(false);
+/// The live session number. A Real desk of an older session (Esc left its thread in a Jev call) is aborted for
+/// good once a new session starts, even though `reset` clears ABORT.
+static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CONFIRMED: AtomicBool = AtomicBool::new(false);
 static DENIED: AtomicBool = AtomicBool::new(false);
 /// 0 = not waiting, 1 = confirm, 2 = pick.
@@ -112,6 +115,7 @@ pub fn aborted() -> bool {
 
 /// A new live session: no abort, no answer pending.
 pub fn reset() {
+    GEN.fetch_add(1, Ordering::SeqCst);
     for f in [&ABORT, &CONFIRMED, &DENIED] {
         f.store(false, Ordering::SeqCst);
     }
@@ -218,6 +222,53 @@ pub fn parse_pick(text: &str, choices: &[(u32, f32)], ids: &[u32]) -> Option<u32
     }
     let n = words.iter().find_map(|w| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1))?;
     ids.contains(&n).then_some(n)
+}
+
+/// The pick list of a "Which one? 4 #general · 7 #design" question: (mark id, name).
+pub fn pick_options(question: &str) -> Vec<(u32, String)> {
+    let list = question.split_once('?').map_or(question, |(_, r)| r);
+    list.split('·')
+        .filter_map(|o| {
+            let (id, name) = o.trim().split_once(' ').unwrap_or((o.trim(), ""));
+            Some((id.parse().ok()?, name.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Words that carry no choice: "the second one", "la del medio", "number 4".
+const PICK_FILLER: [&str; 16] = ["the", "one", "el", "la", "lo", "los", "las", "de", "del", "number", "número", "numero", "please", "por", "favor", "that"];
+
+/// A name of a shown option in `text` (or `text` inside one name), when exactly one option fits.
+pub fn pick_by_name(text: &str, options: &[(u32, String)]) -> Option<u32> {
+    let n = crate::text::norm(text);
+    let said: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty() && !PICK_FILLER.contains(w)).collect();
+    if said.is_empty() {
+        return None;
+    }
+    let said = said.join(" ");
+    let fits: Vec<u32> = options
+        .iter()
+        .filter(|(_, name)| {
+            let name = crate::text::norm(name).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+            name.chars().count() >= 3 && (said.contains(&name) || (said.chars().count() >= 3 && name.contains(&said)))
+        })
+        .map(|o| o.0)
+        .collect();
+    (fits.len() == 1).then(|| fits[0])
+}
+
+/// The spoken text answers "Which one?" (open risk c): at most 5 words and a number, an ordinal or a shown name.
+/// A full new order ("open a new tab and type hello") is not a pick: the planner gets it.
+/// ponytail: a short order with a number ("type 5") still counts as a pick; add a verb check if that bites.
+pub fn looks_like_pick(text: &str, question: &str) -> bool {
+    let l = text.to_lowercase();
+    let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() || words.len() > 5 {
+        return false;
+    }
+    let ord = ["first", "primer", "second", "segund", "third", "tercer", "last", "últim", "ultim"];
+    let number = |w: &str| w.parse::<u32>().is_ok() || NUMBERS.iter().any(|(s, _)| *s == w);
+    words.iter().any(|w| number(w) || ord.iter().any(|o| w.starts_with(o))) || pick_by_name(text, &pick_options(question)).is_some()
 }
 
 /// The text of "type hello in the search field", "write 'meet in the lobby'", "busca gatos".
@@ -451,6 +502,10 @@ pub trait Desk {
     fn sleep(&mut self, ms: u64);
     fn wait(&mut self, w: Wait, timeout: Duration) -> Answer;
     fn aborted(&self) -> bool;
+    /// correct_word: add `heard` as a correction of the dictionary word `word`. Err = not saved (the reason).
+    fn learn_word(&mut self, _word: &str, _heard: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct Cfg {
@@ -627,7 +682,7 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
             desk.emit(&r.st);
             let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
             id = match desk.wait(Wait::Pick, PICK_TIMEOUT) {
-                Answer::Text(t) => match parse_pick(&t, &r.st.choices, &ids) {
+                Answer::Text(t) => match parse_pick(&t, &r.st.choices, &ids).or_else(|| pick_by_name(&t, &pick_options(r.st.message.as_deref().unwrap_or("")))) {
                     Some(id) => Some(id),
                     None => return Err(r.fail(desk, CmdStatus::Unsure, "Didn't catch a number. Say it again.")),
                 },
@@ -871,7 +926,107 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             }
             r.done(desk, format!("scrolled {}", if down { "down" } else { "up" }))
         }
+        "correct_word" => correct_word(&mut r, target, &text, desk, mem),
         op => r.fail(desk, CmdStatus::Unsure, &format!("Unknown action {op}")),
+    }
+}
+
+/// Spoken letter names, ES and EN ("jota e ve", "jay ee vee"). Single letters ("e", "a") pass as themselves.
+const LETTER_NAMES: &[(&str, &str)] = &[
+    ("be bee", "b"), ("ce cee see", "c"), ("de dee", "d"), ("efe ef", "f"), ("ge gee", "g"), ("hache aitch", "h"),
+    ("jota jay", "j"), ("ka kay", "k"), ("ele el", "l"), ("eme em", "m"), ("ene en", "n"), ("pe pee", "p"),
+    ("cu cue", "q"), ("erre ar", "r"), ("ese ess", "s"), ("te tee", "t"), ("uve ve vee", "v"), ("equis ex", "x"),
+    ("ye why", "y"), ("zeta zed zee", "z"), ("ee", "e"),
+];
+
+/// Spelled letters win (next-queue 4): "J E V" / "J-E-V" / "j. e. v." -> "Jev". Anything else stays as written.
+pub fn spelled(said: &str) -> String {
+    let parts: Vec<&str> = said.split(|c: char| c.is_whitespace() || c == '-' || c == '.' || c == ',').filter(|p| !p.is_empty()).collect();
+    let letter = |p: &str| -> Option<String> {
+        if p.chars().count() == 1 && p.chars().all(char::is_alphabetic) {
+            return Some(p.to_string());
+        }
+        let n = crate::text::norm(p);
+        LETTER_NAMES.iter().find(|(names, _)| names.split(' ').any(|x| x == n)).map(|(_, l)| l.to_string())
+    };
+    let letters: Option<Vec<String>> = parts.iter().map(|p| letter(p)).collect();
+    let Some(letters) = letters.filter(|l| l.len() >= 2) else {
+        return said.trim().to_string();
+    };
+    let w: String = letters.concat();
+    // All one case = a name: "Jev". Mixed case was spelled on purpose: "T y p e S a f e" -> "TypeSafe".
+    if w.chars().all(char::is_uppercase) || w.chars().all(char::is_lowercase) {
+        let mut cs = w.chars();
+        cs.next().map(|c| c.to_uppercase().chain(cs.flat_map(char::to_lowercase)).collect()).unwrap_or_default()
+    } else {
+        w
+    }
+}
+
+/// UTF-16 (start, len) of the last whole-word `word` in `value` (case and accents ignored) that ends at or before
+/// the caret, else the last one.
+pub fn find_word(value: &str, word: &str, caret: Option<usize>) -> Option<(usize, usize)> {
+    let want = crate::text::norm(word.trim());
+    let n = word.trim().chars().count();
+    if want.is_empty() {
+        return None;
+    }
+    let idx: Vec<(usize, char)> = value.char_indices().collect();
+    let mut hits = vec![];
+    for k in 0..idx.len() {
+        let (start, _) = idx[k];
+        let end = idx.get(k + n).map_or(value.len(), |e| e.0);
+        if k + n > idx.len() || crate::text::norm(&value[start..end]) != want {
+            continue;
+        }
+        let wordc = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        if wordc(value[..start].chars().next_back()) || wordc(value[end..].chars().next()) {
+            continue;
+        }
+        let u = |b: usize| value[..b].encode_utf16().count();
+        hits.push((u(start), u(end) - u(start)));
+    }
+    let before = caret.and_then(|c| hits.iter().rev().find(|(s, l)| s + l <= c));
+    before.or(hits.last()).copied()
+}
+
+/// correct_word (next-queue 4): "corrige: Jeff es Jev, J E V". The dictionary learns it first, so it sticks even when
+/// the field cannot be read; then the last "Jeff" before the caret in the focused field becomes "Jev".
+fn correct_word(r: &mut Run, heard: Option<&str>, said: &str, desk: &mut dyn Desk, mem: &mut Memory) -> End {
+    r.st.action = Some("correct_word".into());
+    let word = spelled(said);
+    let Some(heard) = heard.filter(|h| !word.is_empty() && crate::text::norm(h) != crate::text::norm(&word)) else {
+        return r.fail(desk, CmdStatus::Unsure, "Which word, and how is it spelled? Say it again.");
+    };
+    r.st.detail = Some(format!("{heard} → {word}"));
+    let learned = desk.learn_word(&word, heard);
+    if let Err(e) = &learned {
+        log::warn!("correct_word: dictionary not updated: {e}");
+    }
+    let f = desk.focused();
+    if f.secure || desk.secure_input() {
+        return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+    }
+    if desk.aborted() {
+        return r.end(desk, CmdStatus::Stopped, None, String::new());
+    }
+    let summary = format!("fixed {} → {}", quote(heard), quote(&word));
+    let span = f.value.as_deref().and_then(|v| find_word(v, heard, f.sel.map(|s| s.0 + s.1)));
+    if span.is_some_and(|(s, l)| desk.set_selection(s, l)) {
+        let typed = match desk.type_text(&word) {
+            Ok(t) => t,
+            Err(e) => return r.fail(desk, CmdStatus::Error, &format!("{e:#}")),
+        };
+        let after = desk.focused();
+        remember(mem, MemKind::Typed, &typed, &after, after.value.clone());
+        return match learned {
+            Ok(()) => r.done(desk, summary),
+            Err(e) => r.end(desk, CmdStatus::Done, Some(&format!("Fixed here, but not saved to the dictionary: {e}")), summary),
+        };
+    }
+    match learned {
+        Ok(()) => r.end(desk, CmdStatus::Done, Some(&format!("Can't fix {} in this field. {word} is in your dictionary now.", quote(heard))), summary),
+        Err(e) => r.fail(desk, CmdStatus::Unsure, &format!("Can't find {} here, and the dictionary said: {e}", quote(heard))),
     }
 }
 
@@ -1083,11 +1238,13 @@ pub mod mac {
         els: Vec<El>,
         /// The focused element of the last `focused()` (set_selection acts on it).
         focus: Option<CFType>,
+        /// The live session this desk belongs to.
+        generation: u64,
     }
 
     impl Real {
         pub fn new(app: AppHandle) -> Self {
-            Self { app, handles: vec![], els: vec![], focus: None }
+            Self { app, handles: vec![], els: vec![], focus: None, generation: GEN.load(Ordering::SeqCst) }
         }
 
         fn point(&self, t: &Target) -> Option<(f64, f64)> {
@@ -1145,6 +1302,10 @@ pub mod mac {
     }
 
     impl Desk for Real {
+        fn learn_word(&mut self, word: &str, heard: &str) -> Result<(), String> {
+            crate::learn::add_correction(&self.app, word, heard)
+        }
+
         fn read(&mut self) -> Result<Screen, String> {
             if !crate::permissions::accessibility_trusted() {
                 return Err("accessibility".into());
@@ -1269,7 +1430,7 @@ pub mod mac {
         }
 
         fn aborted(&self) -> bool {
-            ABORT.load(Ordering::SeqCst)
+            ABORT.load(Ordering::SeqCst) || GEN.load(Ordering::SeqCst) != self.generation
         }
     }
 }
@@ -1322,6 +1483,17 @@ mod tests {
         assert_eq!(parse_pick("el tercero", &choices, &ids), Some(18));
         assert_eq!(parse_pick("dos", &choices, &ids), Some(2));
         assert_eq!(parse_pick("99", &choices, &ids), None, "not a mark");
+        // names of the shown options (open risk c)
+        let q = "Which one? 4 #general · 7 #design · 9 #random-stuff";
+        let opts = pick_options(q);
+        assert_eq!(opts, [(4, "#general".into()), (7, "#design".into()), (9, "#random-stuff".into())]);
+        assert_eq!(pick_by_name("the design one", &opts), Some(7));
+        assert_eq!(pick_by_name("Random stuff.", &opts), Some(9));
+        assert_eq!(pick_by_name("ra", &opts), None, "too short to name one");
+        assert_eq!(pick_by_name("type hello", &opts), None);
+        assert!(looks_like_pick("el tercero", q) && looks_like_pick("General.", q) && looks_like_pick("20", q));
+        assert!(!looks_like_pick("open slack and search for design reviews", q), "a full order");
+        assert!(!looks_like_pick("type hello", q));
         assert_eq!(parse_pick("never mind", &choices, &ids), None);
     }
 
@@ -1719,6 +1891,50 @@ mod tests {
         assert_eq!((d.tabs, d.typed.as_slice()), (1, &["ls".to_string()][..]));
         let orders: Vec<(u32, Option<String>)> = d.steps.iter().filter(|s| s.status == CmdStatus::Done).map(|s| (s.step, s.op.clone())).collect();
         assert_eq!(orders, [(1, Some("key".into())), (2, Some("type".into())), (3, Some("key".into()))]);
+    }
+
+    fn fix(heard: &str, text: &str) -> Action {
+        Action { op: "correct_word".into(), target: Some(heard.into()), text: Some(text.into()), ..Default::default() }
+    }
+
+    #[test]
+    fn correct_word_fixes_the_last_heard_word_and_spelled_letters_win() {
+        assert_eq!(spelled("J E V"), "Jev");
+        assert_eq!(spelled("j-e-v"), "Jev");
+        assert_eq!(spelled("J. E. V."), "Jev");
+        assert_eq!(spelled("T y p e S a f e"), "TypeSafe");
+        assert_eq!(spelled("Jev"), "Jev");
+        assert_eq!(spelled("jota e ve"), "Jev");
+        assert_eq!(spelled("jay, ee, vee"), "Jev");
+        assert_eq!(spelled("de a ve"), "Dav");
+        assert_eq!(spelled("el modelo"), "el modelo", "not all letter names");
+        assert_eq!(spelled("Eleven Labs"), "Eleven Labs");
+        assert_eq!(find_word("Jeff dijo que jeff, no Jeffrey", "Jeff", None), Some((14, 4)));
+        assert_eq!(find_word("Jeff dijo que jeff", "jeff", Some(4)), Some((0, 4)), "the one before the caret");
+        assert_eq!(find_word("Jeffrey", "Jeff", None), None, "whole words only");
+        assert_eq!(find_word("Pérez y perez", "PEREZ", None), Some((8, 5)));
+        // "corrige: Jeff es Jev, J E V" after a dictation "Le pregunte a Jeff por el modelo."
+        let mut d = FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message", "Le pregunte a Jeff por el modelo.", None)], ..Default::default() };
+        d.fields[0].caret = d.fields[0].value.len();
+        let mut mem = Memory::new();
+        let e = run_all(&[fix("Jeff", "J E V")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.value(0), "Le pregunte a Jev por el modelo.");
+        assert_eq!(d.typed, ["Jev"]);
+        assert_eq!(e[0].summary, "fixed “Jeff” → “Jev”");
+        // not in the field: the dictionary still learns it, the step says so
+        let mut d = FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message", "nothing here", None)], ..Default::default() };
+        let e = run_all(&[fix("GAB", "Jev")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert!(e[0].message.as_deref().is_some_and(|m| m.contains("Jev is in your dictionary")), "{:?}", e[0].message);
+        assert!(d.typed.is_empty() && d.value(0) == "nothing here");
+        // the same word twice, or no word: ask again
+        let e = run_all(&[fix("Jev", "jev")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+        // a password field is never touched
+        let mut d = FakeDesk { app: "Safari".into(), fields: vec![FField { secure: true, ..FField::new("AXSecureTextField", "Password", "Jeff", None) }], ..Default::default() };
+        assert_eq!(statuses(&run_all(&[fix("Jeff", "Jev")], &mut d, &mut mem)), [CmdStatus::Blocked]);
+        assert!(d.typed.is_empty());
     }
 
     #[test]

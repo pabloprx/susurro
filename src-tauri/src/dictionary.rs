@@ -36,6 +36,11 @@ pub fn key(s: &str) -> String {
     tokenize(s).into_iter().map(|t| t.norm).collect::<Vec<_>>().join(" ")
 }
 
+/// One of the `n` most frequent words of either language (the lists are by frequency). A rare call: no cache.
+pub(crate) fn is_top(w: &str, n: usize) -> bool {
+    [include_str!("../data/common_en.txt"), include_str!("../data/common_es.txt")].iter().any(|f| f.lines().take(n).any(|l| text::norm(l) == w))
+}
+
 /// Top 5000 words per language, from hermitdave/FrequencyWords (OpenSubtitles 2018, MIT).
 pub(crate) fn is_common(w: &str) -> bool {
     static SET: OnceLock<HashSet<String>> = OnceLock::new();
@@ -564,6 +569,41 @@ pub fn record_uses(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
         conn.execute("UPDATE dict SET uses = uses + 1 WHERE id = ?1", [id])?;
     }
     Ok(())
+}
+
+/// Default words (next-queue 4, 7): the product names Pablo says and the slang he writes, with their spoken forms.
+/// `seed` adds them once (db v4), each only when nothing in the dictionary uses that text or correction yet.
+pub const SEEDS: &[(&str, &[&str])] = &[
+    ("Jev", &[]),
+    ("TypeSafe", &[]),
+    ("ElevenLabs", &[]),
+    ("OpenRouter", &[]),
+    ("Contaflow", &[]),
+    ("susurro", &[]),
+    ("Ghostty", &[]),
+    ("Claude", &[]),
+    ("xd", &["equis de", "x d"]),
+    ("67", &["six seven", "seis siete"]),
+    ("lol", &[]),
+    ("jaja", &[]),
+    ("jajaja", &[]),
+    ("wtf", &["w t f"]),
+    ("bro", &[]),
+    ("po", &[]),
+    ("cachai", &[]),
+];
+
+pub fn seed_input(text: &str, aliases: &[&str]) -> DictEntryInput {
+    DictEntryInput { id: None, kind: DictKind::Word, text: text.into(), aliases: aliases.iter().map(|a| a.to_string()).collect(), expansion: None, exact_only: false, starred: false }
+}
+
+/// Adds the SEEDS that do not clash with an entry (validate refuses a text or correction already in use).
+pub fn seed(conn: &Connection) {
+    for (text, aliases) in SEEDS {
+        if let Err(e) = upsert(conn, &seed_input(text, aliases)) {
+            log::info!("dictionary seed {text} skipped: {e}");
+        }
+    }
 }
 
 // ---------- commands ----------

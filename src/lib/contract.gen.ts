@@ -38,7 +38,12 @@ model: string,
  * The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
  * spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
  */
-planner_model: string, };
+planner_model: string, 
+/**
+ * The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
+ * "Latency"), else the dictation provider.
+ */
+stt: SttProvider | null, };
 
 /**
  * Payload of `command_step` (all windows) and a row of `command_log`.
@@ -187,6 +192,10 @@ pending: string | null,
  */
 took_over: boolean, 
 /**
+ * Pablo pressed a key or clicked: the queue waits (no more actions) until his next spoken order.
+ */
+paused: boolean, 
+/**
  * The last chunk of text heard.
  */
 last_said: string, };
@@ -274,7 +283,11 @@ export type PasteOpts = { restore_clipboard: boolean,
  * Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
  * 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
  */
-restore_delay_ms: number, press_enter_command: boolean, };
+restore_delay_ms: number, 
+/**
+ * "press enter" / "presenter" / "dale enter" / "enviar" at the end of a dictation: dropped, then Return.
+ */
+press_enter_command: boolean, };
 
 export type PermKind = "microphone" | "accessibility" | "input_monitoring" | "fn_key" | "screen_recording";
 
@@ -353,7 +366,7 @@ command: CommandSettings, };
 
 export type Stats = { words_total: number, words_7d: number, sessions_7d: number, wpm: number, minutes_saved: number, daily: Array<DayStat>, };
 
-export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter";
+export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter" | "elevenlabs_realtime";
 
 export type SttSettings = { provider: SttProvider, whisper_model: string, openai_compat: OpenAiCompat, elevenlabs: ElevenOpts, openrouter_model: string, 
 /**
@@ -365,12 +378,20 @@ local_fallback: boolean,
  */
 mai_clean: boolean, };
 
-export type Style = "formal" | "casual" | "very_casual" | "excited";
+export type Style = "formal" | "casual" | "very_casual" | "excited" | "lowercase";
 
 /**
  * One global style + bundle ids that get Raw (no LLM, no style rules, corrections kept).
  */
-export type Styles = { style: Style, raw_apps: Array<string>, };
+export type Styles = { style: Style, raw_apps: Array<string>, 
+/**
+ * Drop the Spanish opening marks ¿ ¡ (? and ! stay). Pablo does not write them when chatting.
+ */
+strip_inverted: boolean, 
+/**
+ * Bundle ids that keep ¿ ¡ even with `strip_inverted` on.
+ */
+inverted_apps: Array<string>, };
 
 export type Toast = { id: string, kind: ToastKind, text: string, actions: Array<ToastActionDef>, ttl_ms: number, };
 

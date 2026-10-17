@@ -731,11 +731,20 @@ pub struct Chunker {
 
 impl Chunker {
     pub fn new(rate: u32) -> Self {
-        Self { rate, seg: 0, read: 0, buf: vec![], db: vec![], start: 0, cuts: DICTATION }
+        Self::with_cuts(rate, DICTATION)
+    }
+
+    pub fn with_cuts(rate: u32, cuts: Cuts) -> Self {
+        Self { rate, seg: 0, read: 0, buf: vec![], db: vec![], start: 0, cuts }
     }
 
     /// Read the new samples of `rec`. Err = the device changed: drop the chunker (the whole clip goes single-shot).
     pub fn poll(&mut self, rec: &Recorder) -> Result<Option<Vec<f32>>, ()> {
+        self.poll_fresh(rec).map(|(_, c)| c)
+    }
+
+    /// `poll`, plus the new device-rate samples themselves (Scribe Realtime streams them as they come).
+    pub fn poll_fresh(&mut self, rec: &Recorder) -> Result<(Vec<f32>, Option<Vec<f32>>), ()> {
         let g = rec.cur.lock().unwrap();
         if rec.segments.len() != self.seg || rec.rate != self.rate {
             return Err(());
@@ -743,7 +752,13 @@ impl Chunker {
         let new = g[self.read.min(g.len())..].to_vec();
         drop(g);
         self.read += new.len();
-        Ok(self.push(&new))
+        let cut = self.push(&new);
+        Ok((new, cut))
+    }
+
+    /// The device rate of the samples `poll_fresh` returns.
+    pub fn rate(&self) -> u32 {
+        self.rate
     }
 
     /// Add device-rate samples. Some = a finished chunk, 16 kHz, worth transcribing.

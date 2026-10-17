@@ -21,6 +21,7 @@ pub mod planner;
 pub mod secrets;
 pub mod session;
 pub mod settings;
+pub mod slash;
 pub mod stt;
 #[cfg(debug_assertions)]
 pub mod test_hooks;

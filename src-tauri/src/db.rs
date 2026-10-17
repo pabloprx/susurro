@@ -18,7 +18,10 @@ CREATE TABLE dict(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL
 // v2: dict.created_at in ms like every other timestamp (v1 stored seconds).
 "UPDATE dict SET created_at = created_at * 1000 WHERE created_at < 100000000000;",
 // v3: voice command rows next to dictations.
-"ALTER TABLE history ADD COLUMN kind TEXT NOT NULL DEFAULT 'dictation';"];
+"ALTER TABLE history ADD COLUMN kind TEXT NOT NULL DEFAULT 'dictation';",
+// v4: default dictionary words; `dictionary::seed` runs right after this step.
+"SELECT 1;"];
+const SEED_STEP: usize = 3;
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -30,10 +33,11 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-/// In-memory DB with the full schema, for tests in any module.
+/// In-memory DB with the full schema and an empty dictionary (no seeds), for tests in any module.
 pub fn open_memory() -> anyhow::Result<Connection> {
     let conn = Connection::open_in_memory()?;
     migrate(&conn)?;
+    conn.execute("DELETE FROM dict", [])?;
     Ok(conn)
 }
 
@@ -41,6 +45,9 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(v as usize) {
         conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {}; COMMIT;", i + 1))?;
+        if i == SEED_STEP {
+            crate::dictionary::seed(conn);
+        }
     }
     Ok(())
 }
@@ -70,8 +77,29 @@ mod tests {
         c.execute_batch(&format!("{} PRAGMA user_version = 1;", MIGRATIONS[0])).unwrap();
         c.execute("INSERT INTO dict(kind,text,norm,created_at) VALUES('word','A','a',1760000000),('word','B','b',1760000000123)", []).unwrap();
         migrate(&c).unwrap();
-        let v: Vec<i64> = c.prepare("SELECT created_at FROM dict ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let v: Vec<i64> = c.prepare("SELECT created_at FROM dict WHERE text IN ('A', 'B') ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(v, [1760000000000, 1760000000123]);
+    }
+
+    #[test]
+    fn v4_seeds_only_absent_words_once() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("{} {} {} PRAGMA user_version = 3;", MIGRATIONS[0], MIGRATIONS[1], MIGRATIONS[2])).unwrap();
+        // Pablo's own Contaflow entry (other casing, a correction) and "x d" as a correction of something else.
+        c.execute("INSERT INTO dict(kind,text,norm,aliases,created_at) VALUES('word','ContaFlow','contaflow','[\"conta flow\"]',1),('word','XD!','xd','[]',2)", []).unwrap();
+        migrate(&c).unwrap();
+        let es = crate::dictionary::load(&c).unwrap();
+        let texts: Vec<&str> = es.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"ContaFlow") && !texts.contains(&"Contaflow"), "his entry stays: {texts:?}");
+        assert!(texts.contains(&"XD!") && !texts.contains(&"xd"), "{texts:?}");
+        for t in ["Jev", "TypeSafe", "ElevenLabs", "67", "cachai"] {
+            assert!(texts.contains(&t), "{t} seeded: {texts:?}");
+        }
+        assert_eq!(es.iter().find(|e| e.text == "67").unwrap().aliases, ["six seven", "seis siete"]);
+        // Deleted later = not seeded again.
+        c.execute("DELETE FROM dict WHERE text = 'Jev'", []).unwrap();
+        migrate(&c).unwrap();
+        assert!(!crate::dictionary::load(&c).unwrap().iter().any(|e| e.text == "Jev"));
     }
 
     #[test]

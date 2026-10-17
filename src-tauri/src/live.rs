@@ -11,7 +11,8 @@ use crate::planner::{self, Action, Plan};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
-use std::time::Instant;
+use crate::stt::scribe_rt;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// What susurro did (and what Pablo asked), across sessions while the app runs. RAM only.
@@ -29,6 +30,8 @@ const BRANDS: [&str; 20] = [
 
 static LIVE: LazyLock<Mutex<LiveState>> = LazyLock::new(Default::default);
 static TOOK_OVER: AtomicBool = AtomicBool::new(false);
+/// Pablo pressed a key or clicked: the executor waits until his next spoken order (open risk a).
+static PAUSED: AtomicBool = AtomicBool::new(false);
 /// ms of the last event susurro posted itself (backup to SUSURRO_TAG: some events lose the user data field).
 static OWN_AT: AtomicI64 = AtomicI64::new(0);
 /// Pablo's input within this long after one of susurro's own events is susurro's.
@@ -62,15 +65,37 @@ pub fn is_users(user_data: i64, keycode: Option<u16>, bound: &[u16], moved: f64)
     }
 }
 
-/// The input monitor saw Pablo's own event.
-pub fn user_input(app: &AppHandle) {
-    if crate::history::now_ms() - OWN_AT.load(Ordering::SeqCst) < OWN_MS || TOOK_OVER.swap(true, Ordering::SeqCst) {
+/// The queue waits for Pablo's next order.
+pub fn paused() -> bool {
+    PAUSED.load(Ordering::SeqCst)
+}
+
+/// The input monitor saw Pablo's own event. `hard` = a key or a click (not a mouse move or scroll): the queue
+/// pauses too, so susurro never types over what he does by hand.
+pub fn user_input(app: &AppHandle, hard: bool) {
+    if crate::history::now_ms() - OWN_AT.load(Ordering::SeqCst) < OWN_MS {
         return;
     }
-    log::info!("live: Pablo took over, marks hidden");
-    #[cfg(target_os = "macos")]
-    crate::platform::macos::show_marks(app, None);
-    update(app, |l| l.took_over = true);
+    let pause = hard && !PAUSED.swap(true, Ordering::SeqCst);
+    if pause {
+        log::info!("live: Pablo pressed a key or clicked, the queue pauses until his next order");
+    }
+    let hide = !TOOK_OVER.swap(true, Ordering::SeqCst);
+    if hide {
+        log::info!("live: Pablo took over, marks hidden");
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::show_marks(app, None);
+    }
+    if pause || hide {
+        update(app, |l| (l.took_over, l.paused) = (true, paused()));
+    }
+}
+
+/// "continue" and friends: resume a paused queue without a new order.
+pub fn resume_word(text: &str) -> bool {
+    const W: [&str; 10] = ["continue", "continúa", "continua", "sigue", "go on", "resume", "keep going", "dale", "seguí", "sigue nomás"];
+    let t = text.trim().trim_end_matches(['.', '!', ',']).trim().to_lowercase();
+    W.contains(&t.as_str())
 }
 
 fn update(app: &AppHandle, f: impl FnOnce(&mut LiveState)) {
@@ -172,7 +197,8 @@ impl Core {
             self.said.push(text.into());
         }
         match pending {
-            Some((Wait::Pick, _)) if !text.is_empty() => return Heard::Pick(text.into()),
+            // Only a number, an ordinal or a shown name answers "Which one?"; a full new order is planned (open risk c).
+            Some((Wait::Pick, q)) if !text.is_empty() && command::looks_like_pick(text, q) => return Heard::Pick(text.into()),
             Some((Wait::Confirm, q)) if !text.is_empty() => {
                 if let Some(yes) = command::yes_no(text) {
                     return Heard::Confirm(yes);
@@ -272,6 +298,10 @@ impl Queue {
         self.items.lock().unwrap().retain(|i| matches!(i, Item::End { .. }));
     }
 
+    fn has_end(&self) -> bool {
+        self.items.lock().unwrap().iter().any(|i| matches!(i, Item::End { .. }))
+    }
+
     fn labels(&self) -> Vec<String> {
         self.items.lock().unwrap().iter().filter_map(|i| if let Item::Do { action, .. } = i { Some(planner::label(action)) } else { None }).collect()
     }
@@ -281,14 +311,30 @@ impl Queue {
 
 enum Msg {
     Chunk(Vec<f32>),
+    /// Scribe Realtime: new device-rate samples; `true` = a pause cut (commit).
+    Audio(Vec<f32>, bool),
+    Rt(scribe_rt::Ev),
     Text(u32, anyhow::Result<Option<String>>),
     End(Option<Vec<f32>>),
     Abort,
 }
 
+/// One session's stop flag and the words heard so far. Esc ends the session through it at once, while a planner,
+/// STT or Jev request may still be in flight (open risk b); the late threads then see `stopped` and do nothing.
+#[derive(Default)]
+struct Ctl {
+    stopped: AtomicBool,
+    ended: AtomicBool,
+    said: Mutex<String>,
+}
+
 /// session.rs holds this while a live session records.
 pub struct Handle {
     tx: mpsc::Sender<Msg>,
+    app: AppHandle,
+    queue: Arc<Queue>,
+    ctl: Arc<Ctl>,
+    realtime: bool,
 }
 
 impl Handle {
@@ -297,47 +343,111 @@ impl Handle {
         let _ = self.tx.send(Msg::Chunk(audio));
     }
 
+    /// The command STT is Scribe Realtime: session.rs streams every new sample (`audio`) instead of chunks.
+    pub fn realtime(&self) -> bool {
+        self.realtime
+    }
+
+    /// New device-rate samples; `cut` = the Chunker found a pause (Scribe commits there).
+    pub fn audio(&self, samples: Vec<f32>, cut: bool) {
+        let _ = self.tx.send(Msg::Audio(samples, cut));
+    }
+
     /// The recording stopped: the tail after the last cut, then drain the queue and end.
     pub fn end(&self, tail: Option<Vec<f32>>) {
         let _ = self.tx.send(Msg::End(tail));
     }
 
-    /// Esc: drop the queue and end now.
+    /// Esc: drop the queue and end now. No wait for the requests in flight.
     pub fn abort(&self) {
         command::abort();
+        self.ctl.stopped.store(true, Ordering::SeqCst);
+        self.queue.clear();
         let _ = self.tx.send(Msg::Abort);
+        let instruction = self.ctl.said.lock().unwrap().clone();
+        let end = End { status: CmdStatus::Stopped, summary: String::new(), message: None, steps: 0 };
+        finish(&self.app, &self.ctl, Ended { instruction, end, latency_ms: 0 });
     }
 }
 
+/// The session end, once: marks off, the input monitor off, the pill idle, SessionCmd::CommandEnded.
+fn finish(app: &AppHandle, ctl: &Ctl, ended: Ended) {
+    if ctl.ended.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::show_marks(app, None);
+        crate::platform::macos::watch_user_input(app, false);
+    }
+    update(app, |l| *l = LiveState::default());
+    let _ = app.state::<AppState>().session_tx.send(crate::session::SessionCmd::CommandEnded(Box::new(ended)));
+}
+
 /// Starts the live and exec threads for one session. `key` = the OpenRouter key (planner, MAI, Jev).
-pub fn start(app: AppHandle, key: String, cfg: CommandSettings) -> Handle {
+/// `rate` = the mic's device rate (Scribe Realtime gets the samples as recorded).
+pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Handle {
     command::reset();
     command::clear_log();
     TOOK_OVER.store(false, Ordering::SeqCst);
-    let local = app.state::<AppState>().settings.read().unwrap().stt.provider == crate::contract::SttProvider::WhisperLocal;
+    PAUSED.store(false, Ordering::SeqCst);
+    let (provider, rt_opts) = {
+        let st = app.state::<AppState>();
+        let s = st.settings.read().unwrap().clone();
+        let el = crate::secrets::get(crate::contract::KeyName::Elevenlabs).is_some();
+        let p = crate::stt::command_provider(&s, el);
+        let hints = crate::dictionary::Dictionary::new(crate::dictionary::load(&st.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
+        let o = (p == crate::contract::SttProvider::ElevenLabsRealtime).then(|| crate::stt::realtime_opts(&s, rate, &with_brands(&hints), true)).flatten();
+        (p, o)
+    };
+    log::info!("live: command STT {provider:?}{}", if rt_opts.is_some() { " (streaming)" } else { "" });
     update(&app, |l| *l = LiveState { on: true, ..Default::default() });
     #[cfg(target_os = "macos")]
     crate::platform::macos::watch_user_input(&app, true);
     let (tx, rx) = mpsc::channel();
     let queue = Arc::new(Queue::default());
+    let ctl = Arc::new(Ctl::default());
     {
-        let (app, queue, key, cfg) = (app.clone(), queue.clone(), key.clone(), cfg.clone());
-        std::thread::Builder::new().name("cmd-exec".into()).spawn(move || exec_loop(app, queue, key, cfg)).expect("spawn cmd-exec");
+        let (app, queue, key, cfg, ctl) = (app.clone(), queue.clone(), key.clone(), cfg.clone(), ctl.clone());
+        std::thread::Builder::new().name("cmd-exec".into()).spawn(move || exec_loop(app, queue, key, cfg, ctl)).expect("spawn cmd-exec");
     }
-    let tx2 = tx.clone();
+    let realtime = rt_opts.is_some();
+    let rt = rt_opts.map(|o| {
+        let tx = tx.clone();
+        scribe_rt::Live::start(o, move |e| drop(tx.send(Msg::Rt(e))))
+    });
+    let max_in_flight = if provider == crate::contract::SttProvider::WhisperLocal { 1 } else { MAX_IN_FLIGHT };
+    let (tx2, app2, queue2, ctl2) = (tx.clone(), app.clone(), queue.clone(), ctl.clone());
     std::thread::Builder::new()
         .name("cmd-live".into())
-        .spawn(move || live_loop(app, rx, tx2, queue, key, cfg, if local { 1 } else { MAX_IN_FLIGHT }))
+        .spawn(move || live_loop(app2, rx, tx2, queue2, key, cfg, max_in_flight, rt, rate, provider, ctl2))
         .expect("spawn cmd-live");
-    Handle { tx }
+    Handle { tx, app, queue, ctl, realtime }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn live_loop(app: AppHandle, rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, queue: Arc<Queue>, key: String, cfg: CommandSettings, max_in_flight: usize) {
+fn live_loop(
+    app: AppHandle,
+    rx: mpsc::Receiver<Msg>,
+    tx: mpsc::Sender<Msg>,
+    queue: Arc<Queue>,
+    key: String,
+    cfg: CommandSettings,
+    max_in_flight: usize,
+    mut rt: Option<scribe_rt::Live>,
+    rate: u32,
+    provider: crate::contract::SttProvider,
+    ctl: Arc<Ctl>,
+) {
     let t0 = Instant::now();
     let mut core = Core::default();
     let (mut seq, mut in_flight, mut ended) = (0u32, 0usize, false);
     let mut waiting: VecDeque<(u32, Vec<f32>)> = VecDeque::new();
+    // Scribe Realtime: device audio of the commits not answered yet and of the open segment. If the socket dies,
+    // they go to the batch STT as chunks (the fallback) and so does the rest of the session.
+    // Each commit takes the next seq, so the answers and a fallback's chunks keep the spoken order.
+    let (mut unanswered, mut open): (VecDeque<(u32, Vec<f32>)>, Vec<f32>) = (VecDeque::new(), vec![]);
+    let mut rt_last = Instant::now();
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
         let mut input = context(&app);
         (input.utterance, input.last) = (text.to_string(), last);
@@ -346,15 +456,85 @@ fn live_loop(app: AppHandle, rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, que
         log::info!("live: planner {} ms ${:.5} {text:?} -> complete={} {:?} rest={:?}", m.latency_ms, m.cost, p.complete, p.actions.iter().map(planner::label).collect::<Vec<_>>(), p.rest);
         Ok(p)
     };
+    let to_16k = |a: &[f32]| crate::audio::resample(a, rate);
     loop {
-        let Ok(msg) = rx.recv() else { break };
+        if ctl.stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        let msg = match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(m) => m,
+            // The finish waits at most RT_FINISH_MS for Scribe's last answers, then the unanswered audio goes batch.
+            Err(mpsc::RecvTimeoutError::Timeout) if ended && rt.is_some() && rt_last.elapsed() > Duration::from_millis(RT_FINISH_MS) => {
+                Msg::Rt(scribe_rt::Ev::Failed("no answer after the release".into()))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
             Msg::Chunk(a) => {
                 waiting.push_back((seq, a));
                 seq += 1;
             }
+            Msg::Audio(a, cut) => {
+                open.extend_from_slice(&a);
+                let cut = cut && !open.is_empty();
+                match &rt {
+                    Some(l) => {
+                        l.send(&a, cut);
+                        if cut {
+                            unanswered.push_back((seq, std::mem::take(&mut open)));
+                            seq += 1;
+                        }
+                    }
+                    // the socket failed earlier: cut chunks go to the batch STT
+                    None if cut => {
+                        waiting.push_back((seq, to_16k(&std::mem::take(&mut open))));
+                        seq += 1;
+                    }
+                    None => {}
+                }
+            }
+            Msg::Rt(e) => {
+                rt_last = Instant::now();
+                match e {
+                    scribe_rt::Ev::Partial(p) if !p.is_empty() => update(&app, |l| l.last_said = p),
+                    scribe_rt::Ev::Partial(_) => {}
+                    scribe_rt::Ev::Committed(t) => {
+                        // Scribe answers in commit order; the answer goes the way of a finished batch chunk.
+                        if let Some((n, _)) = unanswered.pop_front() {
+                            in_flight += 1;
+                            let _ = tx.send(Msg::Text(n, Ok(command_words(&app, &t))));
+                        }
+                    }
+                    scribe_rt::Ev::Closed => rt = None,
+                    scribe_rt::Ev::Failed(err) => {
+                        log::warn!("live: Scribe Realtime failed, {:?} takes the rest: {err}", crate::stt::batch_for_realtime(true));
+                        rt = None;
+                        for (n, a) in unanswered.drain(..) {
+                            waiting.push_back((n, to_16k(&a)));
+                        }
+                    }
+                }
+            }
             Msg::End(tail) => {
-                if let Some(t) = tail {
+                if realtime_mode(&provider) {
+                    // Scribe (or its fallback) has every sample already: the tail is not sent again.
+                    match &rt {
+                        Some(l) => {
+                            if !open.is_empty() {
+                                unanswered.push_back((seq, std::mem::take(&mut open)));
+                                seq += 1;
+                            }
+                            l.finish();
+                            rt_last = Instant::now();
+                        }
+                        None if !open.is_empty() => {
+                            waiting.push_back((seq, to_16k(&std::mem::take(&mut open))));
+                            seq += 1;
+                        }
+                        None => {}
+                    }
+                } else if let Some(t) = tail {
                     waiting.push_back((seq, t));
                     seq += 1;
                 }
@@ -378,8 +558,21 @@ fn live_loop(app: AppHandle, rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, que
                 for t in core.arrive(n, text) {
                     let Some(t) = t else { continue };
                     update(&app, |l| l.last_said = t.clone());
+                    if paused() && resume_word(&t) {
+                        resume(&app);
+                        continue;
+                    }
                     let pending = command::waiting().map(|w| (w, LIVE.lock().unwrap().pending.clone().unwrap_or_default()));
                     let heard = core.hear(&t, false, pending.as_ref().map(|(w, q)| (*w, q.as_str())), &mut planner);
+                    *ctl.said.lock().unwrap() = core.said.join(" ");
+                    // Esc while the planner ran: its answer is dropped.
+                    if ctl.stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // A new order while "Which one?" waits: Pablo moved on, the pick is dropped.
+                    if matches!(heard, Heard::Order(..)) && command::waiting() == Some(Wait::Pick) {
+                        command::deny();
+                    }
                     handle(&app, &queue, &core, heard);
                 }
             }
@@ -398,8 +591,8 @@ fn live_loop(app: AppHandle, rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, que
                 })
                 .expect("spawn cmd-stt");
         }
-        if ended && in_flight == 0 && waiting.is_empty() {
-            if !core.buffer.is_empty() && !command::aborted() {
+        if ended && in_flight == 0 && waiting.is_empty() && rt.is_none() {
+            if !core.buffer.is_empty() && !command::aborted() && !ctl.stopped.load(Ordering::SeqCst) {
                 let heard = core.hear("", true, None, &mut planner);
                 handle(&app, &queue, &core, heard);
             }
@@ -407,8 +600,23 @@ fn live_loop(app: AppHandle, rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, que
             break;
         }
     }
-    update(&app, |l| (l.on, l.buffer) = (false, String::new()));
+    if !ctl.ended.load(Ordering::SeqCst) {
+        update(&app, |l| (l.on, l.buffer) = (false, String::new()));
+    }
     log::info!("live: recording side done after {} ms, {} orders", t0.elapsed().as_millis(), core.order);
+}
+
+/// Scribe's last commit answers within this after the release (measured ~0.2 s, TESTING.md "Latency").
+const RT_FINISH_MS: u64 = 4000;
+
+fn realtime_mode(p: &crate::contract::SttProvider) -> bool {
+    *p == crate::contract::SttProvider::ElevenLabsRealtime
+}
+
+fn resume(app: &AppHandle) {
+    PAUSED.store(false, Ordering::SeqCst);
+    TOOK_OVER.store(false, Ordering::SeqCst);
+    update(app, |l| (l.paused, l.took_over) = (false, false));
 }
 
 fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
@@ -422,8 +630,9 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
             for a in actions {
                 queue.push(Item::Do { order, said: said.clone(), action: a });
             }
-            // The next order shows the marks again (case 13).
+            // The next order shows the marks again (case 13) and resumes a paused queue (open risk a).
             TOOK_OVER.store(false, Ordering::SeqCst);
+            PAUSED.store(false, Ordering::SeqCst);
             if let Some(s) = say {
                 crate::session::toast(app, Some("overlay"), "live-say", crate::contract::ToastKind::Info, s, &[], 4000);
             }
@@ -435,10 +644,10 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
     }
     let labels = queue.labels();
     let buffer = core.buffer.clone();
-    update(app, |l| (l.queue, l.buffer, l.took_over) = (labels, buffer, took_over()));
+    update(app, |l| (l.queue, l.buffer, l.took_over, l.paused) = (labels, buffer, took_over(), paused()));
 }
 
-fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSettings) {
+fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSettings, ctl: Arc<Ctl>) {
     let t0 = Instant::now();
     let cfg = Cfg { confirm_risky: settings.confirm_risky };
     let mut ask = |s: &serde_json::Value, q: &serde_json::Value| crate::jev::ask(crate::jev::DECISIONS_URL, &key, &settings.model, s, q);
@@ -451,7 +660,16 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
         match queue.pop() {
             Item::End { instruction } => break instruction,
             Item::Do { order, said, action } => {
-                if command::aborted() || skip == Some(order) {
+                let stopped = || command::aborted() || ctl.stopped.load(Ordering::SeqCst);
+                // Pablo took over by hand: wait for his next order; the session end drops what is left.
+                while paused() && !stopped() && !queue.has_end() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if paused() && !stopped() {
+                    (worst, message) = (CmdStatus::Stopped, Some("Paused: you took over".into()));
+                    continue;
+                }
+                if stopped() || skip == Some(order) {
                     continue;
                 }
                 step += 1;
@@ -471,6 +689,9 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                     End { status: CmdStatus::Error, summary: String::new(), message: Some("macOS only".into()), steps: step }
                 };
                 log::info!("live: step {step} (order {order}) {}: {:?} {} {:?}", planner::label(&action), end.status, end.summary, end.message);
+                if ctl.stopped.load(Ordering::SeqCst) {
+                    continue; // Esc already ended the session: a new one may own the marks and the pill now
+                }
                 if end.status != CmdStatus::Done {
                     // The rest of this order depends on this action.
                     skip = Some(order);
@@ -492,16 +713,9 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
     if command::aborted() {
         worst = CmdStatus::Stopped;
     }
-    #[cfg(target_os = "macos")]
-    {
-        crate::platform::macos::show_marks(&app, None);
-        crate::platform::macos::watch_user_input(&app, false);
-    }
-    update(&app, |l| *l = LiveState::default());
     let end = End { status: if summary.is_empty() && worst == CmdStatus::Done { CmdStatus::Unsure } else { worst }, summary: summary.join("; "), message, steps: step };
     let end = if step == 0 && instruction.trim().is_empty() { End { status: CmdStatus::Stopped, ..end } } else { end };
-    let ended = Ended { instruction, end, latency_ms: t0.elapsed().as_millis() as u32 };
-    let _ = app.state::<AppState>().session_tx.send(crate::session::SessionCmd::CommandEnded(Box::new(ended)));
+    finish(&app, &ctl, Ended { instruction, end, latency_ms: t0.elapsed().as_millis() as u32 });
 }
 
 /// The planner's view right before the call: app, focused field, marks (ids dropped).
@@ -534,19 +748,38 @@ pub fn with_brands(h: &crate::dictionary::Hints) -> crate::dictionary::Hints {
     h
 }
 
+/// A Scribe Realtime text through the same pipeline as a batch chunk (hallucination filter, dictionary). None = nothing.
+/// ponytail: the Chunker already gated the audio (worth), so a stand-in clip passes the pipeline's audio gates.
+fn command_words(app: &AppHandle, text: &str) -> Option<String> {
+    let t = text.trim().to_string();
+    if t.is_empty() {
+        return None;
+    }
+    let clip = crate::audio::Clip { samples: vec![0.5; 16000], duration_ms: 1000, peak_db: 0.0, device_names: vec![] };
+    let out = crate::stt::SttOutput { text: t, language: None, note: None, fell_back: false };
+    chunk_text_with(app, clip, &|_: &crate::stt::SttRequest| Ok(out.clone())).ok().flatten()
+}
+
 /// One chunk through the command STT: the pipeline (hallucination filter, dictionary corrections), no cleanup LLM,
 /// plus BRANDS as extra hint words. Ok(None) = nothing heard.
 fn chunk_text(app: &AppHandle, audio: Vec<f32>) -> anyhow::Result<Option<String>> {
+    let state = app.state::<AppState>();
+    let mut s = state.settings.read().unwrap().clone();
+    // the command STT; Scribe Realtime here = its batch fallback (stt::build maps it to MAI or Scribe batch)
+    s.stt.provider = crate::stt::command_provider(&s, crate::secrets::get(crate::contract::KeyName::Elevenlabs).is_some());
+    let peak = audio.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let clip = crate::audio::Clip { duration_ms: (audio.len() / 16) as u32, peak_db: crate::audio::db(peak), samples: audio, device_names: vec![] };
+    let stt = crate::stt::build(&s, &state)?;
+    chunk_text_with(app, clip, &|r: &crate::stt::SttRequest| stt.transcribe(&crate::stt::SttRequest { audio: r.audio, language: r.language, hints: &with_brands(r.hints) }))
+}
+
+fn chunk_text_with(app: &AppHandle, clip: crate::audio::Clip, stt_fn: &dyn Fn(&crate::stt::SttRequest) -> anyhow::Result<crate::stt::SttOutput>) -> anyhow::Result<Option<String>> {
     use crate::pipeline::{self, Outcome};
     let state = app.state::<AppState>();
     let s = state.settings.read().unwrap().clone();
     let d = crate::dictionary::Dictionary::new(crate::dictionary::load(&state.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone());
-    let peak = audio.iter().fold(0f32, |m, x| m.max(x.abs()));
-    let clip = crate::audio::Clip { duration_ms: (audio.len() / 16) as u32, peak_db: crate::audio::db(peak), samples: audio, device_names: vec![] };
-    let stt = crate::stt::build(&s, &state)?;
-    let stt_fn = |r: &crate::stt::SttRequest| stt.transcribe(&crate::stt::SttRequest { audio: r.audio, language: r.language, hints: &with_brands(r.hints) });
-    let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false };
-    match pipeline::run(&clip, &opts, &d, &stt_fn, None) {
+    let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false, strip_inverted: false, slash: None };
+    match pipeline::run(&clip, &opts, &d, stt_fn, None) {
         Outcome::Text(d) => Ok(Some(d.final_text)),
         Outcome::Skip(_) => Ok(None),
         Outcome::Failed(e) => Err(anyhow::anyhow!(e)),
@@ -692,6 +925,27 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(c.hear("la dos", false, Some((Wait::Pick, "Which one?")), &mut p), Heard::Pick("la dos".into()));
         assert_eq!(c.buffer, "", "answers never enter the order buffer");
+    }
+
+    #[test]
+    fn a_new_order_during_a_pick_is_planned_not_swallowed() {
+        // open risk c: only numbers, ordinals and shown names answer "Which one?"
+        let q = "Which one? 4 #general · 7 #design · 9 #random";
+        let mut c = Core::default();
+        let mut p = |t: &str, _: bool, _: Option<&str>| Ok(if t.starts_with("open") { plan(true, "", &["key", "open_app"]) } else { plan(true, "", &[]) });
+        for answer in ["la dos", "7", "the second one", "design", "el de random", "number four"] {
+            assert_eq!(c.hear(answer, false, Some((Wait::Pick, q)), &mut p), Heard::Pick(answer.into()), "{answer}");
+        }
+        assert!(matches!(c.hear("open a new tab and type hello", false, Some((Wait::Pick, q)), &mut p), Heard::Order(1, ..)), "a full order");
+        assert_eq!(c.hear("something else entirely", false, Some((Wait::Pick, q)), &mut p), Heard::Nothing, "not a pick, no actions");
+    }
+
+    #[test]
+    fn resume_words() {
+        for w in ["continue", "Sigue.", "go on", "dale"] {
+            assert!(resume_word(w), "{w}");
+        }
+        assert!(!resume_word("continue typing hello"), "a real order goes to the planner");
     }
 
     #[test]

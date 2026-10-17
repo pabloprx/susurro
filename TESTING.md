@@ -80,6 +80,33 @@ The word lists are the same length in both modes (151 and 453 words): no word lo
 
 Re-run 2026-10-17 (review), same Mac and command, idle machine, 3 runs: median release to text 874 / 260 ms (long.wav single / streaming) and 2664 / 252 ms (x3). Same WER and chunk counts. The app adds the hands-free grace (default 400 ms, checked on the 100 ms tick) before the STT starts; the bench does not include it.
 
+## Latency per STT path (next-queue 5)
+
+`src-tauri/tests/latency_bench.rs` plays each e2e fixture at real-time pace (100 ms of audio every 100 ms, as the session tick sends it) and times the release to the final STT text. The cleanup LLM and the paste are not in it: they are the same for every path.
+
+```
+SUSURRO_TEST_MODEL=~/.cache/susurro/ggml-large-v3-turbo-q5_0.bin SUSURRO_WHISPER_THREADS=6 OPENROUTER_API_KEY=.. ELEVENLABS_API_KEY=.. \
+  cargo test --release --manifest-path src-tauri/Cargo.toml --test latency_bench -- --ignored --nocapture --test-threads=1
+```
+
+Measured 2026-10-17, Mac Studio M4 Max, home network, median of 3 (the run values in brackets):
+
+| Path | en_snippet (2.0 s) | es_accents (4.9 s) | en_numbers (8.7 s) |
+|------|-------------------|--------------------|--------------------|
+| Local turbo streaming (large-v3-turbo q5_0, 6 threads) | 354 ms [354, 351, 373] | 369 ms [404, 369, 357] | 400 ms [400, 377, 432] |
+| MAI-Transcribe 2 batch (OpenRouter) | 695 ms [1692, 695, 689] | 737 ms [752, 735, 737] | 768 ms [1259, 768, 755] |
+| Scribe v2 batch (ElevenLabs) | 590 ms [590, 616, 565] | 646 ms [813, 646, 571] | 1005 ms [1065, 1005, 668] |
+| Scribe v2 Realtime (WebSocket, commit at the release) | 198 ms [193, 209, 198] | 210 ms [205, 219, 210] | 208 ms [191, 208, 257] |
+
+Text quality on these clips: all four paths got every word. Scribe batch wrote "five five five zero one nine nine" for "555-0199"; Scribe Realtime wrote "a las 3:00 p.m." for "a las 3" (an added "p.m."). One sample each, so these are anecdotes, not a WER.
+
+Voice control cuts (`command_chunks`, the COMMAND cuts, one run): Scribe Realtime answers a commit 197-259 ms after the cut (3 cuts). MAI answers a cut chunk in 724-2116 ms (3 chunks; 2116 ms was a 7 s chunk).
+
+Defaults from these numbers (Pablo's explicit choices stay as they are):
+- Voice control: `command.stt` = auto = Scribe Realtime when an ElevenLabs key is saved (about 3x faster per order than MAI), else the dictation provider. Partials show in the pill; each commit (a 300 ms pause) goes to the planner. If the socket fails twice, the unanswered audio and the rest of the session go to MAI (or Scribe batch).
+- Dictation: the default stays Local Whisper streaming (0.35-0.4 s, free, offline, no key at install). Scribe Realtime (0.2 s) is the fastest choice when an ElevenLabs key is saved; MAI (0.7 s) is the slowest of the four. A failed realtime stream runs the clip single-shot on MAI (or Scribe batch).
+- Not measured: the ElevenLabs realtime price per hour, long dictations over 36 s on Scribe Realtime (the server commits by itself there), and the release to paste in the real app (no GUI test while Pablo uses the Mac).
+
 ## Known limits (2026-10-17)
 
 - base.en writes "Francisco Ugarte" in `long.wav`. The dictionary does not change it on purpose: a fuzzy match must not flip a gendered name.

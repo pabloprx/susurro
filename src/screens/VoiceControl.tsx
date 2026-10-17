@@ -10,6 +10,7 @@ import { Kbd, Label, radioKeys, Title, toast, Toggle } from "../ui";
 import { Diagram, usePermWatch } from "./Onboarding";
 import { DEFAULTS, PICKS, useRecorder } from "./Shortcuts";
 import type { Nav } from "../App";
+import type { SttProvider } from "../lib/contract.gen";
 
 const PINNED_MODEL = "typesafe/jev-1.14";
 const ENDED: CommandStep["status"][] = ["done", "stopped", "unsure", "blocked", "setup", "error"];
@@ -207,6 +208,25 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
             <span className="mono">{s.command.model || PINNED_MODEL}</span>
             <span className="tag">PINNED</span>
           </span>
+          <span />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Speech to text</div>
+            <div className="sub">Hears your commands. Scribe Realtime answers in ~0.2 s, MAI in ~0.7 s</div>
+          </div>
+          <select
+            className="input"
+            aria-label="Speech to text for commands"
+            value={s.command.stt ?? "auto"}
+            onChange={(e) => save((x) => void (x.command.stt = e.target.value === "auto" ? null : (e.target.value as SttProvider)))}
+          >
+            <option value="auto">Auto · {keys?.elevenlabs ? "Scribe Realtime" : "same as dictation"}</option>
+            <option value="elevenlabs_realtime">Scribe Realtime (live)</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="elevenlabs">ElevenLabs Scribe</option>
+            <option value="whisper_local">Local Whisper</option>
+          </select>
           <span />
         </div>
       </div>

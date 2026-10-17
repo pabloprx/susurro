@@ -54,6 +54,8 @@ const DOUBLE: Duration = Duration::from_millis(500);
 /// A Cancel this soon after PttDown is the fn+key chord (hotkey.rs): silent, no Undo.
 const CHORD: Duration = crate::hotkey::CHORD_WINDOW;
 const UNDO: Duration = Duration::from_secs(5);
+/// Scribe Realtime's last commit answers within this after the release (measured ~0.2 s, TESTING.md "Latency").
+const RT_FINISH: Duration = Duration::from_secs(4);
 /// The recents list closes after this long without a pick.
 const RECENTS_IDLE: Duration = Duration::from_secs(10);
 const WARN_BEFORE: Duration = Duration::from_secs(60);
@@ -326,6 +328,7 @@ fn provider_label(s: &crate::contract::Settings, fell_back: bool) -> String {
         SttProvider::OpenAiCompat => format!("openai_compat:{}", st.openai_compat.model),
         SttProvider::ElevenLabs => format!("elevenlabs:{}", st.elevenlabs.model_id),
         SttProvider::OpenRouter => format!("openrouter:{}", st.openrouter_model),
+        SttProvider::ElevenLabsRealtime => "elevenlabs:scribe_v2_realtime".into(),
     }
 }
 
@@ -352,11 +355,15 @@ fn run_pipeline_with(state: &AppState, clip: &Clip, bundle: Option<&str>, stream
     };
     let clean_fn = |t: &str, h: &Hints| cleanup::cleanup(&s, key.as_deref(), &level, t, h);
     let clean: pipeline::Cleaner = (level != CleanupLevel::None).then_some(&clean_fn as &dyn Fn(&str, &Hints) -> anyhow::Result<String>);
+    let in_app = |list: &[String]| bundle.is_some_and(|b| list.iter().any(|r| r == b));
+    let slash_names = bundle.filter(|b| crate::slash::app_takes_slash(b)).and_then(|_| std::env::var_os("HOME")).map(|h| crate::slash::names(&std::path::Path::new(&h).join(".claude")));
     let opts = pipeline::Opts {
         language: Some(s.language.as_str()),
         style: s.styles.style.clone(),
         raw_app,
         press_enter_command: s.paste.press_enter_command,
+        strip_inverted: s.styles.strip_inverted && !in_app(&s.styles.inverted_apps),
+        slash: slash_names.as_deref(),
     };
     let outcome = pipeline::run(clip, &opts, &d, &stt_fn, clean);
     let fell_back = matches!(&outcome, Outcome::Text(d) if d.fell_back);
@@ -365,11 +372,12 @@ fn run_pipeline_with(state: &AppState, clip: &Clip, bundle: Option<&str>, stream
 
 /// A voice command's text: the pipeline STT + dictionary corrections, no cleanup LLM, no spoken punctuation.
 fn command_text(state: &AppState, clip: &Clip) -> Outcome {
-    let s = state.settings.read().unwrap().clone();
+    let mut s = state.settings.read().unwrap().clone();
+    s.stt.provider = stt::command_provider(&s, secrets::get(KeyName::Elevenlabs).is_some());
     let entries = dictionary::load(&state.db.lock().unwrap()).unwrap_or_default();
     let d = Dictionary::new(entries, s.dictionary.clone());
     let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);
-    let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false };
+    let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false, strip_inverted: false, slash: None };
     pipeline::run(clip, &opts, &d, &stt_fn, None)
 }
 
@@ -435,6 +443,8 @@ struct Actor {
     cmd_ctx: Option<Ctx>,
     /// Local whisper transcribes finished chunks while the user speaks (None: cloud STT, model not loaded, a command).
     stream: Option<(audio::Chunker, whisper_local::Stream)>,
+    /// Dictation over Scribe Realtime: every new sample goes out, the Chunker's pauses commit (next-queue 1).
+    rt: Option<(audio::Chunker, stt::scribe_rt::Live, mpsc::Receiver<stt::scribe_rt::Ev>)>,
     /// The next session_state carries this hands-free grace countdown.
     grace: Option<u32>,
     /// A continuation (vc-feedback 17): the 16 kHz sample where it starts in the still-open recording, and the History
@@ -476,6 +486,7 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
                 answering: false,
                 cmd_ctx: None,
                 stream: None,
+                rt: None,
                 grace: None,
                 cont_from: None,
                 cont_row: None,
@@ -755,13 +766,14 @@ impl Actor {
             }
             Act::Discard | Act::CancelUndoable if self.command => self.drop_command_recording(),
             Act::Discard => {
-                self.stream = None;
+                (self.stream, self.rt) = (None, None);
                 self.rec = None;
                 self.ctx = None;
                 (self.cont_from, self.cont_row) = (None, None);
                 self.set(Phase::Idle, None);
             }
             Act::ProcessKeep => {
+                self.pump(); // the last samples before the peek
                 let (Some(rec), Some(ctx)) = (self.rec.as_ref(), self.ctx.take()) else {
                     self.m.idle();
                     return true;
@@ -784,7 +796,7 @@ impl Actor {
                 self.set(Phase::Locked, None);
             }
             Act::CancelUndoable => {
-                self.stream = None;
+                (self.stream, self.rt) = (None, None);
                 if let (Some(rec), Some(ctx)) = (self.rec.take(), self.ctx.take()) {
                     self.kept = Some((rec.stop(), ctx));
                 }
@@ -792,6 +804,7 @@ impl Actor {
                 toast(&self.app, None, "cancelled", ToastKind::Info, "Cancelled", &[("undo", "Undo")], UNDO.as_millis() as u32);
             }
             Act::Process => {
+                self.pump(); // the last samples before the stop
                 if let (Some(rec), Some(ctx)) = (self.rec.take(), self.ctx.take()) {
                     let mut clip = rec.stop();
                     self.cont_now = match self.cont_from.take() {
@@ -874,12 +887,15 @@ impl Actor {
                 let ctx = Ctx { app: front, started_at: history::now_ms(), device: Some(r.device().name.clone()) };
                 self.ctx = Some(ctx.clone());
                 self.stream = if self.command { None } else { self.streamer(&r) };
+                self.rt = if self.command { None } else { self.realtime(&r) };
                 if self.command && !self.answering {
                     let cfg = self.state().settings.read().unwrap().command.clone();
                     let key = secrets::get(KeyName::Openrouter).unwrap_or_default();
-                    self.cmd_chunker = Some(r.chunker_with(audio::COMMAND));
+                    let ch = r.chunker_with(audio::COMMAND);
+                    let rate = ch.rate();
+                    self.cmd_chunker = Some(ch);
                     self.cmd_ctx = Some(ctx);
-                    self.live = Some(crate::live::start(self.app.clone(), key, cfg));
+                    self.live = Some(crate::live::start(self.app.clone(), key, cfg, rate));
                     log::info!("live: command session started");
                 }
                 self.rec = Some(r);
@@ -909,8 +925,96 @@ impl Actor {
         Some((rec.chunker(), whisper_local::Stream::spawn(w, Some(s.language.clone()), d.hints())))
     }
 
+    /// Scribe Realtime dictation: the provider is picked and the ElevenLabs key is saved.
+    fn realtime(&self, rec: &Recorder) -> Option<(audio::Chunker, stt::scribe_rt::Live, mpsc::Receiver<stt::scribe_rt::Ev>)> {
+        let state = self.state();
+        let s = state.settings.read().unwrap().clone();
+        if s.stt.provider != SttProvider::ElevenLabsRealtime {
+            return None;
+        }
+        let ch = rec.chunker();
+        let hints = Dictionary::new(dictionary::load(&state.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
+        let o = stt::realtime_opts(&s, ch.rate(), &hints, s.stt.elevenlabs.send_keyterms)?;
+        let (tx, rx) = mpsc::channel();
+        Some((ch, stt::scribe_rt::Live::start(o, move |e| drop(tx.send(e))), rx))
+    }
+
+    /// Every new sample to the streams (local whisper chunks, Scribe Realtime, the live command session).
+    fn pump(&mut self) {
+        if let (Some((ch, st)), Some(rec)) = (self.stream.as_mut(), self.rec.as_ref()) {
+            match ch.poll(rec) {
+                Ok(Some(chunk)) => st.push(chunk),
+                Ok(None) => {}
+                Err(()) => {
+                    log::info!("whisper stream: the mic changed, the clip goes single-shot");
+                    self.stream = None;
+                }
+            }
+        }
+        if let (Some((ch, live, _)), Some(rec)) = (self.rt.as_mut(), self.rec.as_ref()) {
+            match ch.poll_fresh(rec) {
+                Ok((new, cut)) => live.send(&new, cut.is_some()),
+                Err(()) => {
+                    log::info!("scribe-rt: the mic changed, the clip goes single-shot");
+                    self.rt = None;
+                }
+            }
+        }
+        // The live command session: each finished chunk (or, on Scribe Realtime, every sample) goes out while
+        // Pablo keeps talking.
+        if let (Some(ch), Some(rec), Some(live)) = (self.cmd_chunker.as_mut(), self.rec.as_ref(), self.live.as_ref()) {
+            let r = if live.realtime() {
+                ch.poll_fresh(rec).map(|(new, cut)| {
+                    live.audio(new, cut.is_some());
+                    None
+                })
+            } else {
+                ch.poll(rec)
+            };
+            match r {
+                Ok(Some(chunk)) => {
+                    log::info!("live: chunk {} ms", chunk.len() / 16);
+                    live.chunk(chunk);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    log::info!("live: the mic changed, the rest goes with the tail");
+                    self.cmd_chunker = None;
+                }
+            }
+        }
+    }
+
+    /// The Scribe Realtime text: commit the rest, collect every committed segment. None = failed: single-shot.
+    fn finish_realtime(&mut self) -> Option<stt::SttOutput> {
+        let (_, live, rx) = self.rt.take()?;
+        let t = Instant::now();
+        live.finish();
+        let mut texts = vec![];
+        loop {
+            match rx.recv_timeout(RT_FINISH.saturating_sub(t.elapsed())) {
+                Ok(stt::scribe_rt::Ev::Committed(c)) if !c.is_empty() => texts.push(c),
+                Ok(stt::scribe_rt::Ev::Closed) => break,
+                Ok(stt::scribe_rt::Ev::Failed(e)) => {
+                    log::warn!("scribe-rt failed, running the clip single-shot: {e}");
+                    return None;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    log::warn!("scribe-rt: no final text {} ms after the stop, running the clip single-shot", t.elapsed().as_millis());
+                    return None;
+                }
+            }
+        }
+        log::info!("scribe-rt: final text {} ms after the stop", t.elapsed().as_millis());
+        Some(stt::SttOutput { text: texts.join(" "), language: None, note: None, fell_back: false })
+    }
+
     /// The streaming transcript of `clip`: the chunks so far plus the tail. None = run it single-shot.
     fn finish_stream(&mut self, clip: &Clip) -> Option<stt::SttOutput> {
+        if self.rt.is_some() {
+            return self.finish_realtime();
+        }
         let (ch, st) = self.stream.take()?;
         let t = Instant::now();
         match st.finish(ch.tail(clip)) {
@@ -949,15 +1053,17 @@ impl Actor {
         self.ping(Ping::Stop);
         self.m.idle();
         if self.answering {
-            self.ctx = Some(ctx);
-            self.set(Phase::Processing, None);
-            let text = match command_text(self.state(), &clip) {
-                Outcome::Text(d) => d.final_text,
-                _ => String::new(),
-            };
-            self.ctx = None;
+            // Off the actor thread: Esc must end the session while this STT request is still in flight.
+            let _ = ctx;
             self.answering = false;
-            command::answer(text);
+            let app = self.app.clone();
+            std::thread::spawn(move || {
+                let text = match command_text(&app.state::<AppState>(), &clip) {
+                    Outcome::Text(d) => d.final_text,
+                    _ => String::new(),
+                };
+                command::answer(text);
+            });
             return self.set(Phase::Acting, None);
         }
         let tail = self.cmd_chunker.take().and_then(|c| c.tail(&clip));
@@ -1317,30 +1423,7 @@ impl Actor {
     /// Returns true if a max-length stop ran the (blocking) pipeline.
     fn tick(&mut self) -> bool {
         let now = Instant::now();
-        if let (Some((ch, st)), Some(rec)) = (self.stream.as_mut(), self.rec.as_ref()) {
-            match ch.poll(rec) {
-                Ok(Some(chunk)) => st.push(chunk),
-                Ok(None) => {}
-                Err(()) => {
-                    log::info!("whisper stream: the mic changed, the clip goes single-shot");
-                    self.stream = None;
-                }
-            }
-        }
-        // The live command session: each finished chunk goes to the planner while Pablo keeps talking.
-        if let (Some(ch), Some(rec), Some(live)) = (self.cmd_chunker.as_mut(), self.rec.as_ref(), self.live.as_ref()) {
-            match ch.poll(rec) {
-                Ok(Some(chunk)) => {
-                    log::info!("live: chunk {} ms", chunk.len() / 16);
-                    live.chunk(chunk);
-                }
-                Ok(None) => {}
-                Err(()) => {
-                    log::info!("live: the mic changed, the rest goes with the tail");
-                    self.cmd_chunker = None;
-                }
-            }
-        }
+        self.pump();
         if self.recents.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.close_recents(None);
         }
@@ -1568,7 +1651,7 @@ mod tests {
         let clip = Clip { samples: vec![0.2; 16000], duration_ms: 1000, peak_db: -14.0, device_names: vec!["Mic".into()] };
         let failed = pipeline::run(
             &clip,
-            &pipeline::Opts { language: None, style: crate::contract::Style::Formal, raw_app: false, press_enter_command: false },
+            &pipeline::Opts { language: None, style: crate::contract::Style::Formal, raw_app: false, press_enter_command: false, strip_inverted: false, slash: None },
             &Dictionary::new(vec![], Default::default()),
             &|_: &SttRequest| anyhow::bail!("503 upstream"),
             None,

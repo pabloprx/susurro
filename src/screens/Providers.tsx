@@ -53,12 +53,14 @@ export default function Providers() {
     whisper_local: activeModel ? `ready · ${modelName(activeModel.file)}` : models.some((m) => m.downloaded) ? "pick a model" : "no model yet",
     openai_compat: lastTest.openai_compat && !lastTest.openai_compat.ok ? "not reachable" : (hostOf(s.stt.openai_compat.base_url) ?? "invalid URL"),
     elevenlabs: keys.elevenlabs ? "ready" : S.help.noKeys,
+    elevenlabs_realtime: keys.elevenlabs ? "ready" : S.help.noKeys,
     openrouter: !keys.openrouter ? S.help.noKeys : s.stt.openrouter_model ? "ready" : "pick a model",
   };
   const what: Record<SttProvider, [string, string]> = {
     whisper_local: ["Local Whisper", "on this Mac · private · offline"],
     openai_compat: ["Local server", "OpenAI-compatible"],
     elevenlabs: ["ElevenLabs Scribe", "cloud"],
+    elevenlabs_realtime: ["Scribe Realtime", "cloud · words while you speak"],
     openrouter: ["OpenRouter", "cloud STT model"],
   };
   // An English-only (.en) Whisper model transcribes other languages as English: warn where the language is picked.
@@ -81,6 +83,7 @@ export default function Providers() {
               <button className="prov-head" role="radio" aria-checked={sel} tabIndex={sel ? 0 : -1} onClick={() => !sel && save((x) => void (x.stt.provider = id))}>
                 <span className="radio" />
                 <span className="name">{what[id][0]}</span>
+                {id === "elevenlabs_realtime" && <span className="badge-chip rec">LIVE</span>}
                 <span className="small">{what[id][1]}</span>
                 <span className="what">{sel && ready ? "" : state[id]}</span>
                 <Dot tone={sel && ready ? "ok" : "idle"} />
@@ -181,6 +184,19 @@ export default function Providers() {
                 <span className="small">Send up to {s!.stt.elevenlabs.max_keyterms} of your words. ElevenLabs bills keyterms +20%.</span>
               </span>
             </div>
+            <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
+              <span className="small">{keys!.elevenlabs ? "Key saved." : "Add your ElevenLabs key below."}</span>
+              <TestButton which="stt" onResult={onTest} disabled={!keys!.elevenlabs} />
+            </div>
+          </>
+        );
+      case "elevenlabs_realtime":
+        return (
+          <>
+            <p className="small" style={{ marginTop: 0 }}>
+              Streams your voice over a WebSocket and pastes about 0.2 s after you let go (MAI: ~0.7 s, Local Whisper: ~0.4 s).
+              If the stream fails, the clip goes to {keys!.openrouter ? "OpenRouter" : "ElevenLabs Scribe"}. Uses the ElevenLabs key and the Keyterms toggle of ElevenLabs Scribe.
+            </p>
             <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
               <span className="small">{keys!.elevenlabs ? "Key saved." : "Add your ElevenLabs key below."}</span>
               <TestButton which="stt" onResult={onTest} disabled={!keys!.elevenlabs} />
@@ -535,7 +551,7 @@ function KeyRow({ name, title, sub, s, saved }: { name: KeyName; title: string; 
   const mask = localStorage.getItem(`susurro.keymask.${name}`);
   const which: "stt" | "cleanup" | null =
     name === "elevenlabs"
-      ? s.stt.provider === "elevenlabs"
+      ? s.stt.provider === "elevenlabs" || s.stt.provider === "elevenlabs_realtime"
         ? "stt"
         : null
       : name === "openrouter"

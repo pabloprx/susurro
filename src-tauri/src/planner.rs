@@ -34,6 +34,25 @@ Output: strict JSON {"complete": bool, "rest": string, "answer": string|null, "s
 - Noise or filler ("voila", "um", "thank you") = complete=true, actions=[].
 - Prefer the fewest actions. No prose outside JSON."#;
 
+/// next-queue 4. Appended only when the order sounds like a spelling fix: the extra op text moved 4 of 23 unrelated
+/// planner cases (2 runs each, gpt-oss-120b, 2026-10-17), so normal orders keep the bench prompt byte for byte.
+const CORRECT_WORD: &str = "\n- One more op, correct_word{target, text}: fix a misheard written word (\"corrige: Jeff es Jev, J E V\", \"the last thing you wrote, GAB must be Jev\"). target = the wrong word as written, text = the right word; spelled letters win (\"J E V\", \"jota e ve\" -> \"Jev\"; unsure: copy the letters as said).";
+
+/// Words of a spoken spelling fix ("corrige: Jeff es Jev", "GAB must be Jev", "se escribe J E V").
+/// ponytail: a keyword list; a miss means the planner never sees correct_word, so add the phrase here.
+const CORRECTION_WORDS: &[&str] = &[
+    "corrige", "corregir", "corrigelo", "correct", "correction", "fix", "must be", "should be", "is spelled", "spelled",
+    "spell", "debe ser", "deberia ser", "se escribe", "escribe con", "deletrea", "misheard", "mal escrito", "no es", "it's not",
+    "is not", "isn't", "es con", "wrong word", "mal",
+];
+
+pub fn system_for(utterance: &str) -> String {
+    let u = format!(" {} ", crate::text::norm(utterance).replace(|c: char| !c.is_alphanumeric() && c != '\'', " "));
+    let u = u.split_whitespace().collect::<Vec<_>>().join(" ");
+    let fix = CORRECTION_WORDS.iter().any(|w| format!(" {u} ").contains(&format!(" {w} ")));
+    if fix { format!("{PROMPT}{CORRECT_WORD}") } else { PROMPT.to_string() }
+}
+
 /// One planner action. Flat on purpose: it is the strict schema 1:1 (unused fields null).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,7 +76,7 @@ pub struct Plan {
     pub actions: Vec<Action>,
 }
 
-pub const OPS: [&str; 10] = ["open_app", "key", "type", "click", "select_typed", "delete_typed", "copy", "paste", "scroll", "wait_user"];
+pub const OPS: [&str; 11] = ["open_app", "key", "type", "click", "select_typed", "delete_typed", "copy", "paste", "scroll", "wait_user", "correct_word"];
 
 pub fn schema() -> Value {
     let s = json!({"type": ["string", "null"]});
@@ -130,10 +149,14 @@ pub fn user_message(i: &Input) -> Value {
 }
 
 pub fn request(model: &str, user: &Value) -> Value {
+    request_with(model, PROMPT, user)
+}
+
+pub fn request_with(model: &str, system: &str, user: &Value) -> Value {
     let mut b = json!({
         "model": model, "temperature": 0, "max_tokens": 1500,
         "response_format": {"type": "json_schema", "json_schema": {"name": "plan", "strict": true, "schema": schema()}},
-        "messages": [{"role": "system", "content": PROMPT}, {"role": "user", "content": user.to_string()}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user.to_string()}],
     });
     if let (Some(b), Some(x)) = (b.as_object_mut(), extra_for(model).as_object()) {
         b.extend(x.clone());
@@ -170,7 +193,7 @@ pub fn plan(base: &str, key: &str, model: &str, input: &Input) -> anyhow::Result
         .header("HTTP-Referer", "https://susurro.app")
         .header("X-Title", "susurro")
         .timeout(TIMEOUT)
-        .json(&request(model, &user_message(input)));
+        .json(&request_with(model, &system_for(&input.utterance), &user_message(input)));
     let v = send_json(rb, "Planner")?;
     if let Some(e) = v.get("error") {
         anyhow::bail!("Planner: {}", e["message"].as_str().unwrap_or("error"));
@@ -215,6 +238,7 @@ pub fn label(a: &Action) -> String {
         "copy" => a.target.as_ref().map_or("copy".into(), |_| format!("copy {}", q(&a.target))),
         "paste" => a.target.as_ref().map_or("paste".into(), |_| format!("paste into {}", q(&a.target))),
         "scroll" => format!("scroll {}", a.dir.as_deref().unwrap_or("down")),
+        "correct_word" => format!("fix {} → {}", q(&a.target), q(&a.text)),
         op => op.into(),
     }
 }
@@ -232,6 +256,16 @@ mod tests {
             memory: vec!["21:10:25 typed 'hello' into WhatsApp 'Type a message'".into()],
             marks: vec!["New Tab (button, toolbar)".into()],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn correct_word_prompt_only_for_spelling_fixes() {
+        for u in ["Corrige: Jeff es Jev, J E V.", "The last thing you wrote, GAB must be Jev.", "No es Jeff, es jota e ve.", "fix the word type safe"] {
+            assert!(system_for(u).contains("correct_word{target, text}"), "{u}");
+        }
+        for u in ["Type hello there.", "LS command.", "Remove what you typed.", "Onto the top header, click the share button."] {
+            assert_eq!(system_for(u), PROMPT, "{u}");
         }
     }
 

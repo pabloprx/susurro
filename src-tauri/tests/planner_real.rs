@@ -200,3 +200,34 @@ fn planner_stream_cases() {
     }
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
+
+/// next-queue 4: voice correction of a mis-heard word -> correct_word{target: heard, text: word}; spelled letters win.
+#[test]
+#[ignore]
+fn planner_correct_word() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY");
+    let model = std::env::var("PLANNER_MODEL").unwrap_or_else(|_| susurro_lib::contract::DEFAULT_PLANNER.into());
+    // (utterance, focused value, Some((heard, word)) or None = no correct_word)
+    let cases: [(&str, &str, Option<(&str, &str)>); 5] = [
+        ("Corrige: Jeff es Jev, J E V.", "Le pregunté a Jeff por el modelo.", Some(("Jeff", "Jev"))),
+        ("The last thing you wrote, GAB must be Jev.", "I asked GAB about it.", Some(("GAB", "Jev"))),
+        ("No es Jeff, es jota e ve.", "Hablé con Jeff ayer.", Some(("Jeff", "Jev"))),
+        ("Fix the word type safe, it's TypeSafe, T Y P E S A F E.", "We use type safe for that.", Some(("type safe", "TypeSafe"))),
+        ("Type hello there.", "", None),
+    ];
+    let mut misses = vec![];
+    for (utt, value, want) in cases {
+        let i = Input { utterance: utt.into(), last: true, app: "Slack".into(), focused: Field { app: "Slack".into(), role: "AXTextArea".into(), name: "Message".into(), value: Some(value.into()), ..Default::default() }, ..Default::default() };
+        let (p, m) = planner::plan_openrouter(&key, &model, &i).expect("planner call");
+        let got = p.actions.iter().find(|a| a.op == "correct_word").map(|a| (a.target.clone().unwrap_or_default(), susurro_lib::command::spelled(a.text.as_deref().unwrap_or(""))));
+        let ok = match want {
+            Some((h, w)) => got.as_ref().is_some_and(|(gh, gw)| gh.eq_ignore_ascii_case(h) && gw == w),
+            None => got.is_none(),
+        };
+        println!("{} {utt:?} -> {got:?} {:?} {} ms ${:.5}", if ok { "OK  " } else { "MISS" }, p.actions.iter().map(planner::label).collect::<Vec<_>>(), m.latency_ms, m.cost);
+        if !ok {
+            misses.push(utt);
+        }
+    }
+    assert!(misses.is_empty(), "misses: {misses:?}");
+}

@@ -302,7 +302,41 @@ pub fn style_rules(text: &str, style: Style, terms: &[String]) -> String {
             }
         }
     }
+    if style == Style::Lowercase {
+        t = lowercase(&t, terms);
+    }
     t
+}
+
+/// Lowercase style: every word whose only capital is its first letter ("Hola", "I") is lowercased. Dictionary
+/// terms keep their casing ("Contaflow"), and so do acronyms and inner capitals ("API", "iPhone", "GitHub").
+fn lowercase(t: &str, terms: &[String]) -> String {
+    let wordc = |c: char| c.is_alphanumeric() || c == '\'' || c == '’';
+    let kept: Vec<(usize, usize)> = terms
+        .iter()
+        .filter(|x| !x.is_empty())
+        .flat_map(|x| t.match_indices(x.as_str()).map(|(i, m)| (i, i + m.len())))
+        // "Contaflow's" keeps the term's casing too.
+        .filter(|&(i, j)| !t[..i].ends_with(wordc) && (!t[j..].starts_with(wordc) || t[j..].starts_with("'s") || t[j..].starts_with("’s")))
+        .collect();
+    let mut out = String::with_capacity(t.len());
+    let mut pos = 0;
+    for w in t.split(|c: char| !wordc(c)).filter(|w| !w.is_empty()) {
+        let start = w.as_ptr() as usize - t.as_ptr() as usize;
+        out.push_str(&t[pos..start]);
+        pos = start + w.len();
+        // Code stays as written: "`Foo`", "Cargo.toml", "MyClass.New()", "$HOME".
+        let code = t[..start].matches('`').count() % 2 == 1 || (glued(t, start, pos) && !t[pos..].starts_with('-') && !t[..start].ends_with('-'));
+        let keep = code || w.chars().skip(1).any(char::is_uppercase) || kept.iter().any(|&(i, j)| i <= start && start < j);
+        out.push_str(&if keep { w.to_string() } else { w.to_lowercase() });
+    }
+    out.push_str(&t[pos..]);
+    out
+}
+
+/// Drops the Spanish opening marks: "Hola, ¿cómo estás?" -> "Hola, cómo estás?". The closing ? and ! stay.
+pub fn strip_inverted(t: &str) -> String {
+    t.replace(['¿', '¡'], "")
 }
 
 // ---------- hallucination filter ----------
@@ -357,16 +391,62 @@ pub fn is_hallucination(text: &str) -> bool {
 
 // ---------- press enter ----------
 
-const PRESS_ENTER: &[[&str; 2]] = &[["press", "enter"], ["presiona", "enter"], ["pulsa", "enter"]];
+/// Tail words that press Return. Fuzzy on purpose: STT hears "press enter" as "presenter", "press center",
+/// "prez enter". (first words, last words); an empty first list = a one-word trigger.
+const PRESS_ENTER: &[(&[&str], &[&str])] = &[
+    (&["press", "pres", "prez", "pressed", "presses", "hit", "presiona", "presione", "pulsa", "pulse", "dale", "dar", "aprieta"], &["enter", "inter", "entre", "intro", "return"]),
+    (&["press", "pres", "prez"], &["center"]),
+    // Not "and enter": "open the door and enter" is English.
+    (&["y"], &["enter"]),
+    (&[], &["presenter", "prezenter", "enviar", "envialo", "enter"]),
+];
 
-/// Some(text without the phrase) when the text ends with "press enter" / "presiona enter".
+/// One-word triggers that are also a verb after another verb ("no olvides enviar", "necesito enviar"): they count
+/// only after punctuation or alone. A wrong Enter sends a cut message, a missed one costs a key press.
+const STRICT_ONE_WORD: &[&str] = &["enviar", "envialo", "enter"];
+
+/// Before a two-word phrase these make it a description, not an order: "I pressed enter", "go to the press center".
+const SUBJECTS: &[&str] = &["i", "you", "he", "she", "we", "they", "it", "yo", "tu", "el", "ella", "ellos", "usted"];
+
+/// Before a one-word trigger these make it a word of the sentence: "the TV presenter", "tengo que enviar".
+const NOT_A_TRIGGER: &[&str] = &[
+    "tv", "news", "radio", "show", "game", "guest", "best", "great", "good", "new", "famous", "que", "para", "por", "sin",
+    "a", "puedo", "puedes", "quiero", "quieres", "voy", "vas", "va", "vamos", "hay", "debo", "debes", "tengo", "tienes",
+    "lo", "le", "me", "te", "se", "nos", "les", "please", "to", "must", "will", "can", "should", "you", "i", "we", "then",
+    "y", "and", "not", "no", "or", "o", "we'll", "i'll", "the", "press", "hit", "as", "excellent", "amazing", "awesome",
+    "main", "keynote", "nice", "bad", "terrible", "former", "our",
+];
+
+/// Some(text without the phrase) when a dictation ends with a press-enter phrase (EN/ES, fuzzy, see PRESS_ENTER).
+/// Only the tail counts: "the presenter said hi" stays text.
 pub fn strip_press_enter(text: &str) -> Option<String> {
     let toks = tokenize(text);
     let n = toks.len();
-    if n < 2 || !PRESS_ENTER.iter().any(|p| toks[n - 2].norm == p[0] && toks[n - 1].norm == p[1]) {
+    let last = toks.last()?;
+    // Only punctuation after the phrase.
+    if text[last.end..].chars().any(char::is_alphanumeric) {
         return None;
     }
-    Some(text[..toks[n - 2].start].trim_end_matches(|c: char| c.is_whitespace() || c == ',').to_string())
+    let start = PRESS_ENTER.iter().find_map(|(first, lasts)| {
+        if !lasts.contains(&last.norm.as_str()) {
+            return None;
+        }
+        if first.is_empty() {
+            let prev = n.checked_sub(2).map(|i| &toks[i]);
+            let free = match prev {
+                None => true,
+                // "Run it. Enviar." / "listo, presenter": punctuation before = a command.
+                Some(p) if text[p.end..last.start].chars().any(|c| ",.;:!?".contains(c)) => true,
+                Some(p) => !STRICT_ONE_WORD.contains(&last.norm.as_str()) && !NOT_A_TRIGGER.contains(&p.norm.as_str()) && !DETERMINERS.contains(&p.norm.as_str()),
+            };
+            return free.then_some(last.start);
+        }
+        let p = toks.get(n.checked_sub(2)?)?;
+        let before = n.checked_sub(3).map(|i| &toks[i]).filter(|b| text[b.end..p.start].chars().all(char::is_whitespace));
+        let described = before.is_some_and(|b| SUBJECTS.contains(&b.norm.as_str()) || DETERMINERS.contains(&b.norm.as_str()));
+        (first.contains(&p.norm.as_str()) && sep_ok(&text[p.end..last.start]) && !described).then_some(p.start)
+    })?;
+    Some(text[..start].trim_end_matches(|c: char| c.is_whitespace() || c == ',').to_string())
 }
 
 #[cfg(test)]
@@ -487,9 +567,86 @@ mod tests {
 
     #[test]
     fn press_enter_table() {
-        assert_eq!(strip_press_enter("Send it, press enter."), Some("Send it".into()));
-        assert_eq!(strip_press_enter("ok presiona enter"), Some("ok".into()));
-        assert_eq!(strip_press_enter("press enter to continue"), None);
-        assert_eq!(strip_press_enter("hello"), None);
+        let cases: &[(&str, Option<&str>)] = &[
+            ("Send it, press enter.", Some("Send it")),
+            ("Run the tests press enter", Some("Run the tests")),
+            ("Run the tests, presenter.", Some("Run the tests")),
+            ("run the tests presenter", Some("run the tests")),
+            ("Deploy it. Press center.", Some("Deploy it.")),
+            ("ls prez enter", Some("ls")),
+            ("git status, pres enter", Some("git status")),
+            ("Ok, hit enter.", Some("Ok")),
+            ("Press enter.", Some("")),
+            ("Presenter.", Some("")),
+            ("Done. Enter.", Some("Done.")),
+            // Spanish
+            ("ok presiona enter", Some("ok")),
+            ("Mándalo, dale enter.", Some("Mándalo")),
+            ("hola cómo estás y enter", Some("hola cómo estás")),
+            ("Nos vemos mañana, enviar.", Some("Nos vemos mañana")),
+            ("Listo, enviar", Some("Listo")),
+            ("Enviar.", Some("")),
+            ("pulsa intro", Some("")),
+            // mid-sentence or a word of the sentence: text
+            ("press enter to continue", None),
+            ("The TV presenter said hello", None),
+            ("I met the TV presenter", None),
+            ("She is a great presenter.", None),
+            ("Tengo que enviar", None),
+            ("Lo voy a enviar.", None),
+            ("Please enter", None),
+            ("You must enter", None),
+            ("left and center", None),
+            ("Listo enviar", None),
+            ("No olvides enviar.", None),
+            ("Necesito enviar", None),
+            ("I pressed enter.", None),
+            ("To submit, you press enter.", None),
+            ("Go to the press center", None),
+            ("Open the door and enter.", None),
+            ("We hired her as presenter", None),
+            ("She was an excellent presenter.", None),
+            ("Then press enter", Some("Then")),
+            ("Please press enter.", Some("Please")),
+            ("hello", None),
+            ("", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(strip_press_enter(input).as_deref(), *want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn lowercase_style_table() {
+        let terms = vec!["Contaflow".to_string(), "kubectl".to_string(), "Visual Studio Code".to_string()];
+        let cases = [
+            ("Hola. Nos vemos mañana, Pablo.", "hola. nos vemos mañana, pablo."),
+            ("I think Contaflow is down. Check kubectl.", "i think Contaflow is down. check kubectl."),
+            ("The API is down, ask GitHub support.", "the API is down, ask GitHub support."),
+            ("Open Visual Studio Code. Then Safari.", "open Visual Studio Code. then safari."),
+            ("Don't Stop", "don't stop"),
+            ("¿Qué tal? ¡Genial!", "¿qué tal? ¡genial!"),
+            ("Contaflows Are Cool", "contaflows are cool"),
+            ("Contaflow's API is down.", "Contaflow's API is down."),
+            ("Run `Foo.bar()` now.", "run `Foo.bar()` now."),
+            ("Open Cargo.toml and MyClass.New() then exit.", "open Cargo.toml and MyClass.New() then exit."),
+            ("Non-linear. Fine.", "non-linear. fine."),
+        ];
+        for (input, want) in cases {
+            assert_eq!(style_rules(input, Style::Lowercase, &terms), want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn inverted_marks_table() {
+        let cases = [
+            ("¿cómo estás?", "cómo estás?"),
+            ("Hola, ¿cómo estás? ¡Qué bueno!", "Hola, cómo estás? Qué bueno!"),
+            ("¡Vamos!", "Vamos!"),
+            ("No marks here.", "No marks here."),
+        ];
+        for (input, want) in cases {
+            assert_eq!(strip_inverted(input), want, "input: {input:?}");
+        }
     }
 }

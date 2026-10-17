@@ -53,6 +53,9 @@ pub struct CommandSettings {
     /// The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
     /// spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
     pub planner_model: String,
+    /// The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
+    /// "Latency"), else the dictation provider.
+    pub stt: Option<SttProvider>,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -161,6 +164,10 @@ pub enum SttProvider {
     /// OpenRouter's JSON transcription API (stt/openrouter.rs): dictionary words go as provider options.
     #[serde(rename = "openrouter")]
     OpenRouter,
+    /// ElevenLabs Scribe v2 Realtime over a WebSocket (stt/scribe_rt.rs): the words arrive while you speak.
+    /// Batch paths (Retry, the fallback) use MAI when an OpenRouter key exists, else Scribe v2 batch.
+    #[serde(rename = "elevenlabs_realtime")]
+    ElevenLabsRealtime,
 }
 
 #[serde(default)]
@@ -192,6 +199,10 @@ pub enum LlmProvider {
 pub struct Styles {
     pub style: Style,
     pub raw_apps: Vec<String>,
+    /// Drop the Spanish opening marks ¿ ¡ (? and ! stay). Pablo does not write them when chatting.
+    pub strip_inverted: bool,
+    /// Bundle ids that keep ¿ ¡ even with `strip_inverted` on.
+    pub inverted_apps: Vec<String>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -200,6 +211,8 @@ pub enum Style {
     Casual,
     VeryCasual,
     Excited,
+    /// No capital letters anywhere (dictionary words and acronyms keep theirs); periods and commas stay.
+    Lowercase,
 }
 
 #[serde(default)]
@@ -213,6 +226,7 @@ pub struct PasteOpts {
     /// Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
     /// 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
     pub restore_delay_ms: u32,
+    /// "press enter" / "presenter" / "dale enter" / "enviar" at the end of a dictation: dropped, then Return.
     pub press_enter_command: bool,
 }
 
@@ -567,6 +581,8 @@ pub struct LiveState {
     pub pending: Option<String>,
     /// Pablo moved the mouse or typed: the marks hide until the next order.
     pub took_over: bool,
+    /// Pablo pressed a key or clicked: the queue waits (no more actions) until his next spoken order.
+    pub paused: bool,
     /// The last chunk of text heard.
     pub last_said: String,
 }
@@ -623,7 +639,8 @@ pub struct Navigate {
 /// v3: voice control (hotkeys.command = "F2"), and an empty OpenRouter STT model becomes MAI-Transcribe 2.
 /// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
 /// v5: hotkeys.recents ("Ctrl+" + an F-key ptt), the old 400 ms grace becomes 1000, LLM cleanup off once for MAI STT.
-pub const SETTINGS_VERSION: u32 = 5;
+/// v6: "press enter" at the end of a dictation is on by default (turned on once for older files).
+pub const SETTINGS_VERSION: u32 = 6;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
 /// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
 /// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
@@ -725,7 +742,7 @@ impl Default for CleanupSettings {
 
 impl Default for Styles {
     fn default() -> Self {
-        Self { style: Style::Formal, raw_apps: vec![] }
+        Self { style: Style::Formal, raw_apps: vec![], strip_inverted: true, inverted_apps: vec![] }
     }
 }
 
@@ -737,7 +754,7 @@ impl Default for DictOpts {
 
 impl Default for PasteOpts {
     fn default() -> Self {
-        Self { restore_clipboard: true, restore_delay_ms: 500, press_enter_command: false }
+        Self { restore_clipboard: true, restore_delay_ms: 500, press_enter_command: true }
     }
 }
 
@@ -767,7 +784,7 @@ impl Default for SessionState {
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into() }
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), stt: None }
     }
 }
 

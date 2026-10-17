@@ -105,7 +105,9 @@ if [ "$RESET" = 1 ]; then
 fi
 if [ "$OPEN" = 1 ]; then
   open "$DEST"
-  echo "susurro is open. Hold your talk key (F1 by default) and speak."
+  # The user's own talk key from settings.json; F1 (the default) before the first run writes it.
+  PTT="$(plutil -extract hotkeys.ptt raw -o - "$HOME/Library/Application Support/$BUNDLE_ID/settings.json" 2>/dev/null || true)"
+  echo "susurro is open. Hold ${PTT:-F1} and speak."
 else
   echo "Open it: open -a susurro"
 fi

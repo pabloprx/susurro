@@ -112,10 +112,10 @@ export default function Settings() {
         </Row>
       </div>
 
-      <Label>Experimental</Label>
+      <Label>Sending</Label>
       <div className="card">
-        <Row title="Press-enter command" help={"End with “press enter” to send the message after the paste."}>
-          <Toggle label="Press-enter command" on={s.paste.press_enter_command} onChange={(v) => save((x) => void (x.paste.press_enter_command = v))} />
+        <Row title="Say “press enter” to send" help={"End a dictation with “press enter”, “dale enter” or “enviar”: susurro drops the words and presses Return after the paste."}>
+          <Toggle label="Say press enter to send" on={s.paste.press_enter_command} onChange={(v) => save((x) => void (x.paste.press_enter_command = v))} />
         </Row>
       </div>
 

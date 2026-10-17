@@ -69,6 +69,10 @@ fn migrate(mut s: Settings) -> Settings {
             s.cleanup.level = CleanupLevel::None;
         }
     }
+    // v6 (next-queue 3): "press enter" at the end of a dictation is on by default; older files had it off.
+    if s.version < 6 {
+        s.paste.press_enter_command = true;
+    }
     s.version = SETTINGS_VERSION;
     s
 }
@@ -284,7 +288,7 @@ mod tests {
         let s = load(&p);
         assert_eq!(s.hotkeys.command, "F2");
         assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
-        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into() }, "opt-in, also for migrated users");
+        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), stt: None }, "opt-in, also for migrated users");
         assert_eq!(s.version, SETTINGS_VERSION);
         // A picked model is kept; a v3 user may clear it on purpose.
         std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
@@ -373,12 +377,25 @@ mod tests {
     }
 
     #[test]
+    fn v6_turns_press_enter_on_once() {
+        let p = tmp_dir("v6mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":5,"paste":{"press_enter_command":false}}"#).unwrap();
+        let s = load(&p);
+        assert!(s.paste.press_enter_command && s.styles.strip_inverted);
+        let mut s2 = s.clone();
+        s2.paste.press_enter_command = false;
+        save(&p, &s2).unwrap();
+        assert!(!load(&p).paste.press_enter_command, "a v6 user who turns it off keeps it off");
+    }
+
+    #[test]
     fn wire_names_are_snake_case() {
         let j = serde_json::to_value(Settings::default()).unwrap();
         assert_eq!(j["stt"]["provider"], "whisper_local");
         assert_eq!(j["cleanup"]["provider"], "openrouter");
         assert_eq!(j["mic"]["selection"], "auto");
         assert_eq!(j["styles"]["style"], "formal");
+        assert_eq!(serde_json::to_value(Style::Lowercase).unwrap(), "lowercase");
         let d = serde_json::to_value(MicSelection::Device { id: "x".into() }).unwrap();
         assert_eq!(d, serde_json::json!({"device": {"id": "x"}}));
     }

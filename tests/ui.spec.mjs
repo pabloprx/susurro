@@ -562,6 +562,7 @@ test.describe("styles", () => {
       ["Formal", "Hello, are you free tonight?"],
       ["Very casual", "hey are you free tonight?"],
       ["Excited", "grab dinner!"],
+      ["Lowercase", "hey, are you free tonight? i was thinking"],
       ["Casual", "Hey, are you free tonight?"],
     ]) {
       await page.getByRole("radiogroup", { name: "Style" }).getByRole("radio", { name: new RegExp(`^${name}`) }).click();
@@ -584,6 +585,23 @@ test.describe("styles", () => {
     await expect(page.locator(".app-row", { hasText: "com.example.thing" })).toContainText("thing");
     await page.getByRole("button", { name: "Remove com.example.thing" }).click();
     await expect(rows).toHaveCount(3);
+  });
+  test("spanish marks: drop by default, keep-in apps, toggle off hides the list", async ({ page }) => {
+    await expect(sw(page, "Drop ¿ and ¡")).toHaveAttribute("aria-checked", "true");
+    await page.getByRole("button", { name: "Keep in app" }).click();
+    await page.getByLabel("Bundle id").fill("com.openai.chat");
+    await page.locator(".popover").getByRole("button", { name: "Add", exact: true }).click();
+    const row = page.locator(".app-row", { hasText: "com.openai.chat" });
+    await expect(row).toContainText("keeps ¿ ¡");
+    await nav(page, "Home");
+    await nav(page, "Styles");
+    await expect(row).toBeVisible();
+    await sw(page, "Drop ¿ and ¡").click();
+    await expect(row).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Keep in app" })).toHaveCount(0);
+    await sw(page, "Drop ¿ and ¡").click();
+    await page.getByRole("button", { name: "Remove com.openai.chat from the ¿ ¡ list" }).click();
+    await expect(row).toHaveCount(0);
   });
   test("needs-LLM link goes to Providers", async ({ page }) => {
     await nav(page, "Providers");
@@ -620,6 +638,13 @@ test.describe("providers", () => {
     const turbo = page.locator(".models .row", { hasText: "large-v3-turbo q5_0" });
     await turbo.getByRole("button", { name: "Delete large-v3-turbo q5_0" }).click();
     await expect(turbo.getByRole("button", { name: "Download" })).toBeVisible();
+  });
+  test("Scribe Realtime is a provider with a LIVE badge", async ({ page }) => {
+    const rt = prov(page, "Scribe Realtime");
+    await expect(rt.locator(".badge-chip")).toHaveText("LIVE");
+    await rt.click();
+    await expect(rt).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(".prov-body")).toContainText("0.2 s after you let go");
   });
   test("English-only model warns for other languages", async ({ page }) => {
     await page.locator(".models .row", { hasText: "base.en q5_1" }).getByRole("button", { name: "Use" }).click();
@@ -1197,7 +1222,7 @@ test.describe("settings", () => {
     await nav(page, "Settings");
   });
   test("every toggle flips and survives a screen change", async ({ page }) => {
-    const toggles = ["Launch at login", "Sounds", "Show idle pill", "Spoken punctuation", "Fuzzy word matching", "Restore clipboard", "Save history", "Press-enter command"];
+    const toggles = ["Launch at login", "Sounds", "Show idle pill", "Spoken punctuation", "Fuzzy word matching", "Restore clipboard", "Save history", "Say press enter to send"];
     const before = {};
     for (const t of toggles) before[t] = await sw(page, t).getAttribute("aria-checked");
     for (const t of toggles) {

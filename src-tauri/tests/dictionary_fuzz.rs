@@ -211,7 +211,7 @@ fn says(t: String) -> impl Fn(&SttRequest) -> anyhow::Result<SttOutput> {
 }
 
 fn opts(style: Style) -> Opts<'static> {
-    Opts { language: None, style, raw_app: false, press_enter_command: true }
+    Opts { language: None, style, raw_app: false, press_enter_command: true, strip_inverted: false, slash: None }
 }
 
 fn style() -> impl Strategy<Value = Style> {
