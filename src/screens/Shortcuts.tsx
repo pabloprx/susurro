@@ -49,9 +49,10 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
       .then(() => setMsg(null))
       .catch((e) => setMsg({ slot, text: String(e) }));
 
+  // Reset the pressed codes only when recording starts: the effect below re-runs on every `held` change.
+  useEffect(() => void (codes.current = new Set()), [rec]);
   useEffect(() => {
     if (!rec || !s) return;
-    codes.current = new Set();
     const down = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();

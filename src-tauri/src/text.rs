@@ -84,6 +84,24 @@ pub fn sep_ok(sep: &str) -> bool {
         && !(sep.contains('.') && sep.chars().any(char::is_whitespace))
 }
 
+/// The window is part of an email, URL, code identifier or glued word: "pablo@x.app", "github.com/x",
+/// "non-linear", "SUPABASE_URL", "--flag", "$var", "mod::Type".
+/// Inner separators of a multi-token window ("node.js") are inside the window, so they still match,
+/// except "_" ("pablo_perez" is an identifier, not a name).
+pub fn glued(s: &str, start: usize, end: usize) -> bool {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut before = s[..start].chars().rev();
+    let mut after = s[end..].chars();
+    let (b1, b2, a1, a2) = (before.next(), before.next(), after.next(), after.next());
+    s[start..end].contains('_')
+        || matches!(b1, Some('@' | '/' | '_' | '$'))
+        || matches!(a1, Some('@' | '/' | '_'))
+        || (matches!(b1, Some('.' | '-')) && (word(b2) || b2 == Some('-')))
+        || (matches!(a1, Some('.' | '-')) && word(a2))
+        || (b1 == Some(':') && b2 == Some(':'))
+        || (a1 == Some(':') && a2 == Some(':'))
+}
+
 // ---------- spoken punctuation ----------
 
 /// (normalized phrase, mark, conditional). Conditional commands apply only at the end of the text,
@@ -133,7 +151,11 @@ fn command_at(s: &str, toks: &[Token], i: usize) -> Option<(usize, &'static str,
 }
 
 fn conditional_ok(s: &str, toks: &[Token], i: usize, n: usize) -> bool {
-    if i > 0 && DETERMINERS.contains(&toks[i - 1].norm.as_str()) && sep_ok(&s[toks[i - 1].end..toks[i].start]) {
+    // Only a plain space: "this, comma, and that" is a command, "a comma" is a noun.
+    if i > 0
+        && DETERMINERS.contains(&toks[i - 1].norm.as_str())
+        && s[toks[i - 1].end..toks[i].start].chars().all(char::is_whitespace)
+    {
         return false;
     }
     let j = i + n;
@@ -166,14 +188,15 @@ pub fn spoken_punctuation(s: &str) -> String {
     };
     let mut i = 0;
     while i < toks.len() {
-        let Some((n, mark, _)) = command_at(s, &toks, i).filter(|&(n, _, c)| !c || conditional_ok(s, &toks, i, n))
+        let Some((n, mark, _)) = command_at(s, &toks, i)
+            .filter(|&(n, _, c)| !glued(s, toks[i].start, toks[i + n - 1].end) && (!c || conditional_ok(s, &toks, i, n)))
         else {
             i += 1;
             continue;
         };
         push(&mut out, &s[pos..toks[i].start], &mut cap_next);
         // Drop the punctuation whisper put before the command; a newline keeps a sentence end.
-        let drop: &[char] = if mark.starts_with('\n') { &[',', ';', ':'] } else { &[',', '.', ';', ':'] };
+        let drop: &[char] = if mark.starts_with('\n') { &[',', ';', ':'] } else { &[',', '.', ';', ':', '?', '!'] };
         let kept = out.trim_end().trim_end_matches(drop).trim_end().len();
         out.truncate(kept.max(floor));
         out.push_str(mark);
@@ -216,7 +239,7 @@ pub fn backtrack_rules(text: &str) -> String {
         let before = s[..toks[i].start].trim_end_matches(|c: char| c.is_whitespace() || ",;:".contains(c));
         // If the phrase starts a sentence, the sentence before it is the previous one.
         let core = before.strip_suffix(['.', '!', '?', '\n']).unwrap_or(before);
-        let cut = core.rfind(['.', '!', '?', '\n']).map_or(0, |p| p + 1);
+        let cut = last_sentence_end(core);
         let head = s[..cut].trim_end();
         let tail = capitalize_first(&s[end..]);
         s = match (head.is_empty(), tail.is_empty()) {
@@ -227,6 +250,25 @@ pub fn backtrack_rules(text: &str) -> String {
         };
     }
     s
+}
+
+/// Never a sentence end: "Dr. Smith", "Sra. Pérez".
+const ABBREVIATIONS: &[&str] = &["dr", "dra", "mr", "mrs", "ms", "sr", "sra", "srta", "prof", "st", "vs", "ud", "uds"];
+
+/// Byte offset just after the last sentence end in `s` (0 if none). A sentence end is a newline, or
+/// `.!?` followed by whitespace, so "1.5", "v1.2", "example.com" and "Dr. Smith" do not count.
+fn last_sentence_end(s: &str) -> usize {
+    s.char_indices()
+        .filter(|&(i, c)| {
+            let next_space = s[i + c.len_utf8()..].starts_with(char::is_whitespace);
+            let abbr = || {
+                let w = s[..i].rsplit(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+                ABBREVIATIONS.contains(&norm(w).as_str())
+            };
+            c == '\n' || ("!?".contains(c) && next_space) || (c == '.' && next_space && !abbr())
+        })
+        .last()
+        .map_or(0, |(i, c)| i + c.len_utf8())
 }
 
 // ---------- style rules ----------
@@ -283,6 +325,28 @@ const HALLUCINATIONS: &[&str] = &[
     "music",
     "musica",
 ];
+
+/// STT output as one line of text: whisper-server joins its segments with "\n " and writes
+/// "[BLANK_AUDIO]" / "[MUSIC]" for non-speech. Spoken "new line" is handled later, from the words.
+pub fn tidy_stt(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(a) = rest.find('[') {
+        let tag = rest[a + 1..].find(']').map(|b| &rest[a + 1..a + 1 + b]);
+        match tag.filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphabetic() || c == '_' || c == ' ')) {
+            Some(t) => {
+                out.push_str(&rest[..a]);
+                rest = &rest[a + t.len() + 2..];
+            }
+            None => {
+                out.push_str(&rest[..=a]);
+                rest = &rest[a + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// True when the whole result is a phrase whisper invents on silence ("Thank you.", "Gracias.").
 pub fn is_hallucination(text: &str) -> bool {
@@ -348,6 +412,9 @@ mod tests {
             ("Llegamos a las tres en punto.", "Llegamos a las tres en punto."),
             ("Estaba en estado de coma.", "Estaba en estado de coma."),
             ("qué tal signo de interrogación", "qué tal?"),
+            // whisper already wrote the mark the user spoke: one mark, not two
+            ("Hola, ¿cómo estás? Signo de interrogación nueva línea hasta mañana.", "Hola, ¿cómo estás?\nHasta mañana."),
+            ("Is it done? Question mark", "Is it done?"),
             ("primero punto y coma segundo", "primero; segundo"),
             ("la lista dos puntos", "la lista:"),
             ("tengo dos puntos en el examen", "tengo dos puntos en el examen"),
@@ -401,6 +468,20 @@ mod tests {
         }
         for t in ["Thank you for the report.", "Gracias por todo, Pablo.", "You are right.", ""] {
             assert!(!is_hallucination(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn tidy_stt_table() {
+        let cases = [
+            (" One sentence.\n Two, and\n three.\n [BLANK_AUDIO]", "One sentence. Two, and three."),
+            ("[MUSIC] hello [Music]", "hello"),
+            ("[BLANK_AUDIO]", ""),
+            ("keep [1] and [a-b] and [x", "keep [1] and [a-b] and [x"),
+            ("  plain  ", "plain"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(tidy_stt(input), want, "input: {input:?}");
         }
     }
 

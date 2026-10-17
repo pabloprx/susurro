@@ -288,7 +288,7 @@ function ToastCard({ t, onDone }: { t: LocalToast & { leaving?: boolean }; onDon
             className={`btn ${i === t.actions.length - 1 ? "secondary" : "ghost"} sm`}
             onClick={() => {
               if (t.local) a.run?.();
-              else api.toastAction(t.id, a.id);
+              else api.toastAction(t.id, a.id).catch((e) => toast(String(e), { kind: "error" }));
               onDone();
             }}
           >

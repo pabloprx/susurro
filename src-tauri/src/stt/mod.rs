@@ -122,7 +122,7 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
     let resp = rb.send().map_err(|e| {
         if e.is_timeout() {
             anyhow::anyhow!("{what} timed out")
-        } else if e.is_connect() {
+        } else if e.is_connect() || refused(&e) {
             anyhow::anyhow!("Cannot connect to {what}. Is it running and reachable?")
         } else {
             anyhow::anyhow!("{what} request failed: {e}")
@@ -139,11 +139,33 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
     match code {
         200..=299 => serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
         401..=403 if out_of_credits => anyhow::bail!("{what}: out of credits or over quota (HTTP {code}): {snippet}"),
-        401 | 403 => anyhow::bail!("{what}: invalid or missing API key (HTTP {code})"),
+        401 | 403 => match server_reason(&body) {
+            // "API key expired" vs a typo: pass the server's reason on.
+            Some(r) => anyhow::bail!("{what}: invalid or missing API key (HTTP {code}): {r}"),
+            None => anyhow::bail!("{what}: invalid or missing API key (HTTP {code})"),
+        },
         429 => anyhow::bail!("{what}: rate limited or out of credits (HTTP 429)"),
         500.. => anyhow::bail!("{what} server error (HTTP {code}): {snippet}"),
         _ => anyhow::bail!("{what} rejected the request (HTTP {code}): {snippet}"),
     }
+}
+
+/// A streamed (multipart) body to a closed port fails as a body error: reqwest's blocking body
+/// channel reports "Disconnected" and drops the connect error. Probe the socket to tell.
+fn refused(e: &reqwest::Error) -> bool {
+    use std::net::TcpStream;
+    let Some(u) = e.url().filter(|_| e.is_body() || e.is_request()) else { return false };
+    let Some(addr) = u.socket_addrs(|| None).ok().and_then(|a| a.into_iter().next()) else { return false };
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err()
+}
+
+/// `{"error":{"message":..}}` (OpenAI/OpenRouter), `{"detail":{"message":..}}` / `{"detail":".."}` (ElevenLabs).
+fn server_reason(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let m = [&v["error"]["message"], &v["detail"]["message"], &v["detail"], &v["message"], &v["error"]]
+        .into_iter()
+        .find_map(|m| m.as_str())?;
+    Some(m.chars().take(200).collect())
 }
 
 pub(crate) fn url(base: &str, path: &str) -> String {
@@ -286,6 +308,17 @@ mod tests {
         }
         let e = send_json(http().get("http://127.0.0.1:9/x"), "Prov").unwrap_err().to_string();
         assert!(e.contains("Cannot connect to Prov"), "{e}");
+        // A multipart POST to a closed port is a body error in reqwest, not a connect error.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", reqwest::blocking::multipart::Part::bytes(vec![0u8; 64 * 1024]).file_name("a.wav"));
+        let e = send_json(http().post(format!("http://127.0.0.1:{port}/x")).multipart(form), "Prov").unwrap_err().to_string();
+        assert!(e.contains("Cannot connect to Prov"), "{e}");
+        // The server's reason for a 401 is kept: an expired key is not a typo.
+        let m = srv.mock("GET", "/x").with_status(401).with_body(r#"{"error":{"message":"API key expired","code":401}}"#).create();
+        let e = send_json(http().get(format!("{}/x", srv.url())), "Prov").unwrap_err().to_string();
+        assert_eq!(e, "Prov: invalid or missing API key (HTTP 401): API key expired");
+        m.remove();
     }
 
     #[test]

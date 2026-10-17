@@ -1,5 +1,6 @@
 //! WP4: frontmost app, full pasteboard save/restore, Cmd+V, Enter (PLAN 5). macOS via objc2 + core-graphics.
-//! Runs on the session actor thread (it sleeps `restore_delay_ms`).
+//! Runs on the session actor thread. The clipboard restore runs `restore_delay_ms` later on its own
+//! thread, so the overlay, History latency and the next hotkey press do not wait for it.
 
 use crate::contract::PasteOpts;
 
@@ -115,6 +116,34 @@ mod mac {
     pub fn general() -> Retained<NSPasteboard> {
         NSPasteboard::generalPasteboard()
     }
+
+    /// (changeCount of our write, what to put back). One at a time: a new paste first restores the
+    /// previous one, so its snapshot is the user's clipboard, not our last dictation.
+    static PENDING: std::sync::Mutex<Option<(isize, Snapshot)>> = std::sync::Mutex::new(None);
+
+    fn restore_pending(only: Option<isize>) {
+        let mut p = PENDING.lock().unwrap();
+        if p.as_ref().is_some_and(|(ours, _)| only.is_none_or(|o| o == *ours)) {
+            let (ours, snap) = p.take().unwrap();
+            let pb = general();
+            if should_restore(ours, pb.changeCount()) {
+                restore(&pb, &snap);
+            }
+        }
+    }
+
+    /// Finish any earlier restore now, so the snapshot taken next is the user's clipboard.
+    pub fn flush_restore() {
+        restore_pending(None);
+    }
+
+    pub fn restore_later(ours: isize, snap: Snapshot, delay_ms: u64) {
+        *PENDING.lock().unwrap() = Some((ours, snap));
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            restore_pending(Some(ours));
+        });
+    }
 }
 
 pub fn frontmost_app() -> Option<AppRef> {
@@ -128,6 +157,13 @@ pub fn paste(text: &str, o: &PasteOpts) -> PasteOutcome {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::event::CGEventFlags;
+        #[cfg(debug_assertions)]
+        if let Some(why) = crate::test_hooks::paste_blocked() {
+            // Pablo uses this Mac during tests: no keys and no clipboard write outside the test target.
+            log::warn!("test paste guard: {why}; not pasting {} chars", text.chars().count());
+            return PasteOutcome::CopiedOnly;
+        }
+        mac::flush_restore();
         let pb = mac::general();
         if !crate::permissions::accessibility_trusted() {
             // CGEvent cannot post without Accessibility: leave the text on the clipboard, no restore.
@@ -138,10 +174,7 @@ pub fn paste(text: &str, o: &PasteOpts) -> PasteOutcome {
         let ours = mac::write_text(&pb, text, true);
         mac::key(9, CGEventFlags::CGEventFlagCommand); // kVK_ANSI_V
         if let Some(snap) = snap {
-            std::thread::sleep(std::time::Duration::from_millis(o.restore_delay_ms as u64));
-            if should_restore(ours, pb.changeCount()) {
-                mac::restore(&pb, &snap);
-            }
+            mac::restore_later(ours, snap, o.restore_delay_ms as u64);
         }
         PasteOutcome::Pasted
     }
@@ -153,6 +186,10 @@ pub fn paste(text: &str, o: &PasteOpts) -> PasteOutcome {
 }
 
 pub fn press_enter() {
+    #[cfg(debug_assertions)]
+    if let Some(why) = crate::test_hooks::paste_blocked() {
+        return log::warn!("test paste guard: {why}; not pressing Return");
+    }
     #[cfg(target_os = "macos")]
     mac::key(36, core_graphics::event::CGEventFlags::empty()); // kVK_Return
 }

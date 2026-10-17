@@ -1,0 +1,31 @@
+{
+  "_doc": "Source of truth for make.sh. text = what the voice says. Files are 16 kHz mono s16 WAV. dict.json holds the entries these phrases need.",
+  "files": [
+    {"file": "en_custom.wav", "voice": "Samantha", "lang": "en", "tags": ["custom_words"],
+     "text": "I pushed the Contaflow fix to Supabase, then ran kubectl apply. Ping Pablo Pérez and Francisca Ugarte."},
+    {"file": "en_snippet.wav", "voice": "Samantha", "lang": "en", "tags": ["snippet"],
+     "text": "Sure, here is my calendar link."},
+    {"file": "en_numbers.wav", "voice": "Samantha", "lang": "en", "tags": ["numbers"],
+     "text": "The invoice is 1,250 dollars, due on March 3rd. Call 555 0199 before 5 PM."},
+    {"file": "en_backtrack.wav", "voice": "Samantha", "lang": "en", "tags": ["backtrack"],
+     "text": "Let's meet at three, no wait, actually let's meet at four."},
+    {"file": "en_scratch.wav", "voice": "Samantha", "lang": "en", "tags": ["backtrack", "rule_based"],
+     "text": "Let's meet at three. Scratch that. Let's meet at four."},
+    {"file": "en_fillers.wav", "voice": "Samantha", "lang": "en", "tags": ["fillers"],
+     "text": "Um, so, uh, I think we should, like, ship it today."},
+    {"file": "en_punct.wav", "voice": "Samantha", "lang": "en", "tags": ["spoken_punctuation"],
+     "text": "Hello comma how are you question mark new line see you tomorrow period"},
+    {"file": "es_accents.wav", "voice": "Paulina", "lang": "es", "tags": ["spanish", "accents"],
+     "text": "La reunión es mañana a las tres. ¿Puedes revisar el informe de facturación?"},
+    {"file": "es_custom.wav", "voice": "Paulina", "lang": "es", "tags": ["spanish", "custom_words"],
+     "text": "Francisca Ugarte revisó Contaflow con Pablo Pérez en Supabase."},
+    {"file": "es_backtrack.wav", "voice": "Mónica", "lang": "es", "tags": ["spanish", "backtrack"],
+     "text": "Nos vemos el lunes. Borra eso. Nos vemos el martes."},
+    {"file": "es_punct.wav", "voice": "Mónica", "lang": "es", "tags": ["spanish", "spoken_punctuation"],
+     "text": "Hola coma cómo estás signo de interrogación nueva línea hasta mañana punto"},
+    {"file": "long.wav", "voice": "Samantha", "lang": "en", "tags": ["long"], "pad_to_s": 60,
+     "text": "This is a long dictation to test the full pipeline with a minute of speech. Contaflow helps small companies keep their books in order. Every morning the team checks the bank feed, matches each payment to an invoice, and flags anything that looks wrong. Pablo Pérez wrote most of the importer, and Francisca Ugarte reviews the monthly reports before they go to clients. The backend runs on Supabase, and the workers run on a small cluster that we manage with kubectl. When a deploy goes out, we watch the error rate for ten minutes, then we post a short note in the team channel. If something breaks, we roll back first and ask questions later. The goal is simple: no client should ever see a wrong balance. That is the whole job, and it is a good one. Thanks for listening to this long test clip, and have a nice day."},
+    {"file": "short.wav", "voice": "Samantha", "lang": "en", "tags": ["too_short"], "trim_to_s": 0.2, "text": "hi"},
+    {"file": "silence.wav", "lang": "none", "tags": ["silence"], "silence_s": 3, "text": ""}
+  ]
+}

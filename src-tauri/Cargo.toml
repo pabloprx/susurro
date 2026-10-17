@@ -7,7 +7,8 @@ edition = "2024"
 
 [lib]
 name = "susurro_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only: desktop app. staticlib/cdylib (mobile) made `cargo test --release` link a panic=abort lib into unwind tests.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.6", features = [] }
@@ -47,6 +48,7 @@ block2 = "0.6"
 
 [dev-dependencies]
 mockito = "1.7"
+proptest = "1"
 
 [profile.release]
 codegen-units = 1

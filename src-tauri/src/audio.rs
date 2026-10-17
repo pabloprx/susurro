@@ -71,6 +71,8 @@ pub struct MicRuntime {
     pub fallback_from: Option<String>,
     /// The device a session Recorder is capturing from right now (the monitor sends DeviceLost if it vanishes).
     pub recording: Option<String>,
+    /// Devices that got a "New mic" prompt: its actions still know the name after an unplug.
+    pub prompted: Vec<DeviceInfo>,
 }
 
 // ---------- pure logic (unit tested) ----------
@@ -101,19 +103,15 @@ pub fn visible(devices: &[DeviceInfo], show_virtual: bool, active: Option<&str>)
     devices.iter().filter(|d| show_virtual || d.kind != DeviceKind::Virtual || Some(d.id.as_str()) == active).cloned().collect()
 }
 
-/// By id, else by name (the id can change after an OS update, PLAN 3.1).
-/// By id, else by name (an OS update changed the id). A same-name device that is another known entry
-/// is that entry, not this one (two "Shure MV7" mics).
-fn find<'a>(priority: &[KnownDevice], connected: &'a [DeviceInfo], id: &str, name: Option<&str>) -> Option<&'a DeviceInfo> {
-    connected.iter().find(|d| d.id == id).or_else(|| {
-        let n = name?;
-        connected.iter().find(|d| d.name == n && !priority.iter().any(|k| k.id == d.id))
-    })
+/// By id only. A changed id (OS update, PLAN 3.1) is fixed by `heal_ids` on the monitor scan, which
+/// knows which devices just appeared; matching by name here would also take a second identical mic.
+fn find<'a>(connected: &'a [DeviceInfo], id: &str) -> Option<&'a DeviceInfo> {
+    connected.iter().find(|d| d.id == id)
 }
 
 fn auto(priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Option<&str>) -> Option<Resolved> {
     let r = |d: &DeviceInfo, reason| Some(Resolved { info: d.clone(), reason });
-    if let Some(d) = priority.iter().find_map(|k| find(priority, connected, &k.id, Some(&k.name))) {
+    if let Some(d) = priority.iter().find_map(|k| find(connected, &k.id)) {
         return r(d, Reason::Priority);
     }
     if let Some(d) = system_default.and_then(|id| connected.iter().find(|d| d.id == id && d.kind != DeviceKind::Virtual)) {
@@ -127,15 +125,17 @@ fn auto(priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Opti
 pub fn resolve(sel: &MicSelection, priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Option<&str>) -> Option<Resolved> {
     let MicSelection::Device { id } = sel else { return auto(priority, connected, system_default) };
     let name = priority.iter().find(|k| &k.id == id).map(|k| k.name.as_str());
-    if let Some(d) = find(priority, connected, id, name) {
+    if let Some(d) = find(connected, id) {
         return Some(Resolved { info: d.clone(), reason: Reason::Selected });
     }
     let wanted = name.unwrap_or(id).to_string();
     auto(priority, connected, system_default).map(|r| Resolved { reason: Reason::Fallback { wanted }, ..r })
 }
 
-/// Rewrite stored ids that no longer resolve but whose name matches exactly one connected device. Returns true if changed.
-pub fn heal_ids(mic: &mut MicSettings, connected: &[DeviceInfo]) -> bool {
+/// Rewrite stored ids that no longer resolve but whose name matches exactly one connected device that
+/// just `appeared` (this scan's additions, or everything on the first scan). A same-name device that was
+/// already plugged in next to the old one is a second mic, not the old one with a new id. Returns true if changed.
+pub fn heal_ids(mic: &mut MicSettings, connected: &[DeviceInfo], appeared: &[DeviceInfo]) -> bool {
     let mut changed = false;
     for i in 0..mic.priority.len() {
         let k = &mic.priority[i];
@@ -143,7 +143,7 @@ pub fn heal_ids(mic: &mut MicSettings, connected: &[DeviceInfo]) -> bool {
             continue;
         }
         let same: Vec<_> = connected.iter().filter(|d| d.name == k.name).collect();
-        if same.len() != 1 || mic.priority.iter().any(|o| o.id == same[0].id) {
+        if same.len() != 1 || mic.priority.iter().any(|o| o.id == same[0].id) || !appeared.iter().any(|d| d.id == same[0].id) {
             continue;
         }
         let (old, new) = (k.id.clone(), same[0].id.clone());
@@ -369,8 +369,15 @@ impl Meter {
     }
 }
 
+/// What delivers samples: a cpal stream, or (debug) a test WAV feeder. Dropping it stops the callbacks.
+enum Live {
+    Cpal(#[allow(dead_code)] cpal::Stream),
+    #[cfg(debug_assertions)]
+    Feed(#[allow(dead_code)] Feed),
+}
+
 pub struct Recorder {
-    stream: Option<cpal::Stream>,
+    stream: Option<Live>,
     /// Mono samples of the current segment, at `rate`.
     cur: Arc<Mutex<Vec<f32>>>,
     rate: u32,
@@ -426,6 +433,21 @@ impl Recorder {
     }
 
     fn open_stream(&mut self, dev: &DeviceInfo) -> anyhow::Result<()> {
+        #[cfg(debug_assertions)]
+        if let Some(path) = crate::test_hooks::next_audio() {
+            let samples = crate::test_hooks::load_wav(&path)?;
+            let cur = Arc::new(Mutex::new(Vec::with_capacity(samples.len())));
+            let cb = Cb {
+                ch: 1,
+                cur: cur.clone(),
+                first: self.first.clone(),
+                meter: Meter { sumsq: 0.0, n: 0, peak: 0.0, last: Instant::now(), emit: self.on_level.clone() },
+            };
+            log::info!("mic: test audio {} ({} ms) instead of {}", path.display(), samples.len() as u64 * 1000 / RATE as u64, dev.name);
+            (self.stream, self.cur, self.rate, self.lost, self.device) = (Some(Live::Feed(feed(samples, cb))), cur, RATE, Default::default(), dev.clone());
+            self.device_names.push(dev.name.clone());
+            return Ok(());
+        }
         let device = open_device(&cpal::default_host(), dev)?;
         let cfg = pick_config(&device)?;
         let (rate, ch, fmt) = (cfg.sample_rate(), cfg.channels() as usize, cfg.sample_format());
@@ -462,7 +484,7 @@ impl Recorder {
         }?;
         stream.play()?;
         log::info!("mic: recording from {} ({rate} Hz, {ch} ch, {fmt})", dev.name);
-        (self.stream, self.cur, self.rate, self.lost, self.device) = (Some(stream), cur, rate, lost, dev.clone());
+        (self.stream, self.cur, self.rate, self.lost, self.device) = (Some(Live::Cpal(stream)), cur, rate, lost, dev.clone());
         self.device_names.push(dev.name.clone());
         Ok(())
     }
@@ -575,6 +597,40 @@ where
     Ok(stream)
 }
 
+/// Test feeder: pushes 16 kHz samples in real time (10 ms chunks), then silence, until dropped.
+#[cfg(debug_assertions)]
+struct Feed(Arc<AtomicBool>);
+
+#[cfg(debug_assertions)]
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn feed(samples: Vec<f32>, mut cb: Cb) -> Feed {
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    std::thread::spawn(move || {
+        let (t0, mut pos, zeros) = (Instant::now(), 0usize, [0f32; 1600]);
+        while !s.load(Ordering::SeqCst) {
+            // Pace by wall clock, not by sleep count: no drift over a long clip.
+            let due = (t0.elapsed().as_secs_f64() * RATE as f64) as usize;
+            while pos < due {
+                let n = (due - pos).min(zeros.len());
+                let chunk = if pos < samples.len() { &samples[pos..(pos + n).min(samples.len())] } else { &zeros[..n] };
+                let _ = cb.first.set(Instant::now());
+                cb.meter.push(chunk);
+                cb.cur.lock().unwrap().extend_from_slice(chunk);
+                pos += chunk.len();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    Feed(stop)
+}
+
 // ---------- app glue: runtime state, monitor, toasts ----------
 
 /// Build MicState from settings + runtime. Virtual devices are hidden unless `show_virtual`.
@@ -673,7 +729,7 @@ fn on_change(app: &AppHandle, devices: Vec<DeviceInfo>, added: &[DeviceInfo]) {
     let state = app.state::<AppState>();
     let new: Vec<DeviceInfo> = {
         let mut s = state.settings.write().unwrap();
-        heal_ids(&mut s.mic, &devices);
+        heal_ids(&mut s.mic, &devices, added);
         let now = crate::history::now_ms();
         for k in s.mic.priority.iter_mut().filter(|k| devices.iter().any(|d| d.id == k.id)) {
             k.last_seen = now;
@@ -688,6 +744,11 @@ fn on_change(app: &AppHandle, devices: Vec<DeviceInfo>, added: &[DeviceInfo]) {
         new
     };
     save(&state);
+    {
+        let mut m = state.mic.lock().unwrap();
+        m.prompted.retain(|p| !new.iter().any(|d| d.id == p.id));
+        m.prompted.extend(new.iter().cloned());
+    }
     for d in &new {
         let bt = if d.kind == DeviceKind::Bluetooth { " (Bluetooth: using its mic lowers the headset's audio quality)" } else { "" };
         toast(app, None, &format!("mic-new:{}", d.id), ToastKind::Info, format!("New mic: {}{bt}", d.name), &[("switch", "Switch"), ("keep", "Keep current")], 10_000);
@@ -729,19 +790,25 @@ pub fn spawn_monitor(app: AppHandle) {
 pub fn handle_toast_action(app: &AppHandle, toast_id: &str, action_id: &str) -> bool {
     let Some(id) = toast_id.strip_prefix("mic-new:") else { return false };
     let state = app.state::<AppState>();
+    // The device may be unplugged by now (the toast stays 10 s): the prompt kept its name.
+    let (devices, d) = {
+        let mut m = state.mic.lock().unwrap();
+        let p = m.prompted.iter().position(|d| d.id == id).map(|i| m.prompted.remove(i));
+        let d = m.devices.iter().find(|d| d.id == id).cloned().or(p);
+        (m.devices.clone(), d)
+    };
+    {
+        let mut s = state.settings.write().unwrap();
+        if let Some(d) = d.filter(|_| !s.mic.priority.iter().any(|k| k.id == id)) {
+            s.mic.priority.push(known(&d));
+        }
+    }
+    save(&state);
     match action_id {
         "switch" => {
             let _ = select(app, MicSelection::Device { id: id.into() });
         }
         _ => {
-            let devices = state.mic.lock().unwrap().devices.clone();
-            {
-                let mut s = state.settings.write().unwrap();
-                if let Some(d) = devices.iter().find(|d| d.id == id).filter(|_| !s.mic.priority.iter().any(|k| k.id == id)) {
-                    s.mic.priority.push(known(d));
-                }
-            }
-            save(&state);
             apply(app, devices, false);
         }
     }
@@ -954,17 +1021,16 @@ mod tests {
         let moved = dev("ca:usb-new", "Shure MV7", DeviceKind::Usb, false);
         let c = [builtin(), moved.clone()];
         let p = [k("ca:usb", "Shure MV7")];
-        assert_eq!(got(resolve(&sel("ca:usb"), &p, &c, None)), Some(("ca:usb-new".into(), Reason::Selected)));
-        assert_eq!(got(resolve(&MicSelection::Auto, &p, &c, None)), Some(("ca:usb-new".into(), Reason::Priority)));
-
         let mut mic = MicSettings { selection: sel("ca:usb"), priority: p.to_vec(), show_virtual: false };
-        assert!(heal_ids(&mut mic, &c));
+        assert!(heal_ids(&mut mic, &c, &c)); // first scan: everything just appeared
         assert_eq!(mic.priority[0].id, "ca:usb-new");
         assert_eq!(mic.selection, sel("ca:usb-new"));
-        assert!(!heal_ids(&mut mic, &c));
+        assert_eq!(got(resolve(&mic.selection, &mic.priority, &c, None)), Some(("ca:usb-new".into(), Reason::Selected)));
+        assert!(!heal_ids(&mut mic, &c, &c));
         // Two devices with the same name: ambiguous, no heal.
         let mut mic = MicSettings { selection: MicSelection::Auto, priority: p.to_vec(), show_virtual: false };
-        assert!(!heal_ids(&mut mic, &[moved.clone(), dev("ca:usb-2", "Shure MV7", DeviceKind::Usb, false)]));
+        let two = [moved.clone(), dev("ca:usb-2", "Shure MV7", DeviceKind::Usb, false)];
+        assert!(!heal_ids(&mut mic, &two, &two));
     }
 
     #[test]
@@ -1044,11 +1110,24 @@ mod tests {
     }
 
     #[test]
+    fn second_identical_mic_is_not_the_unplugged_one() {
+        // devices-real step 7: "E2E A" (x) is selected, a second "E2E A" (y) is plugged next to it, then x is unplugged.
+        let (x, y) = (dev("ca:x", "E2E A", DeviceKind::Usb, false), dev("ca:y", "E2E A", DeviceKind::Usb, false));
+        let mut mic = MicSettings { selection: sel("ca:x"), priority: vec![k("ca:x", "E2E A"), k("ca:bi", "MacBook Pro Microphone")], show_virtual: false };
+        assert!(!heal_ids(&mut mic, &[x, y.clone(), builtin()], &[y.clone()])); // y appears, x still there
+        let now = [y, builtin()];
+        assert!(!heal_ids(&mut mic, &now, &[])); // x vanishes: y did not just appear
+        assert_eq!(mic.selection, sel("ca:x"));
+        let r = got(resolve(&mic.selection, &mic.priority, &now, None));
+        assert_eq!(r, Some(("ca:bi".into(), Reason::Fallback { wanted: "E2E A".into() })));
+    }
+
+    #[test]
     fn heal_does_not_steal_another_known_id() {
         // ca:a is gone; ca:b (same name) is already known: no heal, both entries stay.
         let b = dev("ca:b", "Shure MV7", DeviceKind::Usb, false);
         let mut mic = MicSettings { selection: sel("ca:a"), priority: vec![k("ca:a", "Shure MV7"), k("ca:b", "Shure MV7")], show_virtual: false };
-        assert!(!heal_ids(&mut mic, &[b]));
+        assert!(!heal_ids(&mut mic, &[b.clone()], &[b]));
         assert_eq!(mic.selection, sel("ca:a"));
         assert_eq!(mic.priority.len(), 2);
     }

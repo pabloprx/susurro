@@ -1,5 +1,5 @@
 // Main window shell (DESIGN 6): sidebar + one screen, onboarding over everything when needed.
-import { useEffect, useState, type ComponentType } from "react";
+import { Component, useEffect, useState, type ComponentType, type ReactNode } from "react";
 import { AudioLines, BookA, Cpu, House, Keyboard, Mic, PenLine, Settings2 } from "lucide-react";
 import { on, type SessionState } from "./lib/api";
 import { applyTheme, getTheme, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
@@ -133,7 +133,9 @@ export default function App() {
       </aside>
       <main className="content" key={screen}>
         <div className="column">
-          <Current nav={nav} />
+          <Guard>
+            <Current nav={nav} />
+          </Guard>
         </div>
       </main>
       <div className="sr-only" aria-live="polite">
@@ -170,4 +172,22 @@ function Instruments({ testing, go }: { testing: boolean; go: (s: Screen) => voi
       </button>
     </div>
   );
+}
+
+/** A render error in one screen must not blank the window: show it, keep the sidebar. `main` is keyed by screen, so
+ *  opening another screen resets this. */
+class Guard extends Component<{ children: ReactNode }, { err: string | null }> {
+  state = { err: null as string | null };
+  static getDerivedStateFromError(e: unknown) {
+    return { err: String(e) };
+  }
+  render() {
+    return this.state.err ? (
+      <p className="note danger-text" role="alert">
+        This screen failed to draw: {this.state.err}. Open another screen, then come back.
+      </p>
+    ) : (
+      this.props.children
+    );
+  }
 }

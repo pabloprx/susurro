@@ -16,7 +16,7 @@ export class Waveform {
   private raf = 0;
   private collapseAt = 0;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(readonly canvas: HTMLCanvasElement) {
     const dpr = window.devicePixelRatio || 1;
     canvas.width = W * dpr;
     canvas.height = H * dpr;

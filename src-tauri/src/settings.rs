@@ -78,7 +78,9 @@ pub fn save_settings(
             h.update(&settings.hotkeys).map_err(|e| e.to_string())?;
         }
     }
-    if old.autostart != settings.autostart {
+    // A test instance (isolated data dir) must not register itself as a login item.
+    let test_instance = cfg!(debug_assertions) && std::env::var_os("SUSURRO_DATA_DIR").is_some();
+    if old.autostart != settings.autostart && !test_instance {
         let al = app.autolaunch();
         if settings.autostart { al.enable() } else { al.disable() }.map_err(|e| format!("autostart: {e}"))?;
     }

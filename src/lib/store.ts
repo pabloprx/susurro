@@ -35,28 +35,45 @@ export const settingsStore = store<Settings>(api.getSettings);
 export const micStore = store<MicState>(api.getMicState);
 export const keyStore = store<KeyStatus>(api.keyStatus);
 export const permStore = store<Permissions>(api.permissionsStatus);
+// Saves run one at a time: two quick changes (Use a model, then pick a language) must not race, or the second
+// save reads the backend before the first one lands and writes the old value back.
+let chain: Promise<unknown> = Promise.resolve();
+let pending = 0;
+const serial = <T,>(f: () => Promise<T>) => {
+  const r = chain.then(f);
+  chain = r.catch(() => {});
+  return r;
+};
+
 // Mic commands, the tray and the device monitor write settings.mic in Rust: keep the cached copy in step.
+// A queued save reads the backend anyway, so skip the refresh then (it would show the old values for a moment).
 void on("mic_state", (m) => {
   micStore.set(m);
-  if (settingsStore.get()) void settingsStore.refresh();
+  if (settingsStore.get()) void serial(async () => void (pending || (await settingsStore.refresh())));
 });
 
 /** Optimistic save: apply locally, then apply the same change to the backend's latest copy (other paths
  *  write Settings too, e.g. the mic selection) and take the validated result. Rejects with the backend error. */
-export async function saveSettings(mutate: (s: Settings) => void): Promise<void> {
+export function saveSettings(mutate: (s: Settings) => void): Promise<void> {
   const cur = settingsStore.get();
-  if (!cur) return;
+  if (!cur) return Promise.resolve();
   const next = structuredClone(cur);
   mutate(next);
   settingsStore.set(next);
-  try {
-    const fresh = await api.getSettings();
-    mutate(fresh);
-    settingsStore.set(await api.saveSettings(fresh));
-  } catch (e) {
-    settingsStore.set(cur);
-    throw e;
-  }
+  pending++;
+  return serial(async () => {
+    try {
+      const fresh = await api.getSettings();
+      mutate(fresh);
+      const saved = await api.saveSettings(fresh);
+      if (pending === 1) settingsStore.set(saved); // a later queued save sets the final copy
+    } catch (e) {
+      if (pending === 1) await settingsStore.refresh(); // back to what the backend has
+      throw e;
+    } finally {
+      pending--;
+    }
+  });
 }
 
 export * from "./format";

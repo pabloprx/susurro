@@ -1,0 +1,8 @@
+[
+  {"kind": "word", "text": "Contaflow", "aliases": ["conta flow", "contaflo"], "expansion": null, "exact_only": false, "starred": true},
+  {"kind": "word", "text": "Pablo Pérez", "aliases": [], "expansion": null, "exact_only": false, "starred": false},
+  {"kind": "word", "text": "kubectl", "aliases": ["kube control", "cube cuddle", "kube cuttle"], "expansion": null, "exact_only": false, "starred": false},
+  {"kind": "word", "text": "Supabase", "aliases": ["supa base", "super base"], "expansion": null, "exact_only": false, "starred": false},
+  {"kind": "word", "text": "Francisca Ugarte", "aliases": ["francisca ugarde"], "expansion": null, "exact_only": false, "starred": false},
+  {"kind": "snippet", "text": "my calendar link", "aliases": [], "expansion": "https://cal.example.com/pablo", "exact_only": false, "starred": false}
+]

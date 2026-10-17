@@ -21,6 +21,23 @@ export const LANGUAGES: [string, string][] = [
 
 const save = (f: (s: Settings) => void) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 
+/** Host of a server URL, or null if it does not parse (a hand-edited settings.json can hold anything). */
+const hostOf = (u: string) => {
+  try {
+    return new URL(u, "http://x").host;
+  } catch {
+    return null;
+  }
+};
+const checkUrl = (v: string) => (/^https?:\/\/./i.test(v) && hostOf(v) ? null : "Enter a full URL, like http://127.0.0.1:8000/v1");
+
+// Key masks show only the last 4 characters. Older builds also stored the first 6: drop them.
+for (const n of ["openrouter", "elevenlabs", "local_stt", "local_llm"] satisfies KeyName[]) {
+  const k = `susurro.keymask.${n}`;
+  const m = localStorage.getItem(k);
+  if (m?.includes("…")) localStorage.setItem(k, `••••${m.slice(-4)}`);
+}
+
 export default function Providers() {
   const s = settingsStore.use();
   const keys = keyStore.use();
@@ -34,7 +51,7 @@ export default function Providers() {
   const activeModel = models.find((m) => m.file === s.stt.whisper_model && m.downloaded);
   const state: Record<SttProvider, string> = {
     whisper_local: activeModel ? `ready · ${modelName(activeModel.file)}` : models.some((m) => m.downloaded) ? "pick a model" : "no model yet",
-    openai_compat: lastTest.openai_compat && !lastTest.openai_compat.ok ? "not reachable" : new URL(s.stt.openai_compat.base_url, "http://x").host,
+    openai_compat: lastTest.openai_compat && !lastTest.openai_compat.ok ? "not reachable" : (hostOf(s.stt.openai_compat.base_url) ?? "invalid URL"),
     elevenlabs: keys.elevenlabs ? "ready" : S.help.noKeys,
     openrouter: !keys.openrouter ? S.help.noKeys : s.stt.openrouter_model ? "ready" : "pick a model",
   };
@@ -133,7 +150,7 @@ export default function Providers() {
           <>
             <div className="form-grid">
               <span className="label">URL</span>
-              <TextField mono value={s!.stt.openai_compat.base_url} onSave={(v) => save((x) => void (x.stt.openai_compat.base_url = v))} />
+              <TextField mono value={s!.stt.openai_compat.base_url} check={checkUrl} onSave={(v) => save((x) => void (x.stt.openai_compat.base_url = v))} />
               <span className="label">Model</span>
               <TextField mono value={s!.stt.openai_compat.model} onSave={(v) => save((x) => void (x.stt.openai_compat.model = v))} />
               <span className="label">Hotwords</span>
@@ -221,7 +238,7 @@ function Cleanup({ s, hasKey }: { s: Settings; hasKey: boolean }) {
         {prov === "local" && (
           <>
             <span className="label">URL</span>
-            <TextField mono value={s.cleanup.local_base_url} onSave={(v) => save((x) => void (x.cleanup.local_base_url = v))} />
+            <TextField mono value={s.cleanup.local_base_url} check={checkUrl} onSave={(v) => save((x) => void (x.cleanup.local_base_url = v))} />
             <span className="label">Model</span>
             <TextField mono value={s.cleanup.local_model} placeholder="qwen3-8b" onSave={(v) => save((x) => void (x.cleanup.local_model = v))} />
           </>
@@ -262,10 +279,16 @@ function OrPicker({ kind, hasKey, value, onChange }: { kind: "stt" | "chat"; has
   );
 }
 
-function TextField({ value, onSave, mono, placeholder }: { value: string; onSave: (v: string) => void; mono?: boolean; placeholder?: string }) {
+function TextField({ value, onSave, check, mono, placeholder }: { value: string; onSave: (v: string) => void; check?: (v: string) => string | null; mono?: boolean; placeholder?: string }) {
   const [v, setV] = useState(value);
   useEffect(() => setV(value), [value]);
-  const commit = () => v.trim() !== value && onSave(v.trim());
+  const commit = () => {
+    const t = v.trim();
+    if (t === value) return;
+    const err = check?.(t);
+    if (err) return void (toast(err, { kind: "error" }), setV(value));
+    onSave(t);
+  };
   return <input className={`input${mono ? " mono" : ""}`} style={{ maxWidth: 360 }} value={v} placeholder={placeholder} onChange={(e) => setV(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && commit()} />;
 }
 
@@ -304,12 +327,24 @@ export function TestButton({ which, disabled, onResult }: { which: "stt" | "clea
   );
 }
 
+/** Downloads outlive the screen: a remounted Models picks them up here (Rust keeps downloading either way). */
+const inflight = new Map<string, Promise<void>>();
+
 function Models({ models, active, reload }: { models: ModelInfo[]; active: string; reload: () => void }) {
   const [prog, setProg] = useState<Record<string, { done: number; total: number; rate: number; t: number }>>({});
   const [errs, setErrs] = useState<Record<string, string>>({});
+  const track = (file: string, p: Promise<void>) => {
+    setProg((x) => (x[file] ? x : { ...x, [file]: { done: 0, total: 1, rate: 0, t: performance.now() } }));
+    p.catch((e) => setErrs((x) => ({ ...x, [file]: String(e) }))).finally(() => {
+      setProg(({ [file]: _, ...x }) => x);
+      reload();
+    });
+  };
+  useEffect(() => inflight.forEach((p, file) => track(file, p)), []);
   useEffect(() => {
     const off = on("model_progress", (m) =>
       setProg((p) => {
+        if (!inflight.has(m.file)) return p; // a late event after the command returned must not bring the bar back
         const prev = p[m.file];
         const now = performance.now();
         const inst = prev ? ((m.done - prev.done) / (now - prev.t)) * 1000 : 0;
@@ -318,16 +353,11 @@ function Models({ models, active, reload }: { models: ModelInfo[]; active: strin
     );
     return () => void off.then((f) => f());
   }, []);
-  const download = async (file: string) => {
+  const download = (file: string) => {
     setErrs(({ [file]: _, ...e }) => e);
-    setProg((p) => ({ ...p, [file]: { done: 0, total: 1, rate: 0, t: performance.now() } }));
-    try {
-      await api.whisperDownload(file);
-    } catch (e) {
-      setErrs((x) => ({ ...x, [file]: String(e) }));
-    }
-    setProg(({ [file]: _, ...p }) => p);
-    reload();
+    const p = api.whisperDownload(file).finally(() => inflight.delete(file));
+    inflight.set(file, p);
+    track(file, p);
   };
   return (
     <div className="models">
@@ -421,7 +451,7 @@ function KeyRow({ name, title, sub, s, saved }: { name: KeyName; title: string; 
   const store = async (value: string | null) => {
     const status = await api.setApiKey(name, value);
     keyStore.set(status);
-    if (value) localStorage.setItem(`susurro.keymask.${name}`, value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : "••••");
+    if (value) localStorage.setItem(`susurro.keymask.${name}`, value.length > 12 ? `••••${value.slice(-4)}` : "••••");
     else localStorage.removeItem(`susurro.keymask.${name}`);
     setV("");
     setShow(false);

@@ -129,7 +129,11 @@ export default function Overlay() {
   const waveOn = WAVE_VIEWS.includes(view) && !(view === "processing" && reduced.matches);
   useEffect(() => {
     if (!canvas.current) return;
-    wave.current ??= new Waveform(canvas.current);
+    // The error shake remounts the pill (its `key`), so the canvas element can be a new one.
+    if (wave.current?.canvas !== canvas.current) {
+      wave.current?.stop();
+      wave.current = new Waveform(canvas.current);
+    }
     if (waveOn) wave.current.start(view === "processing");
     else wave.current.stop();
   }, [waveOn, view]);
@@ -201,7 +205,7 @@ export default function Overlay() {
     error: (
       <>
         <AlertTriangle size={13} strokeWidth={1.75} className="danger" />
-        <span className="msg">{shown.msg || "Dictation failed"}</span>
+        <span className="msg ellipsis" title={shown.msg || undefined}>{shown.msg || "Dictation failed"}</span>
       </>
     ),
     notice: notice && (
@@ -220,8 +224,8 @@ export default function Overlay() {
             className="link"
             onClick={(e) => {
               e.stopPropagation();
-              api.toastAction(notice.id, a.id);
               setNotice(null);
+              api.toastAction(notice.id, a.id).catch((err) => setNotice({ id: `err${Date.now()}`, kind: "error", text: String(err), actions: [], ttl_ms: 4000 }));
             }}
           >
             {a.label}

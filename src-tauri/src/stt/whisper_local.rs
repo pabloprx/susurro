@@ -11,6 +11,9 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 /// PLAN 2.6. A guess: needs to be measured (PLAN 12).
 const NO_SPEECH_MAX: f32 = 0.6;
+/// A segment this far below the clip's peak is over silence or room noise, not speech.
+/// Speech segments in the fixtures sit within 4 dB of the clip peak; 30 dB is a wide margin.
+const QUIET_BELOW_PEAK_DB: f32 = 30.0;
 pub const ENGLISH_ONLY: &str = "This whisper model understands only English. Set the language to English or pick a multilingual model";
 /// PLAN 2.4: whisper prompt budget, counted with the real tokenizer.
 const PROMPT_TOKENS: usize = 200;
@@ -100,12 +103,39 @@ impl Transcriber for Whisper {
         }
         let mut st = self.ctx.create_state()?;
         st.full(p, req.audio)?;
+        if std::env::var("SEGDBG").is_ok() { for s in st.as_iter() { eprintln!("SEG p={:.3} t={}-{} peak={:.1} {:?}", s.no_speech_probability(), s.start_timestamp(), s.end_timestamp(), peak_db(req.audio, s.start_timestamp(), s.end_timestamp()), s.to_str_lossy().unwrap_or_default()); } }
+        let clip_peak = peak_db(req.audio, 0, i64::MAX);
         let text: String = st
             .as_iter()
             .filter(|s| s.no_speech_probability() <= NO_SPEECH_MAX)
-            .map(|s| s.to_str_lossy().map(|c| c.into_owned()).unwrap_or_default())
+            .map(|s| (peak_db(req.audio, s.start_timestamp(), s.end_timestamp()), s.to_str_lossy().map(|c| c.into_owned()).unwrap_or_default()))
+            // A "you" / "Thank you." over the trailing silence: no_speech_probability is often 0 there
+            // (measured on long.wav, ggml-base), so check the audio under the segment instead.
+            .filter(|(peak, t)| !(*peak < clip_peak - QUIET_BELOW_PEAK_DB && crate::text::is_hallucination(t)))
+            .map(|(_, t)| t)
             .collect();
         let language = whisper_rs::get_lang_str(st.full_lang_id_from_state()).map(str::to_string);
         Ok(SttOutput { text: text.trim().to_string(), language, note: None, fell_back: false })
+    }
+}
+
+/// Peak dB of 16 kHz `a` between whisper timestamps t0..t1 (centiseconds = 160 samples).
+fn peak_db(a: &[f32], t0: i64, t1: i64) -> f32 {
+    let at = |t: i64| (t.max(0) as usize).saturating_mul(160).min(a.len());
+    let (i, j) = (at(t0), at(t1).max(at(t0)));
+    let p = a[i..j].iter().fold(0f32, |m, x| m.max(x.abs()));
+    20.0 * p.max(1e-9).log10()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn peak_db_spans_are_clamped() {
+        let mut a = vec![0.0f32; 1600];
+        a[200] = 0.5; // inside 1..2 cs
+        assert!((super::peak_db(&a, 1, 2) + 6.02).abs() < 0.1);
+        assert!(super::peak_db(&a, 5, 9) < -150.0);
+        assert!(super::peak_db(&a, 0, i64::MAX) > -7.0);
+        assert!(super::peak_db(&a, 50, 3) < -150.0); // reversed or past the end: empty span
     }
 }

@@ -27,7 +27,8 @@ export default function Dictionary() {
   const load = () => api.dictList().then(setList);
   useEffect(() => void load(), []);
   useEffect(() => {
-    if (tab !== "snippets") addRef.current?.focus();
+    // Arrow keys on the tab radios keep focus there (DESIGN 9.4); a click or the first load focuses the add field.
+    if (tab !== "snippets" && document.activeElement?.getAttribute("role") !== "radio") addRef.current?.focus();
   }, [tab]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {

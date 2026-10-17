@@ -59,7 +59,7 @@ pub fn run(clip: &Clip, o: &Opts, d: &Dictionary, stt: Stt, clean: Cleaner) -> O
         Ok(o) => o,
         Err(e) => return Outcome::Failed(format!("{e:#}")),
     };
-    let mut raw = out.text.trim().to_string();
+    let mut raw = text::tidy_stt(&out.text);
     if raw.is_empty() || text::is_hallucination(&raw) {
         return Outcome::Skip(Some("Heard nothing".into()));
     }

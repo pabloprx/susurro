@@ -3,7 +3,7 @@
 
 use crate::AppState;
 use crate::contract::{Applied, DictEntry, DictEntryInput, DictKind, DictOpts, Match, MatchHow};
-use crate::text::{self, Token, sep_ok, tokenize};
+use crate::text::{self, Token, glued, sep_ok, tokenize};
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -365,7 +365,8 @@ impl Dictionary {
                 _ => e.text.clone(),
             };
             let end = push(&mut out, &repl);
-            if base {
+            // A snippet drops the 's: "my calendar link's" -> the URL, not "URL's".
+            if base && c.how != MatchHow::Snippet {
                 push(&mut out, &s[last.suffix_at.unwrap()..last.end]);
             }
             matches.push(Match { start: start as u32, end: end as u32, entry_id: e.id, how: c.how });
@@ -386,19 +387,6 @@ where
     s.replace("{date}", &now.format("%Y-%m-%d").to_string())
         .replace("{time}", &now.format("%H:%M").to_string())
         .replace("{weekday}", &now.format("%A").to_string())
-}
-
-/// The window is part of an email, URL or glued word: "pablo@x.app", "github.com/x", "non-linear".
-/// Inner separators of a multi-token window ("node.js") are inside the window, so they still match.
-fn glued(s: &str, start: usize, end: usize) -> bool {
-    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-    let mut before = s[..start].chars().rev();
-    let mut after = s[end..].chars();
-    let (b1, b2, a1, a2) = (before.next(), before.next(), after.next(), after.next());
-    matches!(b1, Some('@' | '/'))
-        || matches!(a1, Some('@' | '/'))
-        || (matches!(b1, Some('.' | '-')) && word(b2))
-        || (matches!(a1, Some('.' | '-')) && word(a2))
 }
 
 /// whisper `initial_prompt` / OpenAI-compat `prompt`: natural preceding text, because whisper copies

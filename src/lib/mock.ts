@@ -193,7 +193,7 @@ let dict: C.DictEntry[] = fresh
       word("Supabase", ["super base"], 5, 8 * DAY),
       word("Karpathy", ["car pathy"], 2, 4 * DAY),
       word("Reveniu", ["revenue"], 1, 3 * DAY),
-      word("whisper.cpp", ["whisper cpp"], 3, 7 * DAY),
+      word("whisper.cpp", ["whisper c p p"], 3, 7 * DAY),
       word("Pablo Pérez", [], 11, 25 * DAY, true),
       snip("my calendly", "https://calendly.com/pablo/30min", 14, 18 * DAY),
       snip("sign off", "Best,\nPablo - {date}", 22, 21 * DAY),
@@ -346,7 +346,7 @@ function plug() {
     toast("New mic: Shure MV7. Switch to it for dictation?", "info", [
       { id: "keep", label: "Keep current" },
       { id: "switch", label: "Switch" },
-    ], 12000, "hotplug-shure");
+    ], 10_000, `mic-new:${shure.id}`); // same id and ttl as audio.rs
 }
 function unplug() {
   devices = devices.filter((d) => d.id !== shure.id);
@@ -375,8 +375,9 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     const sel = a.selection as C.MicSelection;
     settings.mic.selection = sel;
     if (sel !== "auto") {
-      const d = devices.find((x) => x.id === sel.device.id)!;
-      settings.mic.priority = [known(d), ...settings.mic.priority.filter((k) => k.id !== d.id)];
+      // Like audio.rs promote(): a device that is gone keeps its place (the selection still names it).
+      const d = devices.find((x) => x.id === sel.device.id);
+      if (d) settings.mic.priority = [known(d), ...settings.mic.priority.filter((k) => k.id !== d.id)];
     }
     pushMic();
     return micState();
@@ -414,9 +415,10 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   paste_last: () => undefined,
   get_session_state: () => session,
   toast_action: (a) => {
-    if (a.toastId === "hotplug-shure") {
-      if (a.actionId === "switch") handlers.set_mic_selection({ selection: { device: { id: shure.id } } });
-      else handlers.set_mic_priority({ ids: [...settings.mic.priority.map((k) => k.id), shure.id] });
+    const id = (a.toastId as string).startsWith("mic-new:") ? (a.toastId as string).slice(8) : null;
+    if (id) {
+      if (a.actionId === "switch") handlers.set_mic_selection({ selection: { device: { id } } });
+      else handlers.set_mic_priority({ ids: [...settings.mic.priority.map((k) => k.id), id] });
     }
   },
   dict_list: () => dict,

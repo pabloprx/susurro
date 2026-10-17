@@ -14,11 +14,18 @@ fn account(k: KeyName) -> &'static str {
 }
 
 fn entry(k: KeyName) -> anyhow::Result<keyring::Entry> {
-    Ok(keyring::Entry::new(SERVICE, account(k))?)
+    // A test instance (debug + isolated data dir) gets its own service: it never reads the real keys
+    // and never triggers a Keychain access prompt for them.
+    let test_instance = cfg!(debug_assertions) && std::env::var_os("SUSURRO_DATA_DIR").is_some();
+    Ok(keyring::Entry::new(if test_instance { "app.susurro.desktop.e2e" } else { SERVICE }, account(k))?)
 }
 
 /// None if missing or the Keychain is unavailable.
 pub fn get(k: KeyName) -> Option<String> {
+    #[cfg(debug_assertions)]
+    if let Some(v) = crate::test_hooks::key(account(k)) {
+        return Some(v).filter(|s| !s.is_empty());
+    }
     entry(k).ok()?.get_password().ok().filter(|s| !s.is_empty())
 }
 

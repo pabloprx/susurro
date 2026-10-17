@@ -16,6 +16,8 @@ pub mod secrets;
 pub mod session;
 pub mod settings;
 pub mod stt;
+#[cfg(debug_assertions)]
+pub mod test_hooks;
 pub mod text;
 pub mod tray;
 pub mod platform {
@@ -56,8 +58,18 @@ pub fn show_main(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[allow(unused_mut)]
+    let mut log = tauri_plugin_log::Builder::new().level(log::LevelFilter::Info);
+    #[cfg(debug_assertions)]
+    if let Some(d) = test_hooks::data_dir() {
+        use tauri_plugin_log::{Target, TargetKind};
+        log = log.clear_targets().targets([
+            Target::new(TargetKind::Stdout),
+            Target::new(TargetKind::Folder { path: d.join("logs"), file_name: Some("susurro".into()) }),
+        ]);
+    }
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
+        .plugin(log.build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .setup(|app| {
@@ -65,6 +77,8 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let data_dir = app.path().app_data_dir()?;
+            #[cfg(debug_assertions)]
+            let data_dir = test_hooks::data_dir().unwrap_or(data_dir);
             let settings = settings::load(&data_dir.join("settings.json"));
             let db = db::open(&data_dir.join("susurro.db"))?;
             let first_run = !settings.onboarded;
@@ -84,6 +98,8 @@ pub fn run() {
             audio::spawn_monitor(h.clone());
             app.manage(hotkey::start(h, &hotkeys, hotkey_tx)?);
             tray::build(h)?;
+            #[cfg(debug_assertions)]
+            test_hooks::start_control(h);
             stt::whisper_local::load_in_background(h.clone());
             // The overlay window is always shown; the pill hides itself when idle and `show_idle` is off.
             #[cfg(target_os = "macos")]

@@ -5,3 +5,9 @@ src-tauri/target/
 src-tauri/gen/schemas
 .DS_Store
 *.local
+scripts/e2e/fixtures/*.wav
+scripts/e2e/lib/bin/
+
+# Playwright
+test-results/
+playwright-report/

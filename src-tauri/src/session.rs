@@ -356,7 +356,18 @@ impl Actor {
                 let app = self.app.clone();
                 match self.rec.as_mut().map(|rec| audio::recover_session(&app, rec)) {
                     Some(false) => Ev::Stop,
-                    _ => return false,
+                    _ => {
+                        // The session continues on another mic: report its name, not the lost one.
+                        let name = self.rec.as_ref().map(|r| r.device().name.clone());
+                        if let (Some(ctx), Some(n)) = (self.ctx.as_mut(), name) {
+                            if ctx.device.as_ref() != Some(&n) {
+                                ctx.device = Some(n);
+                                let (phase, message) = { let c = CURRENT.lock().unwrap(); (c.phase.clone(), c.message.clone()) };
+                                self.set(phase, message);
+                            }
+                        }
+                        return false;
+                    }
                 }
             }
             SessionCmd::ToastAction { toast_id, action_id } => {
@@ -437,7 +448,8 @@ impl Actor {
         self.idle_at = None;
         self.kept = None;
         let front = paste::frontmost_app();
-        let Some(dev) = audio::resolve_current(&self.app, false) else {
+        // PLAN 3.2: resolve on a fresh list (about 1 ms), so a mic plugged in under 1.5 s ago counts.
+        let Some(dev) = audio::resolve_current(&self.app, true) else {
             self.m.idle();
             self.ctx = None;
             return self.fail("No microphone".into());
@@ -445,7 +457,7 @@ impl Actor {
         self.ping(Ping::Start);
         #[cfg(target_os = "macos")]
         crate::platform::macos::setup_overlay(&self.app);
-        // The monitor's device list can be 1.5 s old: if the mic was just unplugged, retry once on a fresh list.
+        // The mic can vanish between the list and the open: retry once on a fresh list.
         let rec = Recorder::start(&self.app, &dev, "overlay").or_else(|e| match audio::resolve_current(&self.app, true) {
             Some(d) if d.info.id != dev.info.id => Recorder::start(&self.app, &d, "overlay"),
             _ => Err(e),
@@ -529,8 +541,10 @@ impl Actor {
                 self.fail(short(e));
             }
             Outcome::Text(d) => {
+                let latency_ms = t.elapsed().as_millis() as u32; // STT + cleanup, not the paste
                 let status = self.deliver_done(d);
                 let mut item = row(d.raw.clone(), d.final_text.clone(), status, None);
+                item.latency_ms = latency_ms;
                 item.cleanup = run.cleanup(d);
                 let db = self.state().db.lock().unwrap();
                 if let Err(e) = dictionary::record_uses(&db, &d.used) {
@@ -566,9 +580,7 @@ impl Actor {
         let status = match out {
             PasteOutcome::Pasted => {
                 if press_enter {
-                    if !opts.restore_clipboard {
-                        std::thread::sleep(Duration::from_millis(100)); // let the target app take the Cmd+V first
-                    }
+                    std::thread::sleep(Duration::from_millis(100)); // let the target app take the Cmd+V first
                     paste::press_enter();
                 }
                 HistoryStatus::Pasted

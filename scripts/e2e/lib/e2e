@@ -1,0 +1,10 @@
+#!/bin/bash
+# Compiles e2e.swift once (rebuilds when the source is newer), then runs it. Usage: see e2e.swift.
+set -euo pipefail
+d="$(cd "$(dirname "$0")" && pwd)"
+bin="$d/bin/e2e"
+if [ ! -x "$bin" ] || [ "$d/e2e.swift" -nt "$bin" ]; then
+  mkdir -p "$d/bin"
+  swiftc -O -o "$bin" "$d/e2e.swift" >&2
+fi
+exec "$bin" "$@"
