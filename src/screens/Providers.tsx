@@ -1,10 +1,10 @@
 // DESIGN 6.5
 import { useEffect, useRef, useState } from "react";
-import { Check, Eye, EyeOff, X } from "lucide-react";
+import { AlertTriangle, Check, Eye, EyeOff, X } from "lucide-react";
 import { api, on, type KeyName, type ModelInfo, type OrModel, type ProviderTest, type Settings, type SttProvider } from "../lib/api";
 import { ago, keyStore, modelName, saveSettings, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
-import { Dot, Label, Spinner, Title, Toggle, toast } from "../ui";
+import { Dot, Label, radioKeys, Spinner, Title, Toggle, toast } from "../ui";
 
 export const LANGUAGES: [string, string][] = [
   ["auto", "Auto-detect"],
@@ -44,23 +44,27 @@ export default function Providers() {
     elevenlabs: ["ElevenLabs Scribe", "cloud"],
     openrouter: ["OpenRouter", "cloud STT model"],
   };
+  // An English-only (.en) Whisper model transcribes other languages as English: warn where the language is picked.
+  const usesWhisper = p === "whisper_local" || s.stt.local_fallback;
+  const enOnly = usesWhisper && s.language !== "en" && /\.en[-.]/.test(s.stt.whisper_model);
+  const langName = s.language === "auto" ? "other languages" : (LANGUAGES.find(([v]) => v === s.language)?.[1] ?? s.language);
   const onTest = (r: ProviderTest) => setLastTest((t) => ({ ...t, [p]: r }));
 
   return (
     <>
       <Title parts={S.title.providers} />
       <Label>Speech to text</Label>
-      <div className="card" role="radiogroup" aria-label="Speech to text provider">
+      <div className="card" role="radiogroup" aria-label="Speech to text provider" onKeyDown={radioKeys}>
         {(Object.keys(what) as SttProvider[]).map((id) => {
           const sel = id === p;
           const ready = state[id].startsWith("ready") || (id === "openai_compat" && lastTest.openai_compat?.ok);
           return (
             <div className="prov" key={id}>
-              <button className="prov-head" role="radio" aria-checked={sel} onClick={() => !sel && save((x) => void (x.stt.provider = id))}>
+              <button className="prov-head" role="radio" aria-checked={sel} tabIndex={sel ? 0 : -1} onClick={() => !sel && save((x) => void (x.stt.provider = id))}>
                 <span className="radio" />
                 <span className="name">{what[id][0]}</span>
                 <span className="small">{what[id][1]}</span>
-                <span className="what">{sel ? "" : state[id]}</span>
+                <span className="what">{sel && ready ? "" : state[id]}</span>
                 <Dot tone={sel && ready ? "ok" : "idle"} />
               </button>
               <div className="expand" style={{ gridTemplateRows: sel ? "1fr" : "0fr" }}>
@@ -81,6 +85,12 @@ export default function Providers() {
         </select>
         <span className="small">{S.help.language}</span>
       </div>
+      {enOnly && (
+        <p className="note" role="status">
+          <AlertTriangle size={14} strokeWidth={1.5} className="warn-text" /> {modelName(s.stt.whisper_model)} only understands English.
+          {" "}Pick a multilingual model to dictate in {langName}.
+        </p>
+      )}
       {p !== "whisper_local" && (
         <div className="lang-row">
           <Toggle label="Fall back to Local Whisper" on={s.stt.local_fallback} onChange={(v) => save((x) => void (x.stt.local_fallback = v))} />
@@ -279,7 +289,7 @@ export function TestButton({ which, disabled, onResult }: { which: "stt" | "clea
     onResult?.(res);
   };
   return (
-    <span className="inline" style={{ gap: 10, flexWrap: "nowrap" }}>
+    <span className="inline" style={{ gap: 10, flexWrap: "nowrap", marginLeft: "auto" }}>
       {r && r !== "busy" && (
         <span className={`test-result ${r.ok ? "ok-text" : "danger-text"}`} title={r.ok ? r.text : (r.error ?? "")}>
           {r.ok ? <Check size={13} strokeWidth={2} /> : <X size={13} strokeWidth={2} />}

@@ -164,7 +164,7 @@ function Instruments({ testing, go }: { testing: boolean; go: (s: Screen) => voi
       <button onClick={() => go("providers")}>
         <span className="label">{PROVIDER_LABEL[p]}</span>
         <span className="inst-value">
-          <span className="ellipsis">{model}</span>
+          <span className="ellipsis">{needsKey ? `${model} · needs key` : model}</span>
           <Dot tone={needsKey ? "idle" : "ok"} />
         </span>
       </button>

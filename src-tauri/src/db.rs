@@ -14,7 +14,9 @@ CREATE INDEX history_created ON history(created_at);
 CREATE TABLE dict(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL, norm TEXT NOT NULL UNIQUE,
   aliases TEXT NOT NULL DEFAULT '[]', expansion TEXT, exact_only INTEGER NOT NULL DEFAULT 0,
   starred INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
-"#];
+"#,
+// v2: dict.created_at in ms like every other timestamp (v1 stored seconds).
+"UPDATE dict SET created_at = created_at * 1000 WHERE created_at < 100000000000;"];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -58,6 +60,16 @@ mod tests {
         .unwrap();
         c.execute("INSERT INTO dict(kind,text,norm,created_at) VALUES('word','Contaflow','contaflow',1)", []).unwrap();
         assert!(c.execute("INSERT INTO dict(kind,text,norm,created_at) VALUES('word','ContaFlow','contaflow',2)", []).is_err());
+    }
+
+    #[test]
+    fn v2_turns_dict_seconds_into_ms() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("{} PRAGMA user_version = 1;", MIGRATIONS[0])).unwrap();
+        c.execute("INSERT INTO dict(kind,text,norm,created_at) VALUES('word','A','a',1760000000),('word','B','b',1760000000123)", []).unwrap();
+        migrate(&c).unwrap();
+        let v: Vec<i64> = c.prepare("SELECT created_at FROM dict ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(v, [1760000000000, 1760000000123]);
     }
 
     #[test]

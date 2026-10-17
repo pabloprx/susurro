@@ -473,6 +473,12 @@ select.input {
   flex: none;
   transition: background-color var(--d-fast) var(--ease-out);
 }
+/* 28x16 visual, 28x24 hit target (DESIGN 9.7) */
+.toggle::before {
+  content: "";
+  position: absolute;
+  inset: -4px 0;
+}
 .toggle span {
   position: absolute;
   top: 2px;
@@ -1164,6 +1170,15 @@ mark {
 .expand > div {
   overflow: hidden;
 }
+/* Unclip once open, so the Retry popover can leave the row. Stays clipped during the height transition. */
+.h-item.open .expand > div {
+  animation: unclip 0s var(--d-base) forwards;
+}
+@keyframes unclip {
+  to {
+    overflow: visible;
+  }
+}
 .h-body {
   padding: 0 var(--s-4) var(--s-4);
 }
@@ -1514,7 +1529,7 @@ mark {
 }
 .models .mname {
   font: 12.5px var(--font-mono);
-  width: 200px;
+  width: 170px;
   flex: none;
 }
 .models .size {
@@ -1527,6 +1542,10 @@ mark {
 .models .note {
   margin: 0;
   flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .models .end {
   display: flex;
@@ -1761,6 +1780,8 @@ mark {
 }
 .auto-row {
   cursor: pointer;
+  /* the hover fill follows the card's rounded top corners */
+  border-radius: calc(var(--r-md) - 1px) calc(var(--r-md) - 1px) 0 0;
 }
 .disclosure {
   all: unset;

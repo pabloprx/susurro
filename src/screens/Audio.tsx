@@ -4,7 +4,7 @@ import { AlertTriangle, ChevronRight, GripVertical } from "lucide-react";
 import { api, type DeviceInfo, type KnownDevice } from "../lib/api";
 import { KIND_LABEL, micStore, saveSettings, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
-import { Dot, Empty, Label, Meter, Title, useLevel } from "../ui";
+import { Dot, Empty, Label, Meter, radioKeys, Title, useLevel } from "../ui";
 import type { Nav } from "../App";
 
 const ROW = 44;
@@ -139,8 +139,9 @@ export default function Audio({ nav }: { nav: Nav }) {
       )}
 
       <Label>Priority - drag to reorder. Auto uses the first connected device.</Label>
+      <div role="radiogroup" aria-label="Microphone selection" onKeyDown={radioKeys}>
       <div className="card prio">
-        <div className="row hoverable auto-row" role="radio" aria-checked={auto} tabIndex={0} onClick={() => api.setMicSelection("auto").then(micStore.set)} onKeyDown={(e) => e.key === " " && api.setMicSelection("auto").then(micStore.set)}>
+        <div className="row hoverable auto-row" role="radio" aria-checked={auto} tabIndex={auto ? 0 : -1} onClick={() => api.setMicSelection("auto").then(micStore.set)} onKeyDown={(e) => e.key === " " && api.setMicSelection("auto").then(micStore.set)}>
           <span className="radio" />
           <span>Auto</span>
           <span className="small">highest connected device</span>
@@ -178,7 +179,7 @@ export default function Audio({ nav }: { nav: Nav }) {
                   <span className="dname ellipsis">{d.name}</span>
                   <span className="kind">{KIND_LABEL[d.kind]}</span>
                   <span className="state">
-                    <Dot tone={d.connected ? (d.id === mic.active ? "ok" : "idle") : "idle"} />
+                    <Dot tone={d.connected ? "ok" : "idle"} />
                     {d.connected ? (d.id === mic.active ? "in use" : "connected") : "disconnected"}
                   </span>
                   <span style={{ width: 64, display: "flex", justifyContent: "flex-end" }}>
@@ -202,7 +203,7 @@ export default function Audio({ nav }: { nav: Nav }) {
         )}
       </div>
       <div className="lang-row">
-        <button className="style-opt" role="radio" aria-checked={!auto} onClick={() => mic.devices[0] && api.setMicSelection({ device: { id: fixed ?? mic.active ?? mic.devices[0].id } }).then(micStore.set)}>
+        <button className="style-opt" role="radio" aria-checked={!auto} tabIndex={auto ? -1 : 0} onClick={() => mic.devices[0] && api.setMicSelection({ device: { id: fixed ?? mic.active ?? mic.devices[0].id } }).then(micStore.set)}>
           <span className="radio" />
           Always use
         </button>
@@ -214,6 +215,7 @@ export default function Audio({ nav }: { nav: Nav }) {
           ))}
         </select>
         <span className="small">New mics prompt you once. A lost mic mid-dictation switches without stopping.</span>
+      </div>
       </div>
       <div className="sr-only" aria-live="polite">
         {said}

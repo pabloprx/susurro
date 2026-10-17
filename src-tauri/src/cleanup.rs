@@ -5,11 +5,6 @@ use crate::dictionary::Hints;
 use crate::stt::{OPENROUTER_BASE, http, send_json, url};
 use std::time::Duration;
 
-/// Styles are cut to one global style (Raw apps never reach cleanup).
-pub struct StyleCtx {
-    pub style: Style,
-}
-
 pub const NOT_CONFIGURED: &str = "Cleanup needs an LLM - add OpenRouter or a local server";
 const MAX_VOCAB: usize = 300;
 
@@ -35,9 +30,10 @@ pub fn effective_level(s: &Settings, key: Option<&str>) -> CleanupLevel {
     if configured(s, key) { s.cleanup.level.clone() } else { CleanupLevel::None }
 }
 
-pub fn cleanup(s: &Settings, key: Option<&str>, text: &str, h: &Hints, ctx: &StyleCtx) -> anyhow::Result<String> {
-    let level = effective_level(s, key);
-    if level == CleanupLevel::None || text.trim().is_empty() {
+/// `level` comes from `effective_level`: the caller decides whether to clean at all (not for None).
+/// The tone is the one global style (Raw apps never reach cleanup).
+pub fn cleanup(s: &Settings, key: Option<&str>, level: &CleanupLevel, text: &str, h: &Hints) -> anyhow::Result<String> {
+    if text.trim().is_empty() {
         return Ok(text.to_string());
     }
     let c = &s.cleanup;
@@ -45,7 +41,7 @@ pub fn cleanup(s: &Settings, key: Option<&str>, text: &str, h: &Hints, ctx: &Sty
         LlmProvider::OpenRouter => (OPENROUTER_BASE, c.openrouter_model.as_str(), true),
         LlmProvider::Local => (c.local_base_url.as_str(), c.local_model.as_str(), false),
     };
-    let sys = system_prompt(&level, &ctx.style, h, text.contains('⟦'));
+    let sys = system_prompt(level, &s.styles.style, h, text.contains('⟦'));
     chat(base, model, key, openrouter, &sys, text, Duration::from_millis(c.timeout_ms as u64))
 }
 
@@ -186,21 +182,21 @@ mod tests {
         s.cleanup.provider = LlmProvider::Local;
         s.cleanup.local_base_url = format!("{}/v1", srv.url());
         s.cleanup.local_model = "qwen3-4b".into();
-        let out = cleanup(&s, None, "conta flow is great", &hints(), &StyleCtx { style: Style::Formal }).unwrap();
+        let out = cleanup(&s, None, &CleanupLevel::Light, "conta flow is great", &hints()).unwrap();
         m.assert();
         assert_eq!(out, "Contaflow is great.");
     }
 
     #[test]
-    fn not_configured_or_none_returns_input_without_a_request() {
+    fn not_configured_or_none_is_level_none() {
         let mut s = Settings::default(); // OpenRouter, no key, no model
-        let ctx = StyleCtx { style: Style::Formal };
         assert_eq!(effective_level(&s, None), CleanupLevel::None);
-        assert_eq!(cleanup(&s, None, "um hi", &Hints::default(), &ctx).unwrap(), "um hi");
         s.cleanup.openrouter_model = "m".into();
         assert_eq!(effective_level(&s, Some("k")), CleanupLevel::Light);
         s.cleanup.level = CleanupLevel::None;
-        assert_eq!(cleanup(&s, Some("k"), "um hi", &Hints::default(), &ctx).unwrap(), "um hi");
+        assert_eq!(effective_level(&s, Some("k")), CleanupLevel::None);
+        // empty text never reaches the LLM
+        assert_eq!(cleanup(&s, Some("k"), &CleanupLevel::Light, "  ", &Hints::default()).unwrap(), "  ");
         assert_eq!(key_name(&s), KeyName::Openrouter);
     }
 

@@ -2,6 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, Clipboard, Mic, Square, X } from "lucide-react";
 import { api, isTauri, on, type SessionState, type Settings, type Toast } from "../lib/api";
+import { hasDeadline, keysOf, mmss } from "../lib/format";
 import { Waveform } from "./waveform";
 import "../styles/tokens.css";
 import "../styles/overlay.css";
@@ -39,9 +40,6 @@ function viewOf(s: SessionState): View {
   }
 }
 
-const label = (b: string) => b.split("+").map((k) => ({ Fn: "fn", Alt: "⌥", Cmd: "⌘", Ctrl: "⌃", Shift: "⇧" })[k] ?? k).join(" ");
-const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-const ms = (t: number) => (t < 1e12 ? t * 1000 : t);
 
 export default function Overlay() {
   const [sess, setSess] = useState<SessionState>(IDLE);
@@ -90,13 +88,14 @@ export default function Overlay() {
     return () => offs.forEach((p) => p.then((f) => f()));
   }, []);
 
-  // notice lifetime: ttl, capped at 4 s unless it asks for a decision
+  // notice lifetime: ttl, capped at 4 s unless it asks for a decision. Undo keeps the exact Rust deadline.
+  const deadline = notice !== null && hasDeadline(notice);
   useEffect(() => {
     if (!notice) return;
-    const ttl = notice.actions.length ? Math.max(notice.ttl_ms, 6000) : Math.min(notice.ttl_ms || 2500, 4000);
-    const t = setTimeout(() => !hover && setNotice(null), ttl);
+    const ttl = deadline ? notice.ttl_ms : notice.actions.length ? Math.max(notice.ttl_ms, 6000) : Math.min(notice.ttl_ms || 2500, 4000);
+    const t = setTimeout(() => (deadline || !hover) && setNotice(null), ttl);
     return () => clearTimeout(t);
-  }, [notice, hover]);
+  }, [notice, deadline || hover]);
 
   // session -> shown view, with the holds for done / copied / error
   useEffect(() => {
@@ -122,7 +121,7 @@ export default function Overlay() {
     const t = setInterval(() => tick((n) => n + 1), 250);
     return () => clearInterval(t);
   }, [recording]);
-  const elapsed = sess.started_at ? (Date.now() - ms(sess.started_at)) / 1000 : 0;
+  const elapsed = sess.started_at ? (Date.now() - sess.started_at) / 1000 : 0;
   const max = settings?.recording.max_seconds ?? 600;
   const warning = (view === "listening" || view === "handsfree") && elapsed >= max - 60;
 
@@ -159,7 +158,7 @@ export default function Overlay() {
   );
 
   const body: Record<View, ReactNode> = {
-    idle: <span className="hint">{label(settings?.hotkeys.ptt ?? "Fn")} to talk</span>,
+    idle: <span className="hint">{keysOf(settings?.hotkeys.ptt ?? "Fn").join(" ")} to talk</span>,
     listening: (
       <>
         <span className="tally-dot pulse" />
@@ -168,7 +167,7 @@ export default function Overlay() {
         </PillButton>
         <span className="wave-slot" />
         {warning && timer}
-        <PillButton label="Stop and paste" onClick={api.dictationToggle}>
+        <PillButton label="Stop and paste" onClick={api.dictationStop}>
           <Square size={9} fill="currentColor" strokeWidth={0} />
         </PillButton>
       </>
@@ -181,7 +180,7 @@ export default function Overlay() {
         </PillButton>
         <span className="wave-slot" />
         {timer}
-        <PillButton label="Stop and paste" onClick={api.dictationToggle}>
+        <PillButton label="Stop and paste" onClick={api.dictationStop}>
           <Square size={9} fill="currentColor" strokeWidth={0} />
         </PillButton>
       </>

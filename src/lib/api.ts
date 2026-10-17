@@ -1,13 +1,12 @@
 // Typed IPC for every command and event in PLAN 1.5. Without Tauri (plain browser) it routes to mock.ts.
 import type * as C from "./contract.gen";
-import { mockInvoke, mockListen } from "./mock";
 
 export type * from "./contract.gen";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isTauri) return mockInvoke(cmd, args) as Promise<T>;
+  if (!isTauri) return (await import("./mock")).mockInvoke(cmd, args) as Promise<T>;
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(cmd, args);
 }
@@ -24,6 +23,7 @@ export const api = {
   micTestStart: (deviceId: string | null) => call<void>("mic_test_start", { deviceId }),
   micTestStop: () => call<void>("mic_test_stop"),
   dictationToggle: () => call<void>("dictation_toggle"),
+  dictationStop: () => call<void>("dictation_stop"),
   dictationCancel: () => call<void>("dictation_cancel"),
   pasteLast: () => call<void>("paste_last"),
   getSessionState: () => call<C.SessionState>("get_session_state"),
@@ -62,7 +62,7 @@ export type Events = {
 
 /** Subscribe to a Rust event. Returns the unsubscribe function. */
 export async function on<E extends keyof Events>(event: E, cb: (payload: Events[E]) => void): Promise<() => void> {
-  if (!isTauri) return mockListen(event, cb as (p: unknown) => void);
+  if (!isTauri) return (await import("./mock")).mockListen(event, cb as (p: unknown) => void);
   const { listen } = await import("@tauri-apps/api/event");
   return listen<Events[E]>(event, (e) => cb(e.payload));
 }

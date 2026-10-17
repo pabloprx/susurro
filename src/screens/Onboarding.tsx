@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, Hand, Repeat } from "lucide-react";
 import { api, on, type HistoryItem, type ModelInfo, type ModelProgress } from "../lib/api";
 import { keysOf, modelName, permStore, saveSettings, secs, settingsStore } from "../lib/store";
-import { Kbd, Meter, Serif, useLevel } from "../ui";
+import { Kbd, Meter, radioKeys, Serif, useLevel } from "../ui";
 import { LANGUAGES } from "./Providers";
 import type { Nav } from "../App";
 
@@ -60,28 +60,29 @@ export default function Onboarding({ start, onDone, nav }: { start: number; onDo
       onGrant={perms.input_monitoring ? null : () => api.requestPermission("input_monitoring")}
       onNext={next}
       pane="Input Monitoring"
+      blocked={
+        perms.input_monitoring &&
+        perms.fn_key_free === false && (
+          <div className="ob-panel">
+            <p className="note warn-text" style={{ justifyContent: "center" }}>
+              <AlertTriangle size={14} strokeWidth={1.5} /> Set &lsquo;Press fn key to&rsquo; = Do Nothing, or fn also opens the emoji picker.
+            </p>
+            <button className="btn primary" style={{ marginTop: 12 }} onClick={() => api.requestPermission("fn_key")}>
+              Open Keyboard settings
+            </button>
+          </div>
+        )
+      }
       extra={
-        <>
-          {perms.input_monitoring && perms.fn_key_free === false && (
-            <div className="ob-panel">
-              <p className="note warn-text" style={{ justifyContent: "center" }}>
-                <AlertTriangle size={14} strokeWidth={1.5} /> Set &lsquo;Press fn key to&rsquo; = Do Nothing, or fn also opens the emoji picker.
-              </p>
-              <button className="btn primary" style={{ marginTop: 12 }} onClick={() => api.requestPermission("fn_key")}>
-                Open Keyboard settings
-              </button>
-            </div>
-          )}
-          <button
-            className="link small"
-            onClick={async () => {
-              await saveSettings((x) => void (x.hotkeys.ptt = "Alt+Space"));
-              next();
-            }}
-          >
-            Use ⌥ Space instead (no permission)
-          </button>
-        </>
+        <button
+          className="link small"
+          onClick={async () => {
+            await saveSettings((x) => void (x.hotkeys.ptt = "Alt+Space"));
+            next();
+          }}
+        >
+          Use ⌥ Space instead (no permission)
+        </button>
       }
     />,
     <ShortcutStep key="s" onNext={next} />,
@@ -210,7 +211,7 @@ function MicStep({ granted, denied, onNext }: { granted: boolean; denied: boolea
   );
 }
 
-function PermStep(p: { eyebrow: string; title: string[]; why: string; not: string; granted: boolean; onGrant: (() => void) | null; onNext: () => void; pane: string; extra?: ReactNode }) {
+function PermStep(p: { eyebrow: string; title: string[]; why: string; not: string; granted: boolean; onGrant: (() => void) | null; onNext: () => void; pane: string; extra?: ReactNode; blocked?: ReactNode }) {
   const was = useRef(p.granted);
   // advance by itself once the grant shows up
   useEffect(() => {
@@ -225,41 +226,46 @@ function PermStep(p: { eyebrow: string; title: string[]; why: string; not: strin
       <Head eyebrow={p.eyebrow} title={p.title} />
       <p className="why">{p.why}</p>
       <p className="not">{p.not}</p>
-      <div className="diagram" aria-label={`System Settings, Privacy and Security, ${p.pane}: turn susurro on`}>
-        <div className="bar">
-          <i />
-          <i />
-          <i />
-          <span>Privacy &amp; Security › {p.pane}</span>
-        </div>
-        <div className="item">
-          <span className="app-ico">T</span> Terminal
-          <span className="toggle" aria-hidden>
-            <span />
-          </span>
-        </div>
-        <div className="item me">
-          <span className="app-ico">s</span> susurro
-          <span className="toggle on" aria-hidden>
-            <span />
-          </span>
-        </div>
-      </div>
-      {p.granted ? (
-        <p className="ob-granted">
-          <Check size={16} strokeWidth={2} /> Granted
-        </p>
-      ) : null}
-      <div className="ob-actions">
-        {!p.granted && p.onGrant && (
-          <button className="btn primary ob-primary" onClick={p.onGrant}>
-            Open System Settings
-          </button>
-        )}
-        <button className={`btn ${p.granted ? "primary" : "ghost"} ob-next`} onClick={p.onNext}>
-          {p.granted ? "Continue" : "Not now"}
-        </button>
-      </div>
+      {/* blocked: the grant is done but a follow-up check fails; only its fix shows, not the grant block */}
+      {p.blocked || (
+        <>
+          <div className="diagram" aria-label={`System Settings, Privacy and Security, ${p.pane}: turn susurro on`}>
+            <div className="bar">
+              <i />
+              <i />
+              <i />
+              <span>Privacy &amp; Security › {p.pane}</span>
+            </div>
+            <div className="item">
+              <span className="app-ico">T</span> Terminal
+              <span className="toggle" aria-hidden>
+                <span />
+              </span>
+            </div>
+            <div className="item me">
+              <span className="app-ico">s</span> susurro
+              <span className="toggle on" aria-hidden>
+                <span />
+              </span>
+            </div>
+          </div>
+          {p.granted ? (
+            <p className="ob-granted">
+              <Check size={16} strokeWidth={2} /> Granted
+            </p>
+          ) : null}
+          <div className="ob-actions">
+            {!p.granted && p.onGrant && (
+              <button className="btn primary ob-primary" onClick={p.onGrant}>
+                Open System Settings
+              </button>
+            )}
+            <button className={`btn ${p.granted ? "primary" : "ghost"} ob-next`} onClick={p.onNext}>
+              {p.granted ? "Continue" : "Not now"}
+            </button>
+          </div>
+        </>
+      )}
       {p.extra}
     </>
   );
@@ -272,8 +278,8 @@ function ShortcutStep({ onNext }: { onNext: () => void }) {
   return (
     <>
       <Head eyebrow="Your shortcut" title={["One key. ", "Your", " rhythm."]} />
-      <div className="choice" role="radiogroup" aria-label="How you dictate">
-        <button role="radio" aria-checked={!s.hotkeys.double_tap} onClick={() => set(false)}>
+      <div className="choice" role="radiogroup" aria-label="How you dictate" onKeyDown={radioKeys}>
+        <button role="radio" aria-checked={!s.hotkeys.double_tap} tabIndex={s.hotkeys.double_tap ? -1 : 0} onClick={() => set(false)}>
           <span className="t">
             <Hand size={16} strokeWidth={1.5} /> Hold to talk
           </span>
@@ -281,7 +287,7 @@ function ShortcutStep({ onNext }: { onNext: () => void }) {
             Hold <Kbd keys={keys} />, talk, release. Text lands where you type.
           </span>
         </button>
-        <button role="radio" aria-checked={s.hotkeys.double_tap} onClick={() => set(true)}>
+        <button role="radio" aria-checked={s.hotkeys.double_tap} tabIndex={s.hotkeys.double_tap ? 0 : -1} onClick={() => set(true)}>
           <span className="t">
             <Repeat size={16} strokeWidth={1.5} /> Tap to toggle
           </span>

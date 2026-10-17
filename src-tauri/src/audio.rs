@@ -7,7 +7,8 @@
 //!   Steady state is under the 150 ms bar of PLAN 3.5, so there is no "keep mic warm" setting. ponytail: re-measure with a Bluetooth mic (HFP switch).
 
 use crate::AppState;
-use crate::contract::{AudioLevel, DeviceInfo, DeviceKind, KnownDevice, MicSelection, MicSettings, MicState, Toast, ToastActionDef, ToastKind};
+use crate::contract::{AudioLevel, DeviceInfo, DeviceKind, KnownDevice, MicSelection, MicSettings, MicState, ToastKind};
+use crate::session::toast;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -101,13 +102,18 @@ pub fn visible(devices: &[DeviceInfo], show_virtual: bool, active: Option<&str>)
 }
 
 /// By id, else by name (the id can change after an OS update, PLAN 3.1).
-fn find<'a>(connected: &'a [DeviceInfo], id: &str, name: Option<&str>) -> Option<&'a DeviceInfo> {
-    connected.iter().find(|d| d.id == id).or_else(|| name.and_then(|n| connected.iter().find(|d| d.name == n)))
+/// By id, else by name (an OS update changed the id). A same-name device that is another known entry
+/// is that entry, not this one (two "Shure MV7" mics).
+fn find<'a>(priority: &[KnownDevice], connected: &'a [DeviceInfo], id: &str, name: Option<&str>) -> Option<&'a DeviceInfo> {
+    connected.iter().find(|d| d.id == id).or_else(|| {
+        let n = name?;
+        connected.iter().find(|d| d.name == n && !priority.iter().any(|k| k.id == d.id))
+    })
 }
 
 fn auto(priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Option<&str>) -> Option<Resolved> {
     let r = |d: &DeviceInfo, reason| Some(Resolved { info: d.clone(), reason });
-    if let Some(d) = priority.iter().find_map(|k| find(connected, &k.id, Some(&k.name))) {
+    if let Some(d) = priority.iter().find_map(|k| find(priority, connected, &k.id, Some(&k.name))) {
         return r(d, Reason::Priority);
     }
     if let Some(d) = system_default.and_then(|id| connected.iter().find(|d| d.id == id && d.kind != DeviceKind::Virtual)) {
@@ -121,7 +127,7 @@ fn auto(priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Opti
 pub fn resolve(sel: &MicSelection, priority: &[KnownDevice], connected: &[DeviceInfo], system_default: Option<&str>) -> Option<Resolved> {
     let MicSelection::Device { id } = sel else { return auto(priority, connected, system_default) };
     let name = priority.iter().find(|k| &k.id == id).map(|k| k.name.as_str());
-    if let Some(d) = find(connected, id, name) {
+    if let Some(d) = find(priority, connected, id, name) {
         return Some(Resolved { info: d.clone(), reason: Reason::Selected });
     }
     let wanted = name.unwrap_or(id).to_string();
@@ -152,7 +158,7 @@ pub fn heal_ids(mic: &mut MicSettings, connected: &[DeviceInfo]) -> bool {
 }
 
 fn known(d: &DeviceInfo) -> KnownDevice {
-    KnownDevice { id: d.id.clone(), name: d.name.clone(), kind: d.kind.clone(), last_seen: chrono::Utc::now().timestamp() }
+    KnownDevice { id: d.id.clone(), name: d.name.clone(), kind: d.kind.clone(), last_seen: crate::history::now_ms() }
 }
 
 /// First run: seed the priority list from what is connected, USB > BuiltIn > Bluetooth > Other (PLAN 3.2). No virtual devices.
@@ -207,14 +213,9 @@ pub fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
     })
 }
 
-/// 16 kHz mono s16 WAV (history audio, mic example).
+/// 16 kHz mono s16 WAV file (history audio, mic example).
 pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> anyhow::Result<()> {
-    let spec = hound::WavSpec { channels: 1, sample_rate: RATE, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-    let mut w = hound::WavWriter::create(path, spec)?;
-    for s in samples {
-        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
-    }
-    Ok(w.finalize()?)
+    Ok(std::fs::write(path, crate::stt::wav_bytes(samples)?)?)
 }
 
 // ---------- CoreAudio transport type (cpal 0.18 only reports "Aggregate") ----------
@@ -501,7 +502,17 @@ impl Recorder {
         }
         // A vanished device is not in `devs`; one that only invalidated its stream (rate change) is reopened.
         let r = resolve(sel, priority, &devs, system_default(&devs)).ok_or_else(|| anyhow::anyhow!("No microphone"))?;
-        self.switch_device(&r)?;
+        let r = match self.switch_device(&r) {
+            Ok(()) => r,
+            // CoreAudio can still list the device that just died: try the next one before giving up.
+            Err(e) if r.info.id == self.device.id => {
+                let devs: Vec<DeviceInfo> = devs.into_iter().filter(|d| d.id != r.info.id).collect();
+                let r2 = resolve(sel, priority, &devs, system_default(&devs)).ok_or(e)?;
+                self.switch_device(&r2)?;
+                r2
+            }
+            Err(e) => return Err(e),
+        };
         log::info!("mic: switched to {}", r.info.name);
         Ok(Some(r))
     }
@@ -566,18 +577,6 @@ where
 
 // ---------- app glue: runtime state, monitor, toasts ----------
 
-fn toast(app: &AppHandle, id: &str, kind: ToastKind, text: String, actions: &[(&str, &str)]) {
-    log::info!("mic toast: {text}");
-    let t = Toast {
-        id: id.into(),
-        kind,
-        text,
-        actions: actions.iter().map(|(id, label)| ToastActionDef { id: (*id).into(), label: (*label).into() }).collect(),
-        ttl_ms: if actions.is_empty() { 4000 } else { 10000 },
-    };
-    let _ = app.emit("toast", t);
-}
-
 /// Build MicState from settings + runtime. Virtual devices are hidden unless `show_virtual`.
 pub fn mic_state(state: &AppState) -> MicState {
     let s = state.settings.read().unwrap();
@@ -591,10 +590,11 @@ pub fn mic_state(state: &AppState) -> MicState {
     }
 }
 
-/// The device a dictation should use now (cached list from the monitor; fresh list if the monitor has not run yet).
-pub fn resolve_current(app: &AppHandle) -> Option<Resolved> {
+/// The device a dictation should use now. `fresh` = enumerate now; else the monitor's list (up to 1.5 s old),
+/// or a fresh list if the monitor has not run yet.
+pub fn resolve_current(app: &AppHandle, fresh: bool) -> Option<Resolved> {
     let state = app.state::<AppState>();
-    let cached = state.mic.lock().unwrap().devices.clone();
+    let cached = if fresh { vec![] } else { state.mic.lock().unwrap().devices.clone() };
     let devs = if cached.is_empty() { list_devices() } else { cached };
     let s = state.settings.read().unwrap();
     resolve(&s.mic.selection, &s.mic.priority, &devs, system_default(&devs))
@@ -614,13 +614,13 @@ pub fn recover_session(app: &AppHandle, rec: &mut Recorder) -> bool {
         Ok(Some(r)) => {
             // Same device reopened (sample-rate change): no toast.
             if r.info.id != old_id {
-                toast(app, "mic-lost", ToastKind::Warn, format!("Mic lost - continuing on {}", r.info.name), &[]);
+                toast(app, None, "mic-lost", ToastKind::Warn, format!("Mic lost - continuing on {}", r.info.name), &[], 4000);
             }
             true
         }
         Err(e) => {
             log::warn!("mic: recover failed: {e}");
-            toast(app, "mic-lost", ToastKind::Error, format!("{old} disconnected - no microphone left"), &[]);
+            toast(app, None, "mic-lost", ToastKind::Error, format!("{old} disconnected - no microphone left"), &[], 4000);
             false
         }
     }
@@ -648,9 +648,9 @@ fn apply(app: &AppHandle, devices: Vec<DeviceInfo>, toasts: bool) -> MicState {
     if toasts {
         let using = r.as_ref().map_or("no microphone".to_string(), |r| r.info.name.clone());
         match (prev, &fallback) {
-            (None, Some(w)) => toast(app, "mic-fallback", ToastKind::Warn, format!("{w} disconnected - using {using}"), &[]),
+            (None, Some(w)) => toast(app, None, "mic-fallback", ToastKind::Warn, format!("{w} disconnected - using {using}"), &[], 4000),
             (Some(w), None) if matches!(r, Some(Resolved { reason: Reason::Selected, .. })) => {
-                toast(app, "mic-fallback", ToastKind::Info, format!("Using {w} again"), &[])
+                toast(app, None, "mic-fallback", ToastKind::Info, format!("Using {w} again"), &[], 4000)
             }
             _ => {}
         }
@@ -660,8 +660,9 @@ fn apply(app: &AppHandle, devices: Vec<DeviceInfo>, toasts: bool) -> MicState {
     ms
 }
 
+/// Holds the write lock while writing, like save_settings: the file always gets the latest in-memory copy.
 fn save(state: &AppState) {
-    let s = state.settings.read().unwrap();
+    let s = state.settings.write().unwrap();
     if let Err(e) = crate::settings::save(&state.settings_path(), &s) {
         log::error!("mic: save settings: {e}");
     }
@@ -673,7 +674,7 @@ fn on_change(app: &AppHandle, devices: Vec<DeviceInfo>, added: &[DeviceInfo]) {
     let new: Vec<DeviceInfo> = {
         let mut s = state.settings.write().unwrap();
         heal_ids(&mut s.mic, &devices);
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::history::now_ms();
         for k in s.mic.priority.iter_mut().filter(|k| devices.iter().any(|d| d.id == k.id)) {
             k.last_seen = now;
         }
@@ -689,7 +690,7 @@ fn on_change(app: &AppHandle, devices: Vec<DeviceInfo>, added: &[DeviceInfo]) {
     save(&state);
     for d in &new {
         let bt = if d.kind == DeviceKind::Bluetooth { " (Bluetooth: using its mic lowers the headset's audio quality)" } else { "" };
-        toast(app, &format!("mic-new:{}", d.id), ToastKind::Info, format!("New mic: {}{bt}", d.name), &[("switch", "Switch"), ("keep", "Keep current")]);
+        toast(app, None, &format!("mic-new:{}", d.id), ToastKind::Info, format!("New mic: {}{bt}", d.name), &[("switch", "Switch"), ("keep", "Keep current")], 10_000);
     }
     let recording = state.mic.lock().unwrap().recording.clone();
     if let Some(id) = recording.as_ref().filter(|id| !devices.iter().any(|d| &d.id == *id)) {
@@ -823,7 +824,7 @@ fn open_error(dev: &DeviceInfo, e: &anyhow::Error) -> String {
 pub async fn mic_test_start(app: AppHandle, device_id: Option<String>) -> Result<(), String> {
     let dev = match device_id {
         Some(id) => list_devices().into_iter().find(|d| d.id == id).ok_or_else(|| "unavailable: that microphone is not connected".to_string())?,
-        None => resolve_current(&app).ok_or_else(|| "unavailable: No microphone".to_string())?.info,
+        None => resolve_current(&app, false).ok_or_else(|| "unavailable: No microphone".to_string())?.info,
     };
     mic_test_stop()?;
     // ~100 ms of CoreAudio setup: async command, so it runs off the main thread.
@@ -851,7 +852,7 @@ pub async fn mic_test_start(app: AppHandle, device_id: Option<String>) -> Result
             }
             if !warned && loud_at.elapsed() >= TEST_QUIET_FOR {
                 warned = true;
-                toast_main(&app, ToastKind::Warn, "We hear nothing - is it muted?".into());
+                toast(&app, Some("main"), "mic-test", ToastKind::Warn, "We hear nothing - is it muted?", &[], 4000);
             }
             let focused = main.as_ref().and_then(|w| w.is_focused().ok()).unwrap_or(false);
             let blurred = was_focused && !focused;
@@ -862,7 +863,7 @@ pub async fn mic_test_start(app: AppHandle, device_id: Option<String>) -> Result
                     *t = None;
                 }
                 if lost {
-                    toast_main(&app, ToastKind::Warn, format!("{} disconnected - mic test stopped", dev.name));
+                    toast(&app, Some("main"), "mic-test", ToastKind::Warn, format!("{} disconnected - mic test stopped", dev.name), &[], 4000);
                 }
                 return;
             }
@@ -871,9 +872,6 @@ pub async fn mic_test_start(app: AppHandle, device_id: Option<String>) -> Result
     Ok(())
 }
 
-fn toast_main(app: &AppHandle, kind: ToastKind, text: String) {
-    let _ = app.emit_to("main", "toast", Toast { id: "mic-test".into(), kind, text, actions: vec![], ttl_ms: 4000 });
-}
 
 #[tauri::command]
 pub fn mic_test_stop() -> Result<(), String> {
@@ -1021,5 +1019,37 @@ mod tests {
         assert!(quiet.silent() && !quiet.too_short());
         let tap = Clip { duration_ms: 200, peak_db: -10.0, ..Default::default() };
         assert!(tap.too_short() && !tap.silent());
+    }
+
+    // ---------- adversarial (2026-10-17 review) ----------
+
+    #[test]
+    fn same_name_known_device_is_not_the_selected_one() {
+        // Two identical mics, both known. The selected one is unplugged: the other is a fallback, not "Selected".
+        let (a, b) = (dev("ca:a", "Shure MV7", DeviceKind::Usb, false), dev("ca:b", "Shure MV7", DeviceKind::Usb, false));
+        let p = [k("ca:a", "Shure MV7"), k("ca:b", "Shure MV7"), k("ca:bi", "MacBook Pro Microphone")];
+        let r = got(resolve(&sel("ca:a"), &p, &[builtin(), b.clone()], None));
+        assert_eq!(r, Some(("ca:b".into(), Reason::Fallback { wanted: "Shure MV7".into() })));
+        // Both connected: each id gets its own device.
+        assert_eq!(got(resolve(&sel("ca:b"), &p, &[a, b, builtin()], None)), Some(("ca:b".into(), Reason::Selected)));
+    }
+
+    #[test]
+    fn priority_skips_missing_and_virtual_default() {
+        let p = [k("ca:gone1", "Old USB"), k("ca:gone2", "Old BT")];
+        // nothing in priority is connected, the default is virtual: first BuiltIn
+        assert_eq!(got(resolve(&MicSelection::Auto, &p, &[vir(), bt(), builtin()], Some("ca:bh"))), Some(("ca:bi".into(), Reason::Any)));
+        // selected device unknown to priority and missing: fallback labels it by id
+        assert_eq!(got(resolve(&sel("ca:zzz"), &p, &[bt()], None)), Some(("ca:bt".into(), Reason::Fallback { wanted: "ca:zzz".into() })));
+    }
+
+    #[test]
+    fn heal_does_not_steal_another_known_id() {
+        // ca:a is gone; ca:b (same name) is already known: no heal, both entries stay.
+        let b = dev("ca:b", "Shure MV7", DeviceKind::Usb, false);
+        let mut mic = MicSettings { selection: sel("ca:a"), priority: vec![k("ca:a", "Shure MV7"), k("ca:b", "Shure MV7")], show_virtual: false };
+        assert!(!heal_ids(&mut mic, &[b]));
+        assert_eq!(mic.selection, sel("ca:a"));
+        assert_eq!(mic.priority.len(), 2);
     }
 }

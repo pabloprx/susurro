@@ -30,6 +30,8 @@ pub struct SttOutput {
     pub language: Option<String>,
     /// Set when the cloud STT failed and local whisper produced the text. The toast shows it.
     pub note: Option<String>,
+    /// Local whisper produced the text after the cloud STT failed (the History provider label).
+    pub fell_back: bool,
 }
 
 pub trait Transcriber {
@@ -97,6 +99,7 @@ impl Transcriber for WithFallback {
                 log::warn!("cloud STT failed, trying local whisper: {e:#}");
                 let mut o = self.local.transcribe(req).map_err(|le| anyhow::anyhow!("{e:#}; local fallback also failed: {le:#}"))?;
                 o.note = Some(format!("Used local whisper: {e:#}"));
+                o.fell_back = true;
                 Ok(o)
             }
         }
@@ -128,8 +131,14 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
     let code = resp.status().as_u16();
     let body = resp.text().map_err(|e| anyhow::anyhow!("{what}: reading the response failed: {e}"))?;
     let snippet: String = body.chars().take(300).collect();
+    // OpenRouter 402/403-budget and ElevenLabs 401-quota_exceeded: the key is fine, the account is not.
+    let out_of_credits = code == 402 || {
+        let l = body.to_lowercase();
+        ["quota", "budget", "credit"].iter().any(|w| l.contains(w))
+    };
     match code {
         200..=299 => serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
+        401..=403 if out_of_credits => anyhow::bail!("{what}: out of credits or over quota (HTTP {code}): {snippet}"),
         401 | 403 => anyhow::bail!("{what}: invalid or missing API key (HTTP {code})"),
         429 => anyhow::bail!("{what}: rate limited or out of credits (HTTP 429)"),
         500.. => anyhow::bail!("{what} server error (HTTP {code}): {snippet}"),
@@ -162,9 +171,9 @@ pub(crate) fn wav_bytes(audio: &[f32]) -> anyhow::Result<Vec<u8>> {
     Ok(cur.into_inner())
 }
 
-pub(crate) fn jfk() -> Vec<f32> {
-    let r = hound::WavReader::new(std::io::Cursor::new(JFK_WAV)).expect("bundled jfk.wav");
-    r.into_samples::<i16>().filter_map(Result::ok).map(|v| v as f32 / 32768.0).collect()
+/// The bundled jfk.wav (11 s of English speech), for the provider test and the whisper tests.
+pub fn jfk() -> Vec<f32> {
+    crate::history::decode_wav(JFK_WAV).expect("bundled jfk.wav")
 }
 
 fn run_test(app: &AppHandle, which: &str) -> anyhow::Result<String> {
@@ -183,8 +192,7 @@ fn run_test(app: &AppHandle, which: &str) -> anyhow::Result<String> {
             if s.cleanup.level == crate::contract::CleanupLevel::None {
                 s.cleanup.level = crate::contract::CleanupLevel::Light;
             }
-            let ctx = crate::cleanup::StyleCtx { style: s.styles.style.clone() };
-            crate::cleanup::cleanup(&s, key.as_deref(), "um so I think we should uh meet tomorrow at at three", &Hints::default(), &ctx)
+            crate::cleanup::cleanup(&s, key.as_deref(), &s.cleanup.level, "um so I think we should uh meet tomorrow at at three", &Hints::default())
         }
         _ => anyhow::bail!("unknown provider kind {which:?}"),
     }
@@ -299,5 +307,26 @@ mod tests {
         chat.assert();
         assert_eq!(m, vec![OrModel { id: "a/b".into(), name: "a/b".into() }]);
         assert!(list_models(&base, "tts", None).is_err());
+    }
+
+    // ---------- adversarial (2026-10-17 review) ----------
+
+    #[test]
+    fn credit_and_quota_errors_are_not_called_bad_keys() {
+        let mut srv = mockito::Server::new();
+        // OpenRouter: 402 = insufficient credits; 403 with a budget body = guardrail budget.
+        // ElevenLabs: 401 with detail.status = quota_exceeded.
+        let cases = [
+            (402, r#"{"error":{"code":402,"message":"Insufficient credits"}}"#),
+            (403, r#"{"error":{"code":403,"message":"Budget limit exceeded (weekly limit)"}}"#),
+            (401, r#"{"detail":{"status":"quota_exceeded","message":"This request exceeds your quota"}}"#),
+        ];
+        for (code, body) in cases {
+            let m = srv.mock("GET", "/x").with_status(code).with_body(body).create();
+            let e = send_json(http().get(format!("{}/x", srv.url())), "Prov").unwrap_err().to_string();
+            assert!(!e.contains("invalid or missing API key"), "{code}: {e}");
+            assert!(e.to_lowercase().contains("credit") || e.contains("quota") || e.contains("Budget"), "{code}: {e}");
+            m.remove();
+        }
     }
 }

@@ -402,6 +402,9 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     if (session.phase === "idle") start("locked");
     else void finish();
   },
+  dictation_stop: () => {
+    if (session.phase === "recording" || session.phase === "locked") void finish();
+  },
   dictation_cancel: () => {
     if (session.phase === "recording" || session.phase === "locked") {
       phase("idle");
@@ -592,7 +595,7 @@ export function overlayDemo(state: string | null) {
 }
 
 /** Main window in a browser: a mic gets plugged in a few seconds after load. */
-const inBrowser = !("__TAURI_INTERNALS__" in window); // api.ts imports this file in Tauri too: no side effects there
+const inBrowser = !("__TAURI_INTERNALS__" in window); // api.ts loads this file only outside Tauri; keep the guard anyway
 if (inBrowser && !location.pathname.startsWith("/overlay") && !fresh) setTimeout(plug, 7000);
 
 if (inBrowser) Object.assign(window, {

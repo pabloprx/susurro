@@ -4,13 +4,15 @@
 use crate::AppState;
 use crate::contract::{MicSelection, Navigate};
 use crate::session::SessionCmd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuEvent, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 const TRAY: &str = "susurro";
-static PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn paused(app: &AppHandle) -> bool {
+    app.try_state::<crate::hotkey::HotkeyHandle>().is_some_and(|h| h.paused())
+}
 
 fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let ms = crate::audio::mic_state(app.state::<AppState>().inner());
@@ -28,7 +30,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .text("open", "Open susurro")
         .item(&mic)
         .text("paste-last", "Paste last transcript")
-        .item(&CheckMenuItem::with_id(app, "pause", "Pause hotkey", true, PAUSED.load(Ordering::Relaxed), None::<&str>)?)
+        .item(&CheckMenuItem::with_id(app, "pause", "Pause hotkey", true, paused(app), None::<&str>)?)
         .separator()
         .text("quit", "Quit susurro")
         .build()
@@ -57,10 +59,8 @@ fn on_menu(app: &AppHandle, e: MenuEvent) {
             let _ = state.session_tx.send(SessionCmd::PasteLast);
         }
         "pause" => {
-            let p = !PAUSED.load(Ordering::Relaxed);
-            PAUSED.store(p, Ordering::Relaxed);
             if let Some(h) = app.try_state::<crate::hotkey::HotkeyHandle>() {
-                h.set_paused(p);
+                h.set_paused(!h.paused());
             }
             refresh(app);
         }

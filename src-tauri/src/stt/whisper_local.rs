@@ -11,6 +11,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 /// PLAN 2.6. A guess: needs to be measured (PLAN 12).
 const NO_SPEECH_MAX: f32 = 0.6;
+pub const ENGLISH_ONLY: &str = "This whisper model understands only English. Set the language to English or pick a multilingual model";
 /// PLAN 2.4: whisper prompt budget, counted with the real tokenizer.
 const PROMPT_TOKENS: usize = 200;
 
@@ -76,8 +77,9 @@ impl Whisper {
 
 impl Transcriber for Whisper {
     fn transcribe(&self, req: &SttRequest) -> anyhow::Result<SttOutput> {
-        // English-only models: auto-detect is wasted work and reports a wrong language.
-        let lang = if self.ctx.is_multilingual() { req.lang() } else { Some("en") };
+        let lang = req.lang();
+        // An English-only model turns other speech into invented English: fail (the WAV is kept for Retry).
+        anyhow::ensure!(self.ctx.is_multilingual() || lang == Some("en"), "{}", ENGLISH_ONLY);
         let prompt = if req.hints.terms.is_empty() {
             String::new()
         } else {
@@ -104,6 +106,6 @@ impl Transcriber for Whisper {
             .map(|s| s.to_str_lossy().map(|c| c.into_owned()).unwrap_or_default())
             .collect();
         let language = whisper_rs::get_lang_str(st.full_lang_id_from_state()).map(str::to_string);
-        Ok(SttOutput { text: text.trim().to_string(), language, note: None })
+        Ok(SttOutput { text: text.trim().to_string(), language, note: None, fell_back: false })
     }
 }

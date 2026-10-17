@@ -27,7 +27,8 @@ export default function History() {
     return () => clearTimeout(t);
   }, [query]);
   useEffect(() => {
-    const off = on("history_added", (h) => !query && setItems((cur) => [h, ...(cur ?? [])]));
+    // A retry re-emits an existing id: replace it in place.
+    const off = on("history_added", (h) => setItems((cur) => (cur?.some((x) => x.id === h.id) ? cur.map((x) => (x.id === h.id ? h : x)) : query ? cur : [h, ...(cur ?? [])])));
     const key = (e: KeyboardEvent) => {
       if (e.metaKey && e.key === "f") (e.preventDefault(), search.current?.focus());
     };
@@ -176,7 +177,14 @@ function Row({ h, query, open, onToggle, onChange, onDelete }: { h: HistoryItem;
         {!open && failed && <span className="status danger-text">not pasted</span>}
         {!open && h.status === "copied" && <span className="status dim">copied</span>}
       </button>
-      <div className="expand">
+      <div
+        className="expand"
+        onTransitionEnd={(e) => {
+          // keep the opened row's controls on screen (a row near the bottom opens below the fold)
+          if (open && e.target === e.currentTarget && e.propertyName === "grid-template-rows")
+            e.currentTarget.parentElement!.scrollIntoView({ block: "nearest", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        }}
+      >
         <div>
           {open && (
             <div className="h-body">

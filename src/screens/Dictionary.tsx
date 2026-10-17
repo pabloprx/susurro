@@ -45,6 +45,12 @@ export default function Dictionary() {
   const corrections = wordsList.flatMap((e) => e.aliases.map((a) => ({ alias: a, entry: e })));
   const f = norm(filter);
   const match = (...s: (string | null)[]) => !f || s.some((x) => x && norm(x).includes(f));
+  const shownWords = wordsList.filter((w) => match(w.text));
+  const shownCorrections = corrections.filter((c) => match(c.alias, c.entry.text));
+  const shownSnippets = snippets.filter((s) => match(s.text, s.expansion));
+  const noMatch = (
+    <Empty line={[`No match for “${filter}”.`]} help="The filter checks terms, corrections and expansions." action={<button className="btn secondary" onClick={() => setFilter("")}>Clear filter</button>} />
+  );
 
   /** Where a term already lives, for the shared-namespace check. */
   const whereIs = (term: string, ignore?: number): string | null => {
@@ -168,9 +174,11 @@ export default function Dictionary() {
             <AddWord inputRef={addRef} check={check} onAdd={(t) => upsert(fresh("word", t), `w${norm(t)}`)} />
             {!wordsList.length ? (
               <Empty line={S.empty.words.line} help={S.empty.words.help} />
+            ) : !shownWords.length ? (
+              noMatch
             ) : (
               <div className="rows">
-                {wordsList.filter((w) => match(w.text)).map((w) => (
+                {shownWords.map((w) => (
                   <EditableRow
                     key={w.id}
                     lit={lit === `w${norm(w.text)}`}
@@ -236,9 +244,11 @@ export default function Dictionary() {
             />
             {!corrections.length ? (
               <Empty line={S.empty.corrections.line} help={S.empty.corrections.help} />
+            ) : !shownCorrections.length ? (
+              noMatch
             ) : (
               <div className="rows">
-                {corrections.filter((c) => match(c.alias, c.entry.text)).map(({ alias, entry }) => (
+                {shownCorrections.map(({ alias, entry }) => (
                   <EditableRow
                     key={`${entry.id}-${alias}`}
                     lit={lit === `c${norm(alias)}`}
@@ -276,6 +286,8 @@ export default function Dictionary() {
           <div className="card">
             {!snippets.length ? (
               <Empty line={S.empty.snippets.line} help={S.empty.snippets.help} action={<button className="btn secondary" onClick={() => setSheet("new")}>New snippet</button>} />
+            ) : !shownSnippets.length ? (
+              noMatch
             ) : (
               <>
                 <div className="cols-head">
@@ -283,7 +295,7 @@ export default function Dictionary() {
                   <span className="label">Expansion</span>
                 </div>
                 <div className="rows">
-                  {snippets.filter((s) => match(s.text, s.expansion)).map((s) => (
+                  {shownSnippets.map((s) => (
                     <div key={s.id} className={`row hoverable d-row snip-row${lit === `s${norm(s.text)}` ? " fresh" : ""}`} onClick={() => setSheet(s)}>
                       <span className="trig ellipsis">{s.text}</span>
                       <span className="exp ellipsis">{(s.expansion ?? "").replace(/\n/g, " ↵ ")}</span>
@@ -444,12 +456,14 @@ function EditableRow(p: { value: string; lit: boolean; mono?: boolean; check: (v
 }
 
 const VARS = ["{date}", "{time}", "{weekday}"];
+/** Same output as Rust expand_vars (dictionary.rs): %Y-%m-%d, %H:%M, English %A, local time. */
 const expand = (s: string) => {
   const d = new Date();
+  const p2 = (n: number) => String(n).padStart(2, "0");
   return s
-    .split("{date}").join(d.toLocaleDateString())
-    .split("{time}").join(d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))
-    .split("{weekday}").join(d.toLocaleDateString([], { weekday: "long" }));
+    .split("{date}").join(`${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`)
+    .split("{time}").join(`${p2(d.getHours())}:${p2(d.getMinutes())}`)
+    .split("{weekday}").join(d.toLocaleDateString("en-US", { weekday: "long" }));
 };
 
 function SnippetSheet({ entry, onClose, check, onSave }: { entry: DictEntry | "new" | null; onClose: () => void; check: (t: string, ignore?: number) => string | null; onSave: (e: DictEntryInput) => Promise<string | null> }) {

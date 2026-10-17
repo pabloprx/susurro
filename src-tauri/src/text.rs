@@ -265,9 +265,6 @@ pub fn style_rules(text: &str, style: Style, terms: &[String]) -> String {
 
 // ---------- hallucination filter ----------
 
-/// Whisper segments above this no-speech probability are dropped (WP2). ponytail: a guess, PLAN 12.
-pub const NO_SPEECH_MAX: f32 = 0.6;
-
 /// Normalized: diacritics gone, punctuation as spaces ("Amara.org" -> "amara org").
 const HALLUCINATIONS: &[&str] = &[
     "thank you",

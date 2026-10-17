@@ -175,8 +175,19 @@ pub fn stats(conn: &Connection, now: i64) -> rusqlite::Result<Stats> {
 }
 
 /// Reads a 16 kHz mono s16 WAV (our own format).
+/// The paste result of a retried row.
+pub fn set_status(conn: &Connection, id: i64, status: &HistoryStatus) -> rusqlite::Result<()> {
+    conn.execute("UPDATE history SET status = ?1 WHERE id = ?2", params![status_str(status), id])?;
+    Ok(())
+}
+
 pub fn read_wav(path: &Path) -> anyhow::Result<Vec<f32>> {
-    let r = hound::WavReader::open(path)?;
+    decode_wav(&std::fs::read(path)?)
+}
+
+/// 16 kHz mono s16 WAV bytes -> f32 samples.
+pub fn decode_wav(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
+    let r = hound::WavReader::new(std::io::Cursor::new(bytes))?;
     anyhow::ensure!(r.spec().sample_rate == crate::audio::RATE && r.spec().channels == 1, "unexpected WAV format");
     Ok(r.into_samples::<i16>().collect::<Result<Vec<_>, _>>()?.into_iter().map(|v| v as f32 / 32768.0).collect())
 }

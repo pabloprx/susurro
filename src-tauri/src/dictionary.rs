@@ -83,6 +83,16 @@ fn fuzzy_d(w: &[char], pat: &[char]) -> Option<usize> {
     if w.first() != pat.first() || w.len().abs_diff(pat.len()) > max || w.starts_with(pat) {
         return None;
     }
+    // "iPhone 16" is not "iPhone 15": only letters may differ, the digits are a fact.
+    let digits = |v: &[char]| v.iter().filter(|c| c.is_numeric()).copied().collect::<Vec<_>>();
+    if digits(w) != digits(pat) {
+        return None;
+    }
+    // "Mariana" is not "Mariano": a final-vowel swap is another name (gender), not a mishearing.
+    let vowel = |c: Option<&char>| c.is_some_and(|c| "aeiou".contains(*c));
+    if w.len() == pat.len() && w[..w.len() - 1] == pat[..pat.len() - 1] && vowel(w.last()) && vowel(pat.last()) {
+        return None;
+    }
     let d = dl(w, pat);
     (1..=max).contains(&d).then_some(d)
 }
@@ -91,6 +101,7 @@ struct Pat {
     entry: usize,
     sq: Vec<char>,
     sq_s: String,
+    toks: Vec<String>,
     ntoks: usize,
     snippet: bool,
 }
@@ -148,7 +159,7 @@ impl Dictionary {
                 if !snippet {
                     d.squash.entry(toks.concat()).or_default().push(pi);
                 }
-                d.pats.push(Pat { entry: ei, sq: toks.concat().chars().collect(), sq_s: toks.concat(), ntoks: toks.len(), snippet });
+                d.pats.push(Pat { entry: ei, sq: toks.concat().chars().collect(), sq_s: toks.concat(), ntoks: toks.len(), toks, snippet });
             }
         }
         d
@@ -184,23 +195,9 @@ impl Dictionary {
     /// Corrections again (the LLM can misspell), then the placeholders expanded.
     /// None = a placeholder was lost, duplicated or invented: use the no-LLM path.
     pub fn finish(&self, llm_out: &str, p: &Prepared) -> Option<String> {
-        let mut seen = vec![0u32; p.slots.len()];
-        let mut rest = llm_out;
-        while let Some(a) = rest.find('⟦') {
-            let after = &rest[a + '⟦'.len_utf8()..];
-            let b = after.find('⟧')?;
-            let n: usize = after[..b].trim().parse().ok()?;
-            *seen.get_mut(n.checked_sub(1)?)? += 1;
-            rest = &after[b..];
-        }
-        if seen.iter().any(|&c| c != 1) {
-            return None;
-        }
-        let (mut out, ..) = self.run(llm_out, Mode::WordsOnly);
-        for (i, slot) in p.slots.iter().enumerate() {
-            out = out.replace(&format!("⟦{}⟧", i + 1), slot);
-        }
-        Some(out)
+        let (out, ..) = self.run(llm_out, Mode::WordsOnly);
+        let (out, seen) = Self::expand(&out, &p.slots)?;
+        seen.iter().all(|&c| c == 1).then_some(out)
     }
 
     fn punct(&self, t: &str) -> String {
@@ -241,6 +238,10 @@ impl Dictionary {
                 if n > p.ntoks && (is_common(words[0]) || is_common(words[n - 1])) {
                     continue;
                 }
+                // "pablo pero" is not "Pablo Pérez": a common word that is not in the entry is its own word.
+                if n > 1 && words.iter().any(|w| is_common(w) && !p.toks.iter().any(|t| t == w)) {
+                    continue;
+                }
                 let Some(d) = fuzzy_d(&wc, &p.sq) else { continue };
                 // Any form of this entry + an ending ("contaflows") is another word, not a mishearing.
                 if self.pats.iter().any(|q| q.entry == p.entry && sq.len() > q.sq_s.len() && sq.starts_with(&q.sq_s)) {
@@ -268,6 +269,9 @@ impl Dictionary {
         }
         for l in (1..=maxl).rev() {
             let w = &toks[i..i + l];
+            if glued(s, w[0].start, w[l - 1].end) {
+                continue;
+            }
             // Middle tokens never carry a suffix; the last one may keep its 's ("john's" -> "John's").
             for base in [false, true] {
                 if base && w[l - 1].suffix_at.is_none() {
@@ -281,6 +285,33 @@ impl Dictionary {
             }
         }
         None
+    }
+
+    /// Replace each `⟦n⟧` by `slots[n-1]` in one pass, so an expansion that contains "⟦2⟧" stays as typed.
+    /// Returns the text and how often each slot was used. None = a bracket that is not exactly `⟦n⟧`
+    /// with 1 <= n <= slots.len() ("⟦ 1 ⟧", "⟦01⟧", "⟦+1⟧", a lone "⟧").
+    pub fn expand(s: &str, slots: &[String]) -> Option<(String, Vec<u32>)> {
+        let mut out = String::new();
+        let mut seen = vec![0u32; slots.len()];
+        let mut rest = s;
+        while let Some(a) = rest.find('⟦') {
+            if rest[..a].contains('⟧') {
+                return None;
+            }
+            out.push_str(&rest[..a]);
+            let after = &rest[a + '⟦'.len_utf8()..];
+            let b = after.find('⟧')?;
+            let num = &after[..b];
+            let n: usize = num.parse().ok().filter(|n: &usize| n.to_string() == num)?;
+            *seen.get_mut(n.checked_sub(1)?)? += 1;
+            out.push_str(&slots[n - 1]);
+            rest = &after[b + '⟧'.len_utf8()..];
+        }
+        if rest.contains('⟧') {
+            return None;
+        }
+        out.push_str(rest);
+        Some((out, seen))
     }
 
     fn expansion(&self, e: &DictEntry) -> String {
@@ -355,6 +386,19 @@ where
     s.replace("{date}", &now.format("%Y-%m-%d").to_string())
         .replace("{time}", &now.format("%H:%M").to_string())
         .replace("{weekday}", &now.format("%A").to_string())
+}
+
+/// The window is part of an email, URL or glued word: "pablo@x.app", "github.com/x", "non-linear".
+/// Inner separators of a multi-token window ("node.js") are inside the window, so they still match.
+fn glued(s: &str, start: usize, end: usize) -> bool {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut before = s[..start].chars().rev();
+    let mut after = s[end..].chars();
+    let (b1, b2, a1, a2) = (before.next(), before.next(), after.next(), after.next());
+    matches!(b1, Some('@' | '/'))
+        || matches!(a1, Some('@' | '/'))
+        || (matches!(b1, Some('.' | '-')) && word(b2))
+        || (matches!(a1, Some('.' | '-')) && word(a2))
 }
 
 /// whisper `initial_prompt` / OpenAI-compat `prompt`: natural preceding text, because whisper copies
@@ -508,7 +552,7 @@ pub fn upsert(conn: &Connection, input: &DictEntryInput) -> Result<DictEntry, St
         ),
         None => conn.execute(
             "INSERT INTO dict(kind, text, norm, aliases, expansion, exact_only, starred, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![kind, v.text, norm, aliases, v.expansion, v.exact_only, v.starred, chrono::Utc::now().timestamp()],
+            params![kind, v.text, norm, aliases, v.expansion, v.exact_only, v.starred, crate::history::now_ms()],
         ),
     };
     if res.map_err(|e| e.to_string())? == 0 {
@@ -921,5 +965,84 @@ mod tests {
         assert_eq!(d("cotnaflow", "contaflow"), 1); // transposition
         assert_eq!(d("", "abc"), 3);
         assert!(is_common("comfort") && is_common("tambien") && !is_common("contaflow"));
+    }
+}
+
+/// Adversarial cases (2026-10-17 review). Failing ones are open findings, not wrong tests.
+#[cfg(test)]
+mod adversarial {
+    use super::*;
+
+    fn e(id: i64, kind: DictKind, text: &str, exp: Option<&str>) -> DictEntry {
+        DictEntry { id, kind, text: text.into(), aliases: vec![], expansion: exp.map(Into::into), exact_only: false, starred: false, uses: 0, created_at: id }
+    }
+    fn d(words: &[&str], snippets: &[(&str, &str)]) -> Dictionary {
+        let mut v: Vec<DictEntry> = words.iter().enumerate().map(|(i, w)| e(i as i64 + 1, DictKind::Word, w, None)).collect();
+        v.extend(snippets.iter().enumerate().map(|(i, (t, x))| e(i as i64 + 100, DictKind::Snippet, t, Some(x))));
+        Dictionary::new(v, DictOpts { fuzzy: true })
+    }
+    fn same(d: &Dictionary, inputs: &[&str]) {
+        for s in inputs {
+            assert_eq!(d.apply(s).text, *s, "input: {s:?}");
+        }
+    }
+
+    #[test]
+    fn fuzzy_never_changes_a_number() {
+        let d = d(&["iPhone 15", "Windows 11", "Python 3.12", "COVID-19"], &[]);
+        same(&d, &["I bought an iPhone 16 yesterday", "upgrade to Windows 10 now", "we use Python 3.11 here", "COVID-18 is not a thing"]);
+        assert_eq!(d.apply("iphone 15 and windows 11").text, "iPhone 15 and Windows 11");
+    }
+
+    #[test]
+    fn fuzzy_multi_word_does_not_eat_a_common_word() {
+        let d = d(&["Pablo Pérez"], &[]);
+        same(&d, &["Pablo pero no vino", "Pablo, pero no sé"]);
+        assert_eq!(d.apply("pablo peres vino").text, "Pablo Pérez vino");
+    }
+
+    #[test]
+    fn fuzzy_does_not_flip_gendered_names() {
+        let d = d(&["Mariano", "Valentina", "Martina", "Camila"], &[]);
+        same(&d, &["Mariana y Valentino", "Martino llegó", "Camilo llegó"]);
+    }
+
+    #[test]
+    fn urls_and_emails_keep_their_case() {
+        let d = d(&["Pablo", "Contable", "GitHub", "Linear", "Mail"], &[]);
+        same(&d, &["write to pablo@contable.app today", "see github.com/pablo/repo", "a non-linear e-mail"]);
+        assert_eq!(d.apply("github and linear, mail.").text, "GitHub and Linear, Mail.");
+    }
+
+    #[test]
+    fn finish_never_leaks_a_placeholder() {
+        let d = d(&[], &[("my calendly", "https://calendly.com/pablo")]);
+        let p = d.prepare("send my calendly now");
+        assert_eq!(p.text, "send ⟦1⟧ now");
+        for llm in ["Send ⟦ 1 ⟧ now.", "Send ⟦01⟧ now.", "Send ⟦+1⟧ now."] {
+            if let Some(out) = d.finish(llm, &p) {
+                assert!(!out.contains('⟦') && out.contains("calendly.com"), "{llm:?} -> {out:?}");
+            }
+        }
+        // An expansion that contains "⟦2⟧" is pasted as typed, not filled again by slot 2.
+        let d2 = super::adversarial::d(&[], &[("raro", "a ⟦2⟧ b"), ("firma", "Pablo")]);
+        let p2 = d2.prepare("raro y firma");
+        assert_eq!(d2.finish(&p2.text, &p2).as_deref(), Some("a ⟦2⟧ b y Pablo"));
+    }
+
+    #[test]
+    fn snippet_triggers_survive_case_accents_and_punctuation() {
+        let d = d(&[], &[("mi dirección", "Av. Siempre Viva 742"), ("my calendly", "https://calendly.com/pablo")]);
+        for s in ["mi direccion", "MI DIRECCIÓN.", "¿mi dirección?", "mi direccio\u{301}n"] {
+            assert_eq!(d.apply(s).text, "Av. Siempre Viva 742", "input: {s:?}");
+        }
+        for s in ["(my calendly)", "My-Calendly!"] {
+            assert_eq!(d.apply(s).text, "https://calendly.com/pablo", "input: {s:?}");
+        }
+        // mid-sentence, followed by punctuation, two in a row
+        assert_eq!(d.apply("vivo en mi dirección, gracias").text, "vivo en Av. Siempre Viva 742, gracias");
+        assert_eq!(d.prepare("my calendly my calendly").slots.len(), 2);
+        // a word that only contains the trigger is not a trigger
+        same(&d, &["my calendlyy", "mi direcciones"]);
     }
 }

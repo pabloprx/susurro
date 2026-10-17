@@ -12,7 +12,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 pub const FN: &str = "Fn";
 /// fn + another key within this window = the user meant fn+arrow / an F-key: cancel the PTT.
-const CHORD_WINDOW: Duration = Duration::from_millis(300);
+pub(crate) const CHORD_WINDOW: Duration = Duration::from_millis(300);
 
 // ---------- parse + validate (pure) ----------
 
@@ -204,6 +204,11 @@ impl FnMachine {
 
 // ---------- runtime ----------
 
+/// Paused drops new input, but a release or cancel still ends a hold that started before the pause.
+fn passes(paused: bool, cmd: &SessionCmd) -> bool {
+    !paused || matches!(cmd, SessionCmd::PttUp | SessionCmd::Cancel)
+}
+
 /// WP5 stores it with `app.manage(handle)`; save_settings finds it with `app.try_state::<HotkeyHandle>()`.
 pub struct HotkeyHandle {
     inner: Arc<Inner>,
@@ -222,7 +227,7 @@ struct Inner {
 
 impl Inner {
     fn send(&self, cmd: SessionCmd) {
-        if !self.paused.load(Ordering::Relaxed) {
+        if passes(self.paused.load(Ordering::Relaxed), &cmd) {
             let _ = self.tx.send(cmd);
         }
     }
@@ -323,9 +328,21 @@ pub fn start(app: &AppHandle, b: &Hotkeys, tx: mpsc::Sender<SessionCmd>) -> anyh
 }
 
 impl HotkeyHandle {
+    /// On failure the old bindings are restored and registered again, so the saved settings stay true.
     pub fn update(&self, b: &Hotkeys) -> anyhow::Result<()> {
-        *self.inner.b.lock().unwrap() = b.clone();
-        self.inner.register_all()
+        let old = std::mem::replace(&mut *self.inner.b.lock().unwrap(), b.clone());
+        let r = self.inner.register_all();
+        if r.is_err() {
+            *self.inner.b.lock().unwrap() = old;
+            if let Err(e) = self.inner.register_all() {
+                log::warn!("hotkeys: restoring the old bindings: {e}");
+            }
+        }
+        r
+    }
+
+    pub fn paused(&self) -> bool {
+        self.inner.paused.load(Ordering::Relaxed)
     }
 
     /// Tray "Pause hotkey". ponytail: the combos stay registered and are ignored; unregister if other apps need them.
@@ -409,6 +426,17 @@ fn spawn_fn_tap(on_cmd: impl Fn(SessionCmd) + Send + 'static) {
 mod tests {
     use super::*;
     use SessionCmd::*;
+
+    #[test]
+    fn pause_still_ends_a_hold() {
+        for c in [PttDown, Toggle, PasteLast] {
+            assert!(!passes(true, &c), "{c:?}");
+        }
+        for c in [PttUp, Cancel] {
+            assert!(passes(true, &c), "{c:?}");
+        }
+        assert!(passes(false, &PttDown));
+    }
 
     fn hk(ptt: &str, hf: Option<&str>, cancel: &str, paste: &str) -> Hotkeys {
         Hotkeys {

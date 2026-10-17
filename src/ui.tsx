@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { api, on, type Toast } from "./lib/api";
+import { hasDeadline } from "./lib/format";
 
 /** Serif title; odd parts are italic: ["Your ", "vocabulary."] */
 export function Serif({ parts, as: Tag = "span" }: { parts: string[]; as?: "h1" | "h2" | "span" | "p" }) {
@@ -35,6 +36,18 @@ export function Toggle({ on: value, onChange, label }: { on: boolean; onChange: 
   );
 }
 
+/** Arrow keys in a radiogroup (DESIGN 9.4): focus and select the next radio. Pair with tabIndex = checked ? 0 : -1. */
+export function radioKeys(e: React.KeyboardEvent<HTMLElement>) {
+  const d = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[e.key];
+  if (!d || (e.target as HTMLElement).getAttribute("role") !== "radio") return;
+  const radios = [...e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]')];
+  const i = radios.findIndex((r) => r.getAttribute("aria-checked") === "true");
+  const next = radios[(i + d + radios.length) % radios.length];
+  e.preventDefault();
+  next.focus();
+  next.click();
+}
+
 export function Segmented<T extends string>(p: {
   value: T;
   options: { value: T; label: ReactNode }[];
@@ -42,28 +55,18 @@ export function Segmented<T extends string>(p: {
   label: string;
 }) {
   const i = Math.max(0, p.options.findIndex((o) => o.value === p.value));
-  const refs = useRef<(HTMLButtonElement | null)[]>([]);
-  const move = (d: number) => {
-    const n = (i + d + p.options.length) % p.options.length;
-    p.onChange(p.options[n].value);
-    refs.current[n]?.focus();
-  };
   return (
     <div
       className="seg"
       role="radiogroup"
       aria-label={p.label}
       style={{ ["--n" as string]: p.options.length, ["--i" as string]: i }}
-      onKeyDown={(e) => {
-        if (e.key === "ArrowRight" || e.key === "ArrowDown") (e.preventDefault(), move(1));
-        if (e.key === "ArrowLeft" || e.key === "ArrowUp") (e.preventDefault(), move(-1));
-      }}
+      onKeyDown={radioKeys}
     >
       <span className="seg-thumb" aria-hidden />
       {p.options.map((o, j) => (
         <button
           key={o.value}
-          ref={(el) => void (refs.current[j] = el)}
           role="radio"
           aria-checked={j === i}
           tabIndex={j === i ? 0 : -1}
@@ -123,7 +126,7 @@ export function Popover(p: { trigger: (open: () => void, isOpen: boolean) => Rea
     <div className="pop-anchor" ref={ref}>
       {p.trigger(() => setOpen((o) => !o), open)}
       {open && (
-        <div className={`popover ${p.align ?? "right"}${p.up ? " up" : ""}`} role="menu">
+        <div className={`popover ${p.align ?? "right"}${p.up ? " up" : ""}`}>
           {p.children(() => setOpen(false))}
         </div>
       )}
@@ -259,11 +262,11 @@ function ToastCard({ t, onDone }: { t: LocalToast & { leaving?: boolean }; onDon
   const paused = useRef(false);
   useEffect(() => {
     requestAnimationFrame(() => setShown(true));
-    // auto-dismiss; pauses on hover and while the window is hidden
+    // auto-dismiss; pauses on hover and while the window is hidden, except when Rust holds a deadline
     let last = performance.now();
     const iv = setInterval(() => {
       const now = performance.now();
-      if (!paused.current && !document.hidden) left.current -= now - last;
+      if (hasDeadline(t) || (!paused.current && !document.hidden)) left.current -= now - last;
       last = now;
       if (left.current <= 0) onDone();
     }, 100);

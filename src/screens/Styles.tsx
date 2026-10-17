@@ -4,7 +4,7 @@ import { Info, Plus, Trash2 } from "lucide-react";
 import { api, type CleanupLevel, type Style } from "../lib/api";
 import { keyStore, saveSettings, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
-import { Label, Popover, Segmented, Title } from "../ui";
+import { Label, Popover, radioKeys, Segmented, Title } from "../ui";
 import type { Nav } from "../App";
 
 const SAID = "hey are you free tonight i was thinking we could grab dinner";
@@ -66,9 +66,9 @@ export default function Styles({ nav }: { nav: Nav }) {
 
       <Label>Style - one voice everywhere</Label>
       <div className="card style-grid">
-        <div className="style-list" role="radiogroup" aria-label="Style">
+        <div className="style-list" role="radiogroup" aria-label="Style" onKeyDown={radioKeys}>
           {STYLES.map((o) => (
-            <button key={o.value} className="style-opt" role="radio" aria-checked={o.value === s.styles.style} onClick={() => saveSettings((x) => void (x.styles.style = o.value))}>
+            <button key={o.value} className="style-opt" role="radio" aria-checked={o.value === s.styles.style} tabIndex={o.value === s.styles.style ? 0 : -1} onClick={() => saveSettings((x) => void (x.styles.style = o.value))}>
               <span className="radio" />
               <span>
                 <div>{o.name}</div>

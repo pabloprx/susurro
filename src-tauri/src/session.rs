@@ -3,7 +3,7 @@
 
 use crate::AppState;
 use crate::audio::{self, Clip, Recorder};
-use crate::cleanup::{self, StyleCtx};
+use crate::cleanup;
 use crate::contract::{CleanupLevel, HistoryItem, HistoryStatus, Phase, SessionState, SttProvider, Toast, ToastActionDef, ToastKind};
 use crate::dictionary::{self, Dictionary, Hints};
 use crate::history;
@@ -20,6 +20,8 @@ pub enum SessionCmd {
     PttDown,
     PttUp,
     Toggle,
+    /// Overlay Stop button: stop and transcribe (never locks).
+    Stop,
     Cancel,
     PasteLast,
     DeviceLost,
@@ -37,7 +39,7 @@ const TAP: Duration = Duration::from_millis(250);
 /// Window for the 2nd tap.
 const DOUBLE: Duration = Duration::from_millis(500);
 /// A Cancel this soon after PttDown is the fn+key chord (hotkey.rs): silent, no Undo.
-const CHORD: Duration = Duration::from_millis(300);
+const CHORD: Duration = crate::hotkey::CHORD_WINDOW;
 const UNDO: Duration = Duration::from_secs(5);
 const WARN_BEFORE: Duration = Duration::from_secs(60);
 
@@ -197,8 +199,7 @@ pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run 
     let key = if raw_app { None } else { secrets::get(cleanup::key_name(&s)) };
     let level = cleanup::effective_level(&s, key.as_deref());
     let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);
-    let ctx = StyleCtx { style: s.styles.style.clone() };
-    let clean_fn = |t: &str, h: &Hints| cleanup::cleanup(&s, key.as_deref(), t, h, &ctx);
+    let clean_fn = |t: &str, h: &Hints| cleanup::cleanup(&s, key.as_deref(), &level, t, h);
     let clean: pipeline::Cleaner = (level != CleanupLevel::None).then_some(&clean_fn as &dyn Fn(&str, &Hints) -> anyhow::Result<String>);
     let opts = pipeline::Opts {
         language: Some(s.language.as_str()),
@@ -207,7 +208,7 @@ pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run 
         press_enter_command: s.paste.press_enter_command,
     };
     let outcome = pipeline::run(clip, &opts, &d, &stt_fn, clean);
-    let fell_back = matches!(&outcome, Outcome::Text(d) if d.notes.iter().any(|n| n.starts_with("Used local whisper")));
+    let fell_back = matches!(&outcome, Outcome::Text(d) if d.fell_back);
     Run { outcome, provider: provider_label(&s, fell_back), level }
 }
 
@@ -216,7 +217,8 @@ pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run 
 static CURRENT: LazyLock<Mutex<SessionState>> = LazyLock::new(Default::default);
 const RETENTION_EVERY: Duration = Duration::from_secs(6 * 3600);
 
-pub fn toast(app: &AppHandle, id: &str, kind: ToastKind, text: impl Into<String>, actions: &[(&str, &str)], ttl_ms: u32) {
+/// The one toast builder. `to`: one window label ("main"), or None for every window.
+pub fn toast(app: &AppHandle, to: Option<&str>, id: &str, kind: ToastKind, text: impl Into<String>, actions: &[(&str, &str)], ttl_ms: u32) {
     let t = Toast {
         id: id.into(),
         kind,
@@ -225,9 +227,13 @@ pub fn toast(app: &AppHandle, id: &str, kind: ToastKind, text: impl Into<String>
         ttl_ms,
     };
     log::info!("toast: {}", t.text);
-    let _ = app.emit("toast", t);
+    let _ = match to {
+        Some(label) => app.emit_to(label, "toast", t),
+        None => app.emit("toast", t),
+    };
 }
 
+#[derive(Clone)]
 struct Ctx {
     app: Option<AppRef>,
     started_at: i64,
@@ -240,6 +246,8 @@ struct Actor {
     rec: Option<Recorder>,
     ctx: Option<Ctx>,
     kept: Option<(Clip, Ctx)>,
+    /// A failed dictation with no history row (store_history off): toast "failed" [Retry] re-runs it.
+    failed: Option<(Clip, Ctx)>,
     /// Done/Error stay on screen until then, then Idle.
     idle_at: Option<Instant>,
     /// In-memory last result for paste_last (also when store_history is off).
@@ -252,27 +260,36 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
     std::thread::Builder::new()
         .name("session".into())
         .spawn(move || {
-            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, idle_at: None, last_text: None, last_sweep: None };
+            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None };
+            // Busy guard: hotkey input that queued up while the (blocking) pipeline ran is dropped.
+            let drain = |a: &mut Actor, rx: &mpsc::Receiver<SessionCmd>| {
+                for c in rx.try_iter().filter(|c| !is_hotkey_input(c)).collect::<Vec<_>>() {
+                    a.handle(c);
+                }
+            };
             loop {
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(SessionCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Ok(cmd) => {
-                        let was_busy = a.handle(cmd);
-                        if was_busy {
-                            // Busy guard: hotkey input that queued up during processing is dropped.
-                            let rest: Vec<SessionCmd> = rx.try_iter().filter(|c| !matches!(c, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle | SessionCmd::Cancel | SessionCmd::DeviceLost)).collect();
-                            for c in rest {
-                                a.handle(c);
-                            }
+                        if a.handle(cmd) {
+                            drain(&mut a, &rx);
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                a.tick();
+                // A max-length stop runs the pipeline from tick() too.
+                if a.tick() {
+                    drain(&mut a, &rx);
+                }
             }
             log::info!("session actor stopped");
         })
         .expect("spawn session actor");
+}
+
+/// Input the busy guard drops (pressed while the pipeline ran).
+fn is_hotkey_input(c: &SessionCmd) -> bool {
+    matches!(c, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle | SessionCmd::Stop | SessionCmd::Cancel | SessionCmd::DeviceLost)
 }
 
 impl Actor {
@@ -299,14 +316,19 @@ impl Actor {
     fn ping(&self, p: Ping) {
         #[cfg(target_os = "macos")]
         if self.sounds() {
-            crate::platform::macos::ping(match p {
-                Ping::Start => crate::platform::macos::Ping::Start,
-                Ping::Stop => crate::platform::macos::Ping::Stop,
-                Ping::Error => crate::platform::macos::Ping::Error,
-            });
+            crate::platform::macos::ping(p);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = p;
+    }
+
+    /// A click in susurro's own window (History, a toast) made susurro the frontmost app:
+    /// hide it so Cmd+V reaches the app behind it.
+    fn step_aside(&self) {
+        if paste::frontmost_app().is_some_and(|a| a.pid == std::process::id() as i32) {
+            let _ = self.app.hide();
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
 
     fn fail(&mut self, msg: String) {
@@ -328,6 +350,7 @@ impl Actor {
             SessionCmd::PttDown => Ev::Down,
             SessionCmd::PttUp => Ev::Up,
             SessionCmd::Toggle => Ev::Toggle,
+            SessionCmd::Stop => Ev::Stop,
             SessionCmd::Cancel => Ev::Cancel,
             SessionCmd::DeviceLost => {
                 let app = self.app.clone();
@@ -342,6 +365,7 @@ impl Actor {
                 }
                 match (toast_id.as_str(), action_id.as_str()) {
                     ("cancelled", "undo") => Ev::Undo,
+                    ("failed", "retry") => return self.retry_failed(),
                     (id, "retry") => match id.strip_prefix("failed:").and_then(|n| n.parse().ok()) {
                         Some(id) => return self.retry(id),
                         None => return false,
@@ -355,9 +379,12 @@ impl Actor {
                 return false;
             }
             SessionCmd::PasteText(t) => {
-                // The main window is in front: hide susurro so the app behind it gets focus back.
-                let _ = self.app.hide();
-                std::thread::sleep(Duration::from_millis(300));
+                // A paste now would break a running dictation (the overlay would show Done while recording).
+                if self.m.phase() != Phase::Idle {
+                    toast(&self.app, None, "paste-busy", ToastKind::Info, "Finish the dictation first", &[], 3000);
+                    return false;
+                }
+                self.step_aside();
                 self.deliver(&t, false);
                 return false;
             }
@@ -371,7 +398,7 @@ impl Actor {
         match act {
             Act::Start { locked } => self.start(locked),
             Act::Lock => self.set(Phase::Locked, None),
-            Act::Warn => toast(&self.app, "time-left", ToastKind::Warn, "1 minute left", &[], 4000),
+            Act::Warn => toast(&self.app, None, "time-left", ToastKind::Warn, "1 minute left", &[], 4000),
             Act::Discard => {
                 self.rec = None;
                 self.ctx = None;
@@ -382,7 +409,7 @@ impl Actor {
                     self.kept = Some((rec.stop(), ctx));
                 }
                 self.set(Phase::Idle, None);
-                toast(&self.app, "cancelled", ToastKind::Info, "Cancelled", &[("undo", "Undo")], UNDO.as_millis() as u32);
+                toast(&self.app, None, "cancelled", ToastKind::Info, "Cancelled", &[("undo", "Undo")], UNDO.as_millis() as u32);
             }
             Act::Process => {
                 if let (Some(rec), Some(ctx)) = (self.rec.take(), self.ctx.take()) {
@@ -394,7 +421,10 @@ impl Actor {
             }
             Act::ProcessKept => {
                 match self.kept.take() {
-                    Some((clip, ctx)) => self.process(clip, ctx),
+                    Some((clip, ctx)) => {
+                        self.step_aside(); // Undo was clicked, maybe in the main window
+                        self.process(clip, ctx)
+                    }
                     None => self.m.idle(),
                 }
                 return true;
@@ -407,7 +437,7 @@ impl Actor {
         self.idle_at = None;
         self.kept = None;
         let front = paste::frontmost_app();
-        let Some(dev) = audio::resolve_current(&self.app) else {
+        let Some(dev) = audio::resolve_current(&self.app, false) else {
             self.m.idle();
             self.ctx = None;
             return self.fail("No microphone".into());
@@ -415,7 +445,12 @@ impl Actor {
         self.ping(Ping::Start);
         #[cfg(target_os = "macos")]
         crate::platform::macos::setup_overlay(&self.app);
-        match Recorder::start(&self.app, &dev, "overlay") {
+        // The monitor's device list can be 1.5 s old: if the mic was just unplugged, retry once on a fresh list.
+        let rec = Recorder::start(&self.app, &dev, "overlay").or_else(|e| match audio::resolve_current(&self.app, true) {
+            Some(d) if d.info.id != dev.info.id => Recorder::start(&self.app, &d, "overlay"),
+            _ => Err(e),
+        });
+        match rec {
             Ok(r) => {
                 self.ctx = Some(Ctx { app: front, started_at: history::now_ms(), device: Some(r.device().name.clone()) });
                 self.rec = Some(r);
@@ -465,6 +500,7 @@ impl Actor {
             }
             Outcome::Failed(e) => {
                 // Never lose a dictation: the failed row keeps the WAV even with store_audio off.
+                // With store_history off (or a failed insert) the clip stays in memory for Retry.
                 let item = s.privacy.store_history.then(|| {
                     let db = self.state().db.lock().unwrap();
                     history::insert(&db, &data_dir, &row(String::new(), String::new(), HistoryStatus::Failed, Some(e.clone())), Some(&clip.samples))
@@ -481,10 +517,14 @@ impl Actor {
                     }
                     None => None,
                 };
-                match id {
-                    Some(id) => toast(&self.app, &format!("failed:{id}"), ToastKind::Error, format!("Transcription failed: {e}"), &[("retry", "Retry")], 10_000),
-                    None => toast(&self.app, "failed", ToastKind::Error, format!("Transcription failed: {e}"), &[], 6000),
-                }
+                let toast_id = match id {
+                    Some(id) => format!("failed:{id}"),
+                    None => {
+                        self.failed = Some((clip.clone(), ctx.clone()));
+                        "failed".into()
+                    }
+                };
+                toast(&self.app, None, &toast_id, ToastKind::Error, format!("Transcription failed: {e}"), &[("retry", "Retry")], 10_000);
                 self.m.idle();
                 self.fail(short(e));
             }
@@ -499,7 +539,6 @@ impl Actor {
                 if s.privacy.store_history {
                     match history::insert(&db, &data_dir, &item, s.privacy.store_audio.then_some(&clip.samples[..])) {
                         Ok(item) => {
-                            *self.state().last_result.lock().unwrap() = Some(item.id);
                             let _ = self.app.emit_to("main", "history_added", item);
                         }
                         Err(e) => log::error!("history insert: {e:#}"),
@@ -507,7 +546,7 @@ impl Actor {
                 }
                 drop(db);
                 for n in &d.notes {
-                    toast(&self.app, "note", ToastKind::Info, n.clone(), &[], 4000);
+                    toast(&self.app, None, "note", ToastKind::Info, n.clone(), &[], 4000);
                 }
                 self.m.idle();
             }
@@ -535,7 +574,7 @@ impl Actor {
                 HistoryStatus::Pasted
             }
             PasteOutcome::CopiedOnly => {
-                toast(&self.app, "copied", ToastKind::Warn, "Copied - grant Accessibility to paste", &[], 5000);
+                toast(&self.app, None, "copied", ToastKind::Warn, "Copied - grant Accessibility to paste", &[], 5000);
                 HistoryStatus::Copied
             }
         };
@@ -554,7 +593,7 @@ impl Actor {
             Some(t) => {
                 self.deliver(&t, false);
             }
-            None => toast(&self.app, "paste-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
+            None => toast(&self.app, None, "paste-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
         }
     }
 
@@ -563,13 +602,21 @@ impl Actor {
         if self.m.phase() != Phase::Idle {
             return false;
         }
+        // The same toast shows in the overlay and the main window: a 2nd Retry click finds the row done.
+        let still_failed = history::get(&self.state().db.lock().unwrap(), id).ok().flatten().is_some_and(|h| h.status == HistoryStatus::Failed);
+        if !still_failed {
+            return false;
+        }
+        self.step_aside();
         self.set(Phase::Processing, None);
         match history::retry(&self.app, id) {
             Ok(item) => {
                 let status = self.deliver(&item.final_text, false);
                 self.last_text = Some(item.final_text.clone());
                 let db = self.state().db.lock().unwrap();
-                let _ = db.execute("UPDATE history SET status = ?1 WHERE id = ?2", rusqlite::params![if status == HistoryStatus::Pasted { "pasted" } else { "copied" }, id]);
+                if let Err(e) = history::set_status(&db, id, &status) {
+                    log::error!("history status {id}: {e}");
+                }
                 if let Ok(Some(item)) = history::get(&db, id) {
                     let _ = self.app.emit_to("main", "history_added", item);
                 }
@@ -579,9 +626,21 @@ impl Actor {
         true
     }
 
-    fn tick(&mut self) {
+    /// Toast Retry for a failed dictation that has no history row: run the kept clip again.
+    fn retry_failed(&mut self) -> bool {
+        if self.m.phase() != Phase::Idle {
+            return false;
+        }
+        let Some((clip, ctx)) = self.failed.take() else { return false };
+        self.step_aside();
+        self.process(clip, ctx);
+        true
+    }
+
+    /// Returns true if a max-length stop ran the (blocking) pipeline.
+    fn tick(&mut self) -> bool {
         let now = Instant::now();
-        self.act(Ev::Tick, now);
+        let busy = self.act(Ev::Tick, now);
         if self.idle_at.is_some_and(|t| now >= t) {
             self.idle_at = None;
             if self.m.phase() == Phase::Idle {
@@ -598,11 +657,13 @@ impl Actor {
                 Err(e) => log::warn!("retention sweep: {e}"),
             }
         }
+        busy
     }
 }
 
+/// The start / stop / error sound (platform::macos::ping plays it).
 #[derive(Clone, Copy)]
-enum Ping {
+pub enum Ping {
     Start,
     Stop,
     Error,
@@ -623,6 +684,11 @@ fn send(state: &AppState, cmd: SessionCmd) -> Result<(), String> {
 #[tauri::command]
 pub fn dictation_toggle(state: State<'_, AppState>) -> Result<(), String> {
     send(&state, SessionCmd::Toggle)
+}
+
+#[tauri::command]
+pub fn dictation_stop(state: State<'_, AppState>) -> Result<(), String> {
+    send(&state, SessionCmd::Stop)
 }
 
 #[tauri::command]
@@ -768,6 +834,14 @@ mod tests {
         m.step(Ev::Toggle, t);
         assert_eq!(m.step(Ev::Stop, t + MS(3000)), Some(Act::Process));
         assert_eq!(m.step(Ev::Stop, t + MS(3100)), None);
+    }
+
+    #[test]
+    fn overlay_stop_while_holding_processes_instead_of_locking() {
+        let (mut m, t) = m();
+        m.step(Ev::Down, t);
+        assert_eq!(m.clone().step(Ev::Toggle, t + MS(1000)), Some(Act::Lock));
+        assert_eq!(m.step(Ev::Stop, t + MS(1000)), Some(Act::Process));
     }
 
     #[test]

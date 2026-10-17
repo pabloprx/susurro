@@ -176,6 +176,7 @@ body,
 }
 
 .timer {
+  margin-left: 2px; /* + 6px gap: clear of the last waveform bar (the slot overhangs by 2px) */
   font: 11px/14px var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--pill-dim);

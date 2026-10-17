@@ -37,8 +37,6 @@ pub struct AppState {
     pub mic: Mutex<audio::MicRuntime>,
     /// model file + loaded ctx
     pub whisper: Mutex<Option<(String, Arc<WhisperContext>)>>,
-    /// history id for "paste last"
-    pub last_result: Mutex<Option<i64>>,
     /// {app_data_dir}: settings.json, susurro.db, audio/, models/
     pub data_dir: PathBuf,
 }
@@ -79,7 +77,6 @@ pub fn run() {
                 session_tx: tx,
                 mic: Mutex::new(audio::MicRuntime::default()),
                 whisper: Mutex::new(None),
-                last_result: Mutex::new(None),
                 data_dir,
             });
             let h = app.handle();
@@ -120,6 +117,7 @@ pub fn run() {
             audio::mic_test_start,
             audio::mic_test_stop,
             session::dictation_toggle,
+            session::dictation_stop,
             session::dictation_cancel,
             session::paste_last,
             session::get_session_state,

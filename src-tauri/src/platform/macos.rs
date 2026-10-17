@@ -3,17 +3,8 @@
 
 use objc2_app_kit::{NSEvent, NSScreen, NSSound, NSWindow, NSWindowCollectionBehavior};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSPointInRect, NSString};
+use crate::session::Ping;
 use tauri::{AppHandle, Manager};
-
-#[derive(Debug, Clone, Copy)]
-pub enum Ping {
-    /// "Tink"
-    Start,
-    /// "Pop"
-    Stop,
-    /// "Basso"
-    Error,
-}
 
 /// px between the pill window and the bottom of the visible frame (above the Dock).
 const BOTTOM_GAP: f64 = 12.0;

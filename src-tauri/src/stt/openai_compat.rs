@@ -41,7 +41,7 @@ impl Transcriber for OpenAiCompat {
         }
         let v = send_json(rb, self.label)?;
         let text = v["text"].as_str().ok_or_else(|| anyhow::anyhow!("{}: no text in the response", self.label))?;
-        Ok(SttOutput { text: text.trim().to_string(), language: v["language"].as_str().map(str::to_string), note: None })
+        Ok(SttOutput { text: text.trim().to_string(), language: v["language"].as_str().map(str::to_string), note: None, fell_back: false })
     }
 }
 

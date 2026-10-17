@@ -28,8 +28,10 @@ pub struct Done {
     pub used: Vec<i64>,
     /// The LLM output was used.
     pub cleaned: bool,
-    /// Small notes for the toast (local fallback used, cleanup skipped).
+    /// Small notes for the toast (local fallback used, cleanup skipped). UI text only.
     pub notes: Vec<String>,
+    /// Local whisper produced the text after the cloud STT failed.
+    pub fell_back: bool,
 }
 
 pub struct Opts<'a> {
@@ -61,46 +63,41 @@ pub fn run(clip: &Clip, o: &Opts, d: &Dictionary, stt: Stt, clean: Cleaner) -> O
     if raw.is_empty() || text::is_hallucination(&raw) {
         return Outcome::Skip(Some("Heard nothing".into()));
     }
-    let mut done = Done { notes: out.note.into_iter().collect(), ..Default::default() };
+    let mut done = Done { notes: out.note.into_iter().collect(), fell_back: out.fell_back, ..Default::default() };
     if o.press_enter_command {
         if let Some(t) = text::strip_press_enter(&raw) {
             (raw, done.press_enter) = (t, true);
         }
     }
-    let no_llm = || {
-        let a = d.apply(&raw);
-        let used = a.matches.iter().map(|m| m.entry_id).collect::<Vec<_>>();
-        (text::style_rules(&text::backtrack_rules(&a.text), o.style.clone(), &hints.terms), used)
-    };
     if o.raw_app {
         let a = d.apply(&raw);
         done.used = a.matches.iter().map(|m| m.entry_id).collect();
         done.final_text = a.text;
     } else {
         let p = d.prepare(&raw);
+        // Backtrack and style rules run on the placeholder text: a snippet expansion is pasted as typed.
+        let style = |t: &str| text::style_rules(t, o.style.clone(), &hints.terms);
+        let no_llm = || Dictionary::expand(&style(&text::backtrack_rules(&p.text)), &p.slots).map_or_else(|| d.apply(&raw).text, |(t, _)| t);
         let llm = if p.standalone { None } else { clean.map(|c| c(&p.text, &hints)) };
+        done.used = p.used.clone();
         match llm {
-            _ if p.standalone => {
-                done.final_text = p.slots.first().cloned().unwrap_or_default();
-                done.used = p.used;
-            }
-            Some(Ok(t)) => match d.finish(&t, &p) {
+            _ if p.standalone => done.final_text = p.slots.first().cloned().unwrap_or_default(),
+            Some(Ok(t)) => match d.finish(&style(&t), &p) {
                 Some(f) => {
-                    done.final_text = text::style_rules(&f, o.style.clone(), &hints.terms);
-                    done.used = p.used;
+                    done.final_text = f;
                     done.cleaned = true;
                 }
                 None => {
-                    (done.final_text, done.used) = no_llm();
+                    done.final_text = no_llm();
                     done.notes.push("Cleanup lost a snippet - used the plain text".into());
                 }
             },
             Some(Err(e)) => {
                 log::warn!("cleanup failed: {e:#}");
-                (done.final_text, done.used) = no_llm();
+                done.final_text = no_llm();
                 done.notes.push(format!("Cleanup skipped: {e:#}"));
             }
-            None => (done.final_text, done.used) = no_llm(),
+            None => done.final_text = no_llm(),
         }
     }
     if done.final_text.trim().is_empty() && !done.press_enter {
@@ -151,7 +148,7 @@ mod tests {
     }
 
     fn says(t: &'static str) -> impl Fn(&SttRequest) -> anyhow::Result<SttOutput> {
-        move |_| Ok(SttOutput { text: t.into(), language: Some("en".into()), note: None })
+        move |_| Ok(SttOutput { text: t.into(), language: Some("en".into()), note: None, fell_back: false })
     }
 
     fn text_of(o: Outcome) -> Done {
@@ -246,8 +243,36 @@ mod tests {
 
     #[test]
     fn local_fallback_note_reaches_the_toast() {
-        let stt = |_: &SttRequest| Ok(SttOutput { text: "Hello there.".into(), language: None, note: Some("Used local whisper: 503".into()) });
+        let stt = |_: &SttRequest| Ok(SttOutput { text: "Hello there.".into(), language: None, note: Some("Used local whisper: 503".into()), fell_back: true });
         let d = text_of(run(&clip(0.5, 1000), &opts(), &dict(), &stt, None));
         assert_eq!(d.notes, vec!["Used local whisper: 503".to_string()]);
+        assert!(d.fell_back, "the History label reads the flag, not the note text");
+    }
+
+    // ---------- adversarial (2026-10-17 review) ----------
+
+    #[test]
+    fn style_rules_do_not_rewrite_a_snippet_expansion() {
+        let e = |id, kind, text: &str, exp: Option<&str>| DictEntry { id, kind, text: text.into(), aliases: vec![], expansion: exp.map(String::from), exact_only: false, starred: false, uses: 0, created_at: id };
+        let d = Dictionary::new(vec![e(1, DictKind::Snippet, "mi firma", Some("Saludos,\nPablo."))], DictOpts::default());
+        let echo = |t: &str, _: &Hints| -> anyhow::Result<String> { Ok(t.to_string()) };
+        let o = Opts { style: Style::VeryCasual, ..opts() };
+        for clean in [None, Some(&echo as &dyn Fn(&str, &Hints) -> anyhow::Result<String>)] {
+            let got = text_of(run(&clip(0.5, 1000), &o, &d, &says("mi firma gracias"), clean)).final_text;
+            assert!(got.starts_with("Saludos,\nPablo."), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn stt_error_text_reaches_failed_row() {
+        let stt = |_: &SttRequest| -> anyhow::Result<SttOutput> { Err(anyhow::anyhow!("HTTP 500").context("ElevenLabs")) };
+        assert_eq!(run(&clip(0.5, 1000), &opts(), &dict(), &stt, None), Outcome::Failed("ElevenLabs: HTTP 500".into()));
+    }
+
+    #[test]
+    fn whitespace_only_stt_is_nothing_heard() {
+        assert_eq!(run(&clip(0.5, 1000), &opts(), &dict(), &says("  \n "), None), Outcome::Skip(Some("Heard nothing".into())));
+        // exactly at the 250 ms bar is not a tap
+        assert!(matches!(run(&clip(0.5, 250), &opts(), &dict(), &says("hi"), None), Outcome::Text(_)));
     }
 }
