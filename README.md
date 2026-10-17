@@ -39,3 +39,7 @@ IPC types live in `src-tauri/src/contract.rs`. Never edit `src/lib/contract.gen.
 8. Pick a cloud STT with no network: the toast says local whisper was used.
 9. From a fresh signed build, grant all three permissions in onboarding.
 10. Tray: Microphone submenu switches devices, Paste last transcript, Pause hotkey, Quit.
+
+## API keys
+
+Never commit API keys. susurro stores keys in `~/Library/Application Support/app.susurro.desktop/keys.json` (mode 600), outside the repo. Tests read keys from env vars only (`OPENROUTER_API_KEY`, `ELEVENLABS_API_KEY`).
