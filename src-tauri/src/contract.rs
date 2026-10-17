@@ -38,7 +38,9 @@ pub struct Settings {
     pub autostart: bool,
 }
 
-/// One binding per action. "Fn" is the only modifier-only binding (CGEventTap); others use global-shortcut.
+/// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
+/// "RightControl", "LeftControl", "RightShift", "LeftShift") use the CGEventTap and work only for ptt;
+/// anything else is an accelerator combo for global-shortcut.
 #[serde(default)]
 pub struct Hotkeys {
     pub ptt: String,
@@ -376,6 +378,17 @@ pub struct Permissions {
     pub input_monitoring: bool,
     /// None = unknown.
     pub fn_key_free: Option<bool>,
+    /// Input Monitoring is granted, but this process cannot use it until it restarts (relaunch_app).
+    pub needs_relaunch: bool,
+}
+
+/// Payload of the `hotkey_status` event: the push-to-talk binding is live, or why not.
+pub struct HotkeyStatus {
+    pub binding: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -419,7 +432,8 @@ pub struct Navigate {
 
 // ---------- defaults (PLAN 1.5) ----------
 
-pub const SETTINGS_VERSION: u32 = 1;
+/// v2: the default ptt became RightOption; a stored "Fn" moves to it once.
+pub const SETTINGS_VERSION: u32 = 2;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -446,7 +460,7 @@ impl Default for Settings {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            ptt: "Fn".into(),
+            ptt: "RightOption".into(),
             hands_free: None,
             double_tap: true,
             cancel: "Escape".into(),

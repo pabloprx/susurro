@@ -48,6 +48,10 @@ export const api = {
   openrouterModels: (kind: "stt" | "chat") => call<C.OrModel[]>("openrouter_models", { kind }),
   permissionsStatus: () => call<C.Permissions>("permissions_status"),
   requestPermission: (kind: C.PermKind) => call<void>("request_permission", { kind }),
+  /** Restarts the app (macOS applies some grants only to a new process). */
+  relaunchApp: () => call<void>("relaunch_app"),
+  /** Pause every hotkey while the UI records a new binding. Rust resumes by itself after 30 s. */
+  hotkeyCapture: (on: boolean) => call<void>("hotkey_capture", { on }),
 };
 
 export type Events = {
@@ -58,6 +62,7 @@ export type Events = {
   history_added: C.HistoryItem;
   model_progress: C.ModelProgress;
   navigate: C.Navigate;
+  hotkey_status: C.HotkeyStatus;
 };
 
 /** Subscribe to a Rust event. Returns the unsubscribe function. */

@@ -54,8 +54,26 @@ const GLYPH: Record<string, string> = {
   Left: "←",
   Right: "→",
 };
-/** "Ctrl+Cmd+V" -> ["⌃", "⌘", "V"] */
-export const keysOf = (binding: string) => binding.split("+").map((k) => GLYPH[k] ?? k);
+/** Modifier-only bindings (CGEventTap in Rust): hold = talk, double-tap = hands-free, chord = cancel. */
+export const MOD_ONLY: Record<string, string> = {
+  Fn: "fn",
+  RightOption: "right ⌥",
+  LeftOption: "left ⌥",
+  RightCommand: "right ⌘",
+  LeftCommand: "left ⌘",
+  RightControl: "right ⌃",
+  LeftControl: "left ⌃",
+  RightShift: "right ⇧",
+  LeftShift: "left ⇧",
+};
+export const isModOnly = (binding: string) => binding in MOD_ONLY;
+/** "Ctrl+Cmd+V" -> ["⌃", "⌘", "V"], "RightOption" -> ["right ⌥"] */
+export const keysOf = (binding: string) => (isModOnly(binding) ? [MOD_ONLY[binding]] : binding.split("+").map((k) => GLYPH[k] ?? k));
+/** For prose: "Right ⌥", "fn", "⌃ ⌘ V". */
+export const keyLabel = (binding: string) => {
+  const k = keysOf(binding).join(" ");
+  return k.startsWith("right") || k.startsWith("left") ? k[0].toUpperCase() + k.slice(1) : k;
+};
 
 /** Undo is only valid for ttl_ms in Rust (session.rs UNDO): its toast must not outlive that window. */
 export const hasDeadline = (t: Pick<Toast, "actions">) => t.actions.some((a) => a.id === "undo");

@@ -3,6 +3,8 @@
 // URL flags: ?onboarding (fresh install, onboarding flow), ?empty (fresh install, empty states),
 // /overlay?state=idle|hover|listening|handsfree|warning|processing|done|copied|error|notice (freeze one pill state).
 // Console: window.mock.plug() / unplug() / dictate() / error() / toast(text).
+// Hotkeys: holding the push-to-talk key (default Right Option) dictates, like the CGEventTap. window.mock.stale = true makes
+// System Settings grants invisible until relaunch_app (the macOS input-monitoring case); mock.perms(patch) edits permissions.
 import type * as C from "./contract.gen";
 
 const q = new URLSearchParams(location.search);
@@ -19,7 +21,7 @@ let settings: C.Settings = {
   version: 1,
   onboarded: !onboarding,
   language: "auto",
-  hotkeys: { ptt: "Fn", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V" },
+  hotkeys: { ptt: "RightOption", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V" },
   mic: { selection: "auto", priority: [], show_virtual: false },
   stt: {
     provider: "whisper_local",
@@ -49,9 +51,18 @@ let settings: C.Settings = {
 
 let keys: C.KeyStatus = { elevenlabs: false, openrouter: !fresh, local_stt: false, local_llm: false };
 
-let perms: C.Permissions = onboarding
-  ? { microphone: "undetermined", accessibility: false, input_monitoring: false, fn_key_free: null }
-  : { microphone: "granted", accessibility: true, input_monitoring: true, fn_key_free: true };
+// relaunch_app reloads the page; permissions survive it like real grants do
+const relaunched = sessionStorage.getItem("mock.perms");
+let perms: C.Permissions = relaunched
+  ? JSON.parse(relaunched)
+  : onboarding
+    ? { microphone: "undetermined", accessibility: false, input_monitoring: false, fn_key_free: null, needs_relaunch: false }
+    : { microphone: "granted", accessibility: true, input_monitoring: true, fn_key_free: true, needs_relaunch: false };
+sessionStorage.removeItem("mock.perms");
+/** Grants made in "System Settings" while stale: applied only by a relaunch. */
+let pending: Partial<C.Permissions> = {};
+let stale = false;
+let capturing = false;
 
 // ---------------- devices ----------------
 const dev = (id: string, name: string, kind: C.DeviceKind, manufacturer: string | null, is_default = false): C.DeviceInfo => ({
@@ -363,7 +374,10 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     const s = a.settings as C.Settings;
     const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last].filter(Boolean);
     if (new Set(all).size !== all.length) throw "Two actions share one shortcut";
-    return (settings = s);
+    const moved = s.hotkeys.ptt !== settings.hotkeys.ptt;
+    settings = s;
+    if (moved) hotkeyStatus();
+    return settings;
   },
   key_status: () => keys,
   set_api_key: (a) => {
@@ -499,12 +513,36 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   request_permission: async (a) => {
     await wait(1400);
     const k = a.kind as C.PermKind;
+    if (stale && (k === "accessibility" || k === "input_monitoring")) return void (pending = { ...pending, [k]: true, fn_key_free: true });
     if (k === "microphone") perms = { ...perms, microphone: "granted" };
     if (k === "accessibility") perms = { ...perms, accessibility: true };
     if (k === "input_monitoring") perms = { ...perms, input_monitoring: true, fn_key_free: false };
     if (k === "fn_key") perms = { ...perms, fn_key_free: true };
+    if (k === "input_monitoring") hotkeyStatus();
   },
+  relaunch_app: () => {
+    sessionStorage.setItem("mock.perms", JSON.stringify({ ...perms, ...pending, needs_relaunch: false }));
+    location.reload();
+  },
+  hotkey_capture: (a) => void (capturing = a.on as boolean),
 };
+
+const MOD_CODE: Record<string, string> = {
+  RightOption: "AltRight",
+  LeftOption: "AltLeft",
+  RightCommand: "MetaRight",
+  LeftCommand: "MetaLeft",
+  RightControl: "ControlRight",
+  LeftControl: "ControlLeft",
+  RightShift: "ShiftRight",
+  LeftShift: "ShiftLeft",
+};
+function hotkeyStatus() {
+  const b = settings.hotkeys.ptt;
+  const tap = b === "Fn" || b in MOD_CODE;
+  const st: C.HotkeyStatus = tap && !perms.input_monitoring ? { binding: b, active: false, error: "Input Monitoring is off" } : { binding: b, active: true };
+  setTimeout(() => mockEmit("hotkey_status", st), 0);
+}
 
 export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
   const h = handlers[cmd];
@@ -600,6 +638,20 @@ export function overlayDemo(state: string | null) {
 const inBrowser = !("__TAURI_INTERNALS__" in window); // api.ts loads this file only outside Tauri; keep the guard anyway
 if (inBrowser && !location.pathname.startsWith("/overlay") && !fresh) setTimeout(plug, 7000);
 
+// The CGEventTap, in the browser: hold the modifier-only ptt key to dictate, any other key while held cancels.
+if (inBrowser && !location.pathname.startsWith("/overlay")) {
+  hotkeyStatus();
+  let held = false;
+  addEventListener("keydown", (e) => {
+    if (capturing || !perms.input_monitoring) return;
+    if (e.code === MOD_CODE[settings.hotkeys.ptt] && !e.repeat && session.phase === "idle") return void ((held = true), start("recording"));
+    if (held) (held = false), phase("idle"); // chord (Option+2 = @): cancel silently
+  });
+  addEventListener("keyup", (e) => {
+    if (held && e.code === MOD_CODE[settings.hotkeys.ptt]) (held = false), void finish();
+  });
+}
+
 if (inBrowser) Object.assign(window, {
   mock: {
     plug,
@@ -609,5 +661,9 @@ if (inBrowser) Object.assign(window, {
     error: (m = "Mic disconnected") => phase("error", { message: m }),
     toast,
     phase,
+    set stale(v: boolean) {
+      stale = v;
+    },
+    perms: (p: Partial<C.Permissions>) => void ((perms = { ...perms, ...p }), hotkeyStatus()),
   },
 });

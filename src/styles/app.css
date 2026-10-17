@@ -1467,6 +1467,16 @@ mark {
   color: var(--text-3);
   margin-top: var(--s-3);
 }
+/* .note is declared after the tone utilities: keep the tone */
+.note.ok-text {
+  color: var(--ok);
+}
+.note.warn-text {
+  color: var(--warn);
+}
+.note.danger-text {
+  color: var(--danger);
+}
 .app-row .bundle {
   font: 11.5px var(--font-mono);
   color: var(--text-3);
@@ -2018,6 +2028,151 @@ mark {
   align-items: center;
   color: var(--ok);
   font-size: 13px;
+}
+.ob-restart {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.ob-restart svg {
+  color: var(--tally);
+  flex: none;
+}
+.ob-links {
+  display: flex;
+  gap: var(--s-4);
+  align-items: center;
+  justify-content: center;
+  margin-top: var(--s-1);
+}
+
+/* talk key: one big physical key, then quick picks */
+.keycap {
+  all: unset;
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  min-width: 132px;
+  height: 84px;
+  padding: 0 var(--s-5);
+  margin: var(--s-6) 0 var(--s-2);
+  box-sizing: border-box;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 5px;
+  border-radius: var(--r-md);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  font: 24px/1 var(--font-mono);
+  color: var(--text);
+  cursor: pointer;
+  transition: transform var(--d-press) var(--ease-out), border-bottom-width var(--d-press) var(--ease-out), box-shadow var(--d-fast) ease;
+}
+.keycap:active {
+  transform: translateY(3px);
+  border-bottom-width: 2px;
+}
+.keycap:focus-visible {
+  box-shadow: var(--focus);
+}
+.keycap kbd {
+  all: unset;
+}
+.keycap kbd + kbd::before {
+  content: "";
+  display: inline-block;
+  width: 1px;
+  height: 22px;
+  margin-right: 8px;
+  vertical-align: middle;
+  background: var(--line-strong);
+}
+.keycap.recording {
+  border-color: var(--tally);
+  box-shadow: 0 0 0 4px var(--tally-soft);
+}
+.keycap .rec-hint {
+  font: 13px var(--font-ui);
+  color: var(--text-2);
+  animation: live 1.2s ease-in-out infinite;
+}
+.keypicks {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--s-2);
+  width: 100%;
+  max-width: 480px;
+  margin-top: var(--s-4);
+}
+.keypicks [role="radiogroup"] {
+  display: contents;
+}
+.keypicks button {
+  all: unset;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: var(--s-3) var(--s-2);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--line);
+  cursor: pointer;
+  transition: box-shadow var(--d-fast) ease, transform var(--d-press) var(--ease-out);
+}
+.keypicks button:hover {
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+.keypicks button:active {
+  transform: scale(0.97);
+}
+.keypicks button[aria-checked="true"],
+.keypicks button.on {
+  box-shadow: inset 0 0 0 1px var(--tally);
+}
+.keypicks button:focus-visible {
+  box-shadow: var(--focus);
+}
+.keypicks .cap {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  font: 12px/22px var(--font-mono);
+  min-width: 34px;
+  height: 26px;
+  padding: 0 8px;
+  justify-content: center;
+  box-sizing: border-box;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--r-xs);
+  color: var(--text);
+  white-space: nowrap;
+}
+.keypicks .d {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.keypicks button[aria-checked="true"] .d {
+  color: var(--tally);
+}
+.live-check {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin-top: var(--s-5);
+}
+.live-check .note {
+  justify-content: center;
+}
+.chips.picks .chip:disabled {
+  opacity: 0.45;
 }
 
 /* welcome: messy speech becomes clean text */

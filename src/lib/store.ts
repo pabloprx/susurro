@@ -1,6 +1,6 @@
 // Tiny shared stores (no state library, DESIGN 11) + formatting helpers used by many screens.
 import { useEffect, useSyncExternalStore } from "react";
-import { api, on, type DeviceKind, type KeyStatus, type MicState, type Permissions, type Settings } from "./api";
+import { api, on, type DeviceKind, type HotkeyStatus, type KeyStatus, type MicState, type Permissions, type Settings } from "./api";
 
 function store<T>(load: () => Promise<T>) {
   let value: T | null = null;
@@ -35,6 +35,9 @@ export const settingsStore = store<Settings>(api.getSettings);
 export const micStore = store<MicState>(api.getMicState);
 export const keyStore = store<KeyStatus>(api.keyStatus);
 export const permStore = store<Permissions>(api.permissionsStatus);
+/** Last hotkey_status from Rust (null = none seen yet: there is no command to query it). */
+export const hotkeyStore = store<HotkeyStatus | null>(async (): Promise<HotkeyStatus | null> => hotkeyStore.get());
+void on("hotkey_status", hotkeyStore.set);
 // Saves run one at a time: two quick changes (Use a model, then pick a language) must not race, or the second
 // save reads the backend before the first one lands and writes the old value back.
 let chain: Promise<unknown> = Promise.resolve();

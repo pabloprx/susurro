@@ -27,6 +27,10 @@ fn migrate(mut s: Settings) -> Settings {
             k.last_seen *= 1000;
         }
     }
+    // v2: fn never worked for most users (system-owned, missing on many keyboards). Later choices are kept.
+    if s.version < 2 && s.hotkeys.ptt.trim().eq_ignore_ascii_case("fn") {
+        s.hotkeys.ptt = "RightOption".into();
+    }
     s.version = SETTINGS_VERSION;
     s
 }
@@ -188,6 +192,23 @@ mod tests {
         save(&p, &s).unwrap();
         let l = load(&p);
         assert_eq!(l.mic.priority.iter().map(|k| k.last_seen).collect::<Vec<_>>(), [1_760_000_000_000, 1_760_000_000_123]);
+    }
+
+    #[test]
+    fn v1_fn_becomes_right_option_once() {
+        let p = tmp_dir("fnmig").join("settings.json");
+        std::fs::write(&p, r#"{"version":1,"hotkeys":{"ptt":"Fn"}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!(s.hotkeys.ptt, "RightOption");
+        assert_eq!(s.version, SETTINGS_VERSION);
+        // A v2 user who picks Fn again keeps it.
+        let mut s2 = s.clone();
+        s2.hotkeys.ptt = "Fn".into();
+        save(&p, &s2).unwrap();
+        assert_eq!(load(&p).hotkeys.ptt, "Fn");
+        // Other v1 choices are kept.
+        std::fs::write(&p, r#"{"version":1,"hotkeys":{"ptt":"Alt+Space"}}"#).unwrap();
+        assert_eq!(load(&p).hotkeys.ptt, "Alt+Space");
     }
 
     #[test]

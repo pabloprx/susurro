@@ -506,7 +506,7 @@ Open decision (taste call for Pablo, PLAN 12): cut this screen to the cleanup le
 ```
   Keys, *your* way.
   ──────────────────────────────────────────────────────────────────────
-  PUSH TO TALK          [ fn ]                                Reset
+  PUSH TO TALK          [ right ⌥ ]                           Reset
   HANDS-FREE            double-tap push-to-talk ☑   or  [ + combo ]
   CANCEL                [ esc ]
   PASTE LAST            [ ⌃ ][ ⌘ ][ V ]
@@ -519,9 +519,11 @@ Open decision (taste call for Pablo, PLAN 12): cut this screen to the cleanup le
   └───────────────────────────────────────┘
 ```
 - Each action row: micro-label, exactly one binding as a kbd group (click to record a new one), `Reset` ghost. Hands-free has an optional combo, hover `✕` removes it.
-- `fn` is the only modifier-only binding. Any other binding needs a non-modifier key (for example `⌥ Space`). The recorder rejects `⌃⌥` alone with "Add a key: only fn works alone".
+- Modifier-only bindings (CGEventTap): `fn`, and the left or right side of ⌥ ⌘ ⌃ ⇧ (`RightOption` ...). Default push to talk: `right ⌥` (most Mac keyboards that are not Apple's have no fn the Mac can see). A modifier pressed and released alone records that side; with other keys it records a combo. Only push to talk takes a modifier alone. Two modifiers with no key: "Add a key, or press one modifier alone".
+- While a row records, quick-pick chips show next to it (push to talk: `right ⌥`, `right ⌘`, `fn`). Recording pauses every hotkey (`hotkey_capture`), so pressing the key does not start a dictation.
 - Recording state: the binding slot shows a tally ring (this is "live" input, so tally is right) and pulses opacity. Validation messages per PLAN 4.1 (reserved combos, single letters, duplicates, left+right same modifier, modifier-only other than fn). Conflicts name the other action: "Already used by Hands-free".
-- `fn` needs Input Monitoring: if not granted, the row shows `--warn` "fn needs Input Monitoring - Grant" linking to the permission step.
+- A modifier-only key needs Input Monitoring: if not granted, the row shows `--warn` "Right ⌥ needs Input Monitoring - Grant" linking to the permission step.
+- Copy never says "fn": it names the real binding ("Hold Right ⌥ to talk").
 - Practice field at bottom: "Try it here" textarea that receives a dictation, so the user tests without leaving.
 
 ### 6.8 Settings (general, data)
@@ -529,7 +531,7 @@ Plain grouped list: General (launch at login, sounds, theme `System | Dark | Lig
 
 ### 6.9 Permissions onboarding
 
-Full-window flow (replaces the shell, no sidebar). Shows on first launch and whenever a required permission is missing (resumes at the first missing step). Progress = 6 mono ticks at the top: `● ● ○ ○ ○ ○`.
+Full-window flow (replaces the shell, no sidebar). Shows on first launch and whenever a required permission is missing (resumes at the first missing step). Progress = 7 mono ticks at the top: `● ● ○ ○ ○ ○ ○`.
 
 ```
   ● ● ○ ○ ○ ○                                                 Skip for now
@@ -547,10 +549,11 @@ Full-window flow (replaces the shell, no sidebar). Shows on first launch and whe
 Steps:
 1. **Welcome**: the hero above. The messy line animates once into the clean line: fillers fade and strike (`FILLER` tags float up), "friday no actually" collapses (`BACKTRACK`), casing and period settle. 2.4s total, plays once, `Replay` link. Reduced motion: show both lines static.
 2. **Microphone**: explain in one sentence, `Allow microphone` primary. On grant: live meter appears with "Say something" and turns `--ok` when speech > -40 dB is seen.
-3. **Accessibility**: needed to paste. `Open System Settings` (deep link `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`). The screen polls the permission every 1s and advances by itself with a check. Show a small static diagram of the toggle to flip.
-4. **Input Monitoring + fn key**: needed for `fn`. Same pattern (`?Privacy_ListenEvent`). After the grant, the same step checks the "Press fn key to" setting: if it is not `Do Nothing`, show "Set 'Press fn key to' = Do Nothing, or fn also opens the emoji picker" with a deep link to Keyboard settings, and advance when it is fixed. `Use ⌥ Space instead` secondary link skips the step and sets the fallback hotkey (global shortcut, no permission).
-5. **Your shortcut**: choose `Hold to talk` vs `Tap to toggle`, shows kbd. Language select (Auto + top picks `English`, `Español`).
-6. **Try it**: a practice textarea. "Hold fn and say: *this is my first dictation*." Success shows the transcript, words count and time, and `Finish`. While here, check the default whisper model exists; if not, the step shows the download progress (base q5_1 first so the first try is fast; turbo q5_0 downloads after in the background), or a link to pick a cloud provider.
+3. **Accessibility**: needed to paste. `Open System Settings` (deep link `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`). The screen polls the permission every 1s, re-checks the moment the window gets focus back, and advances by itself with a check. Show a small static diagram of the toggle to flip. If the user came back and the grant still does not show after 3 s, or `needs_relaunch` is true, the primary becomes `Restart susurro` (`relaunch_app`) with one line: "macOS applies <pane> after a restart. susurro reopens right here." The secondary link `I already enabled it` restarts too. The app reopens on the same step (localStorage `susurro.obStep`).
+4. **Input Monitoring (+ fn key)**: needed for a modifier-only key; the title names it ("Hold Right ⌥ to talk."). The fn check below applies only when the key is `fn`. Same pattern (`?Privacy_ListenEvent`). After the grant, the same step checks the "Press fn key to" setting: if it is not `Do Nothing`, show "Set 'Press fn key to' = Do Nothing, or fn also opens the emoji picker" with a deep link to Keyboard settings, and advance when it is fixed. `Use ⌥ Space instead` secondary link skips the step and sets the fallback hotkey (global shortcut, no permission).
+5. **Your talk key**: one big keycap with the binding (click it to record your own), four tiles: `right ⌥` Recommended, `right ⌘`, `fn` + globe (Apple keyboards), `Record your own`. A live line under it: "Right ⌥ is ready. Hold it and say something." turns `--ok` ("Right ⌥ works.") when a dictation starts; `hotkey_status` errors show in `--warn`.
+6. **Your shortcut**: choose `Hold to talk` vs `Tap to toggle`, shows kbd. Language select (Auto + top picks `English`, `Español`).
+7. **Try it**: a practice textarea. "Hold <key> and say: *this is my first dictation*." Success shows the transcript, words count and time, and `Finish`. While here, check the default whisper model exists; if not, the step shows the download progress (base q5_1 first so the first try is fast; turbo q5_0 downloads after in the background), or a link to pick a cloud provider.
 
 Step transition: content slides 16px + fades, 320ms `--ease-drawer`. Back allowed. Every step states why the permission is needed in one line, and what does not happen ("Audio stays on this Mac with Local Whisper.").
 
@@ -562,7 +565,7 @@ Pattern: serif line (h2, one italic word) + one helper line + at most one action
 
 | Screen | Line | Helper | Action |
 |---|---|---|---|
-| Home recent | Nothing said *yet.* | Hold `fn` anywhere and talk. | Try it (opens practice) |
+| Home recent | Nothing said *yet.* | Hold `<key>` anywhere and talk. | Try it (opens practice) |
 | History | *Quiet* in here. | Your dictations show up here. | - |
 | History search | No match for "deploy". | Search covers raw and formatted text. | Clear search |
 | Words | Teach it your *words.* | Names, brands, jargon. susurro hints them to every provider. | focus add field |

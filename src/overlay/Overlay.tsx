@@ -162,7 +162,7 @@ export default function Overlay() {
   );
 
   const body: Record<View, ReactNode> = {
-    idle: <span className="hint">{keysOf(settings?.hotkeys.ptt ?? "Fn").join(" ")} to talk</span>,
+    idle: <span className="hint">{keysOf(settings?.hotkeys.ptt ?? "RightOption").join(" ")} to talk</span>,
     listening: (
       <>
         <span className="tally-dot pulse" />

@@ -4,7 +4,9 @@
 //! - SUSURRO_TEST_PASTE_TARGET=<bundle id>: Cmd+V / Return only if that app is frontmost; else no paste and no clipboard write.
 //! - SUSURRO_TEST_CONTROL=<port>: HTTP on 127.0.0.1 (GET /state, POST /settings /dict /audio /event/<name>
 //!   /mic/select /mic/priority /mic/forget /toast_action /navigate/<screen|hide>, GET /permissions,
-//!   POST /permissions/request/<microphone|accessibility|input_monitoring>).
+//!   POST /permissions/request/<microphone|accessibility|input_monitoring>,
+//!   POST /flags/<RightOption|LeftOption|...>/<down|up>: post a synthetic FlagsChanged CGEvent (never Fn),
+//!   GET /hotkey: the hotkey_status payload, POST /hotkey_capture/<on|off>).
 
 use crate::AppState;
 use crate::contract::{DictEntryInput, Settings};
@@ -136,6 +138,7 @@ fn route(app: &AppHandle, method: &str, path: &str, body: &[u8]) -> Result<Value
                 "last_history": last,
                 "stats": crate::history::get_stats(app.state()).ok(),
                 "mic": crate::audio::mic_state(&state),
+                "hotkey": app.try_state::<crate::hotkey::HotkeyHandle>().map(|h| h.status()),
             }))
         }
         ("POST", "/settings") => {
@@ -208,6 +211,19 @@ fn route(app: &AppHandle, method: &str, path: &str, body: &[u8]) -> Result<Value
             }
             Ok(json!({ "ok": true }))
         }
+        ("GET", "/hotkey") => {
+            let h = app.try_state::<crate::hotkey::HotkeyHandle>().ok_or("hotkeys are not running")?;
+            to_json(serde_json::to_value(h.status()))
+        }
+        ("POST", p) if p.starts_with("/hotkey_capture/") => {
+            crate::hotkey::hotkey_capture(app.clone(), &p["/hotkey_capture/".len()..] == "on")?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", p) if p.starts_with("/flags/") => {
+            let (name, dir) = p["/flags/".len()..].split_once('/').ok_or("POST /flags/<key>/<down|up>")?;
+            post_flags(name, dir == "down")?;
+            Ok(json!({ "ok": true }))
+        }
         ("GET", "/permissions") => to_json(serde_json::to_value(crate::permissions::permissions_status()?)),
         ("POST", p) if p.starts_with("/permissions/request/") => {
             let kind = serde_json::from_value(json!(&p["/permissions/request/".len()..])).map_err(|e| e.to_string())?;
@@ -229,6 +245,29 @@ fn route(app: &AppHandle, method: &str, path: &str, body: &[u8]) -> Result<Value
         }
         _ => Err(format!("no route {method} {path}")),
     }
+}
+
+/// A synthetic FlagsChanged for a modifier-only key, posted at the HID level so the hotkey tap sees it
+/// as a real press. Fn is refused: the system owns it. Always post the matching "up" soon after "down".
+#[cfg(target_os = "macos")]
+fn post_flags(name: &str, down: bool) -> Result<(), String> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    let k = crate::hotkey::mod_key(name).ok_or_else(|| format!("{name} is not a modifier-only key"))?;
+    if k.name == "Fn" {
+        return Err("refused: fn is bound by the system".into());
+    }
+    let src = CGEventSource::new(CGEventSourceStateID::Private).map_err(|_| "CGEventSource failed")?;
+    let ev = CGEvent::new_keyboard_event(src, k.keycode() as u16, down).map_err(|_| "CGEvent failed")?;
+    ev.set_type(CGEventType::FlagsChanged);
+    ev.set_flags(CGEventFlags::from_bits_retain(if down { k.down_flags() } else { 0 }));
+    ev.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn post_flags(_: &str, _: bool) -> Result<(), String> {
+    Err("macOS only".into())
 }
 
 /// Object keys merge recursively; anything else replaces.

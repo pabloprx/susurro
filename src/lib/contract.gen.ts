@@ -39,7 +39,14 @@ export type HistoryItem = { id: number, created_at: number, app_bundle: string |
 export type HistoryStatus = "pasted" | "copied" | "cancelled" | "failed";
 
 /**
- * One binding per action. "Fn" is the only modifier-only binding (CGEventTap); others use global-shortcut.
+ * Payload of the `hotkey_status` event: the push-to-talk binding is live, or why not.
+ */
+export type HotkeyStatus = { binding: string, active: boolean, error?: string, };
+
+/**
+ * One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
+ * "RightControl", "LeftControl", "RightShift", "LeftShift") use the CGEventTap and work only for ptt;
+ * anything else is an accelerator combo for global-shortcut.
  */
 export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, cancel: string, paste_last: string, };
 
@@ -97,7 +104,11 @@ export type Permissions = { microphone: PermState, accessibility: boolean, input
 /**
  * None = unknown.
  */
-fn_key_free: boolean | null, };
+fn_key_free: boolean | null, 
+/**
+ * Input Monitoring is granted, but this process cannot use it until it restarts (relaunch_app).
+ */
+needs_relaunch: boolean, };
 
 export type Phase = "idle" | "recording" | "locked" | "processing" | "done" | "error";
 

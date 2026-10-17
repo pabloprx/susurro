@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { ArrowRight, Copy, RotateCcw } from "lucide-react";
 import { api, on, type HistoryItem, type Stats } from "../lib/api";
-import { clock, keysOf, settingsStore } from "../lib/store";
+import { clock, keyLabel, keysOf, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
 import { copy, Empty, Kbd, toast } from "../ui";
 import type { Nav } from "../App";
@@ -26,7 +26,7 @@ export default function Home({ nav }: { nav: Nav }) {
     return () => void off.then((f) => f());
   }, []);
 
-  const ptt = settings?.hotkeys.ptt ?? "Fn";
+  const ptt = settings?.hotkeys.ptt ?? "RightOption";
   const daily = stats?.daily ?? [];
   const maxDay = Math.max(1, ...daily.map((d) => d.words));
   // streak: consecutive days with words, ending today (or yesterday if today is still empty)
@@ -120,7 +120,7 @@ export default function Home({ nav }: { nav: Nav }) {
         )}
       </div>
       {recent && !recent.length ? (
-        <Empty line={S.empty.recent.line} help={S.empty.recent.help} action={<button className="btn secondary" onClick={() => nav.go("shortcuts")}>Try it</button>} />
+        <Empty line={S.empty.recent.line} help={S.empty.recent.help(keyLabel(ptt))} action={<button className="btn secondary" onClick={() => nav.go("shortcuts")}>Try it</button>} />
       ) : (
         <div className="rows recent">
           {recent?.map((h) => (

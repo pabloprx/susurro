@@ -21,7 +21,7 @@ export const S = {
     settings: ["The ", "quiet", " details."],
   } as Record<string, string[]>,
   empty: {
-    recent: { line: ["Nothing said ", "yet."], help: "Hold fn anywhere and talk." },
+    recent: { line: ["Nothing said ", "yet."], help: (key: string) => `Hold ${key} anywhere and talk.` },
     history: { line: ["", "Quiet", " in here."], help: "Your dictations show up here." },
     search: { help: "Search covers raw and formatted text." },
     words: { line: ["Teach it your ", "words."], help: "Names, brands, jargon. susurro hints them to every provider." },

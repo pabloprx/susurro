@@ -2,7 +2,7 @@
 import { Component, useEffect, useState, type ComponentType, type ReactNode } from "react";
 import { AudioLines, BookA, Cpu, House, Keyboard, Mic, PenLine, Settings2 } from "lucide-react";
 import { on, type SessionState } from "./lib/api";
-import { applyTheme, getTheme, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
+import { applyTheme, getTheme, isModOnly, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
 import { S } from "./lib/strings";
 import { Dot, Meter, Toasts, useLevel } from "./ui";
 import Home from "./screens/Home";
@@ -13,7 +13,7 @@ import Providers from "./screens/Providers";
 import Audio from "./screens/Audio";
 import Shortcuts from "./screens/Shortcuts";
 import Settings from "./screens/Settings";
-import Onboarding from "./screens/Onboarding";
+import Onboarding, { RESUME_KEY } from "./screens/Onboarding";
 import "./styles/tokens.css";
 import "./styles/app.css";
 
@@ -70,11 +70,15 @@ export default function App() {
 
   // first launch, or a required permission is missing -> onboarding, resumed at the first missing step
   useEffect(() => {
-    if (!settings || !perms || onboardStep !== null || sessionStorage.getItem("susurro.skipOnboarding")) return;
+    if (!settings || !perms || onboardStep !== null) return;
+    const resume = localStorage.getItem(RESUME_KEY); // relaunch_app from an onboarding step: reopen on it
+    if (resume !== null) return setOnboardStep(+resume);
+    if (sessionStorage.getItem("susurro.skipOnboarding")) return;
+    const ptt = settings.hotkeys.ptt;
     const missing = [
       perms.microphone !== "granted",
       !perms.accessibility,
-      settings.hotkeys.ptt === "Fn" && (!perms.input_monitoring || perms.fn_key_free === false),
+      isModOnly(ptt) && (!perms.input_monitoring || perms.needs_relaunch || (ptt === "Fn" && perms.fn_key_free === false)),
     ];
     if (!settings.onboarded) setOnboardStep(0);
     else if (missing.some(Boolean)) setOnboardStep(1 + missing.indexOf(true));

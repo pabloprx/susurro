@@ -1,4 +1,4 @@
-//! WP4: mic / accessibility / input monitoring status, request, deep links, fn-key setting check (PLAN 8).
+//! WP4: mic / accessibility / input monitoring status, request, deep links, fn-key setting check, relaunch (PLAN 8).
 
 use crate::contract::{PermKind, PermState, Permissions};
 
@@ -40,8 +40,10 @@ mod mac {
         unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) != 0 }
     }
 
-    pub fn input_monitoring() -> bool {
-        objc2_core_graphics::CGPreflightListenEventAccess()
+    /// (granted, usable now). Preflight can stay false after a grant until restart; the probe tap is live.
+    pub fn input_monitoring() -> (bool, bool) {
+        let probe = crate::hotkey::probe_tap();
+        (objc2_core_graphics::CGPreflightListenEventAccess() || probe, probe)
     }
 
     pub fn prompt_input_monitoring() -> bool {
@@ -92,12 +94,16 @@ pub fn accessibility_trusted() -> bool {
 #[tauri::command]
 pub fn permissions_status() -> Result<Permissions, String> {
     #[cfg(target_os = "macos")]
-    return Ok(Permissions {
-        microphone: mac::microphone(),
-        accessibility: mac::accessibility(),
-        input_monitoring: mac::input_monitoring(),
-        fn_key_free: fn_usage_type().map(fn_free),
-    });
+    {
+        let (granted, usable) = mac::input_monitoring();
+        return Ok(Permissions {
+            microphone: mac::microphone(),
+            accessibility: mac::accessibility(),
+            input_monitoring: granted,
+            fn_key_free: fn_usage_type().map(fn_free),
+            needs_relaunch: granted && (!usable || crate::hotkey::tap_failed()),
+        });
+    }
     #[cfg(not(target_os = "macos"))]
     Err("not supported on this OS".into())
 }
@@ -118,7 +124,7 @@ pub fn request_permission(kind: PermKind) -> Result<(), String> {
             }
         }
         PermKind::InputMonitoring => {
-            // The hotkey module polls the grant and starts the fn tap by itself.
+            // The hotkey module retries its tap every second and starts by itself once the grant is live.
             if !mac::prompt_input_monitoring() {
                 open(&format!("{PANE}Privacy_ListenEvent"));
             }
@@ -128,6 +134,20 @@ pub fn request_permission(kind: PermKind) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     let _ = kind;
     Ok(())
+}
+
+/// Marker for the next launch: show the main window (onboarding resumes on its saved step).
+pub const SHOW_MAIN_MARKER: &str = ".show_main_on_launch";
+
+/// Restart susurro, e.g. after an Input Monitoring grant that this process cannot use yet.
+/// The new instance opens the main window (lib.rs reads the marker).
+#[tauri::command]
+pub fn relaunch_app(app: tauri::AppHandle, state: tauri::State<'_, crate::AppState>) {
+    if let Err(e) = std::fs::write(state.data_dir.join(SHOW_MAIN_MARKER), b"") {
+        log::warn!("relaunch marker: {e}");
+    }
+    log::info!("relaunch requested");
+    app.restart();
 }
 
 #[cfg(test)]

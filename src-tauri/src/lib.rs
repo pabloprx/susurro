@@ -81,7 +81,10 @@ pub fn run() {
             let data_dir = test_hooks::data_dir().unwrap_or(data_dir);
             let settings = settings::load(&data_dir.join("settings.json"));
             let db = db::open(&data_dir.join("susurro.db"))?;
-            let first_run = !settings.onboarded;
+            // relaunch_app leaves a marker: reopen the main window on the next launch.
+            let marker = data_dir.join(permissions::SHOW_MAIN_MARKER);
+            let relaunched = std::fs::remove_file(&marker).is_ok();
+            let first_run = !settings.onboarded || relaunched;
             let hotkeys = settings.hotkeys.clone();
             let (tx, rx) = mpsc::channel();
             let hotkey_tx = tx.clone();
@@ -156,6 +159,8 @@ pub fn run() {
             stt::openrouter_models,
             permissions::permissions_status,
             permissions::request_permission,
+            permissions::relaunch_app,
+            hotkey::hotkey_capture,
         ])
         .build(tauri::generate_context!())
         .expect("error while building susurro");
