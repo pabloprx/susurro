@@ -49,7 +49,7 @@ test.describe("shell", () => {
       await expect(page.getByRole("button", { name, exact: true })).toHaveAttribute("aria-current", "page");
     }
   });
-  test("Cmd+1..8 opens every screen", async ({ page }) => {
+  test("Cmd+1..9 opens every screen", async ({ page }) => {
     await open(page);
     for (let i = screens.length - 1; i >= 0; i--) {
       await page.keyboard.press(`Meta+${i + 1}`);
@@ -121,14 +121,14 @@ test.describe("history", () => {
   });
   test("search highlights, no-match empty state, clear", async ({ page }) => {
     const all = await page.locator(".h-item").count();
-    expect(all).toBe(18);
+    expect(all).toBe(20);
     await page.getByLabel("Search transcripts").fill("Contaflow");
     await expect(page.locator(".h-item")).toHaveCount(1);
     await expect(page.locator(".h-item mark")).toHaveText("Contaflow");
     await page.getByLabel("Search transcripts").fill("zzzz-nothing");
     await expect(page.getByText("No match for “zzzz-nothing”.")).toBeVisible();
     await page.getByRole("button", { name: "Clear search" }).click();
-    await expect(page.locator(".h-item")).toHaveCount(18);
+    await expect(page.locator(".h-item")).toHaveCount(20);
   });
   test("Cmd+F focuses search; arrow keys move between rows", async ({ page }) => {
     await page.keyboard.press("Meta+f");
@@ -171,7 +171,7 @@ test.describe("history", () => {
     await expect(toastText(page, "Re-transcribed. Saved in History.")).toBeVisible();
     // delete
     await item.getByRole("button", { name: "Delete", exact: true }).click();
-    await expect(page.locator(".h-item")).toHaveCount(17);
+    await expect(page.locator(".h-item")).toHaveCount(19);
     await expect(page.locator(".h-item").first()).not.toContainText("push the release");
   });
   test("failed row: not pasted, copy, retry fixes it", async ({ page }) => {
@@ -202,7 +202,7 @@ test.describe("history", () => {
     const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Export JSON" }).click()]);
     expect(dl.suggestedFilename()).toMatch(/^susurro-history-\d{4}-\d\d-\d\d\.json$/);
     const rows = JSON.parse(readFileSync(await dl.path(), "utf8"));
-    expect(rows).toHaveLength(18);
+    expect(rows).toHaveLength(20);
   });
   test("delete all: keep, then delete", async ({ page }) => {
     await page.getByRole("button", { name: "More" }).click();
@@ -211,7 +211,7 @@ test.describe("history", () => {
     await expect(sheet).toContainText("Delete all history?");
     await sheet.getByRole("button", { name: "Keep history" }).click();
     await expect(sheet).toHaveCount(0);
-    await expect(page.locator(".h-item")).toHaveCount(18);
+    await expect(page.locator(".h-item")).toHaveCount(20);
     await page.getByRole("button", { name: "More" }).click();
     await page.getByRole("button", { name: "Delete all…" }).click();
     await page.locator("dialog.sheet[open]").getByRole("button", { name: "Delete all history" }).click();
@@ -220,7 +220,7 @@ test.describe("history", () => {
   test("a new dictation is prepended live", async ({ page }) => {
     await page.evaluate(() => (window.mock.dictate(), window.mock.stop()));
     await expect(page.locator(".h-item").first()).toContainText("The new build is up.");
-    await expect(page.locator(".h-item")).toHaveCount(19);
+    await expect(page.locator(".h-item")).toHaveCount(21);
   });
   test("popover closes on Escape and outside click", async ({ page }) => {
     await page.getByRole("button", { name: "More" }).click();
@@ -703,13 +703,42 @@ test.describe("providers", () => {
   test("OpenRouter STT: model picker, test", async ({ page }) => {
     await prov(page, "OpenRouter").click();
     await expect(prov(page, "OpenRouter")).toContainText("pick a model");
-    const pick = page.locator(".prov-body").getByRole("combobox", { name: "Model" });
-    await expect(pick).toHaveValue("");
-    await pick.selectOption("openai/gpt-4o-transcribe");
-    await expect(pick).toHaveValue("openai/gpt-4o-transcribe");
+    await page.getByRole("button", { name: "Model: none" }).click();
+    const list = page.getByRole("listbox", { name: "Speech to text models" });
+    await list.getByRole("option", { name: /GPT-4o Transcribe/ }).click();
+    await expect(list).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Model: GPT-4o Transcribe" })).toBeVisible();
     await expect(page.locator(".instruments")).toContainText("openai/gpt-4o-transcribe");
+    await expect(page.locator(".prov-body")).toContainText("OpenRouter ignores the vocabulary prompt");
     await testBtn(page).click();
     await expect(result(page)).toContainText("1204 ms");
+  });
+  test("OpenRouter STT picker: ranked order, MAI recommended, prices, keywords note, keyboard", async ({ page }) => {
+    await prov(page, "OpenRouter").click();
+    await page.getByRole("button", { name: "Model: none" }).click();
+    const opts = page.getByRole("listbox", { name: "Speech to text models" }).getByRole("option");
+    await expect(opts.first()).toContainText("01MAI-Transcribe 2RECOMMENDEDKEYWORDS$0.10/h");
+    await expect(opts.nth(1)).toContainText("Whisper Large V3$0.027/h");
+    await expect(opts.nth(3)).toContainText("Scribe v2$0.11/h");
+    await expect(opts.nth(3)).not.toContainText("KEYWORDS"); // keyterms via OpenRouter: no gain measured
+    await expect(opts.nth(4)).toContainText("per token");
+    await expect(page.locator(".stt-group").first()).toContainText("Ranked");
+    await expect(page.locator(".stt-group").nth(1)).toContainText("All models");
+    // the unranked rest is alphabetical, after the top 10
+    await expect(opts.nth(10)).toContainText("Universal-3.6 Pro");
+    // typing filters, arrows move, Enter picks
+    const search = page.getByRole("combobox", { name: "Search models" });
+    await search.fill("scribe v");
+    await expect(opts).toHaveCount(1);
+    await search.press("ArrowDown");
+    await search.press("Enter");
+    await expect(page.getByRole("button", { name: "Model: Scribe v2" })).toBeVisible();
+    await expect(page.locator(".prov-body")).not.toContainText("Scribe v2 gets your dictionary words as hints");
+    // Escape closes without a change
+    await page.getByRole("button", { name: "Model: Scribe v2" }).click();
+    await search.press("Escape");
+    await expect(page.getByRole("listbox", { name: "Speech to text models" })).toHaveCount(0);
+    await page.screenshot({ path: test.info().outputPath("picker.png") });
   });
   test("provider radios by keyboard", async ({ page }) => {
     await prov(page, "Local Whisper").focus();
@@ -1354,6 +1383,150 @@ test.describe("onboarding", () => {
 
 // ---------------- overlay ----------------
 
+test.describe("marks window", () => {
+  const root = (page) => page.locator(".marks-root");
+  test("marks: a numbered badge per AX element and a tint per region", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/marks?state=marks");
+    await expect(root(page)).toHaveClass(/\bs-marks\b/);
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await expect(root(page).locator(".mark .badge").first()).toHaveText("1");
+    await expect(root(page).locator(".region")).toHaveCount(5);
+    await expect(root(page).locator(".hud")).toContainText("STEP 1/6LOOKINGopen my DM with Anaesc stops");
+    // badges sit on the element: mark 41 (Send now) is at the composer's bottom-right
+    const b = await root(page).locator(".mark").nth(40).boundingBox();
+    expect(b.x).toBeGreaterThan(1300);
+    expect(b.y).toBeGreaterThan(800);
+    await page.screenshot({ path: test.info().outputPath("marks.png") });
+  });
+  test("aim: brackets and a crosshair on the target, the rest fades", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/marks?state=aim");
+    await expect(root(page).locator(".mark.chosen .badge")).toHaveText("27");
+    await expect(root(page).locator(".mark.faded")).toHaveCount(42);
+    await expect(root(page).locator(".brackets .cross")).toHaveCount(1);
+    await expect(root(page).locator(".brackets.warn")).toHaveCount(0);
+    await expect(root(page).locator(".hud")).toContainText("CLICK");
+    await page.screenshot({ path: test.info().outputPath("marks-aim.png") });
+  });
+  test("pick: Which one? lists the top 3 with their confidence", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/marks?state=pick");
+    await expect(root(page).locator(".mark.pick")).toHaveCount(3);
+    const rows = root(page).locator(".hud-picks li");
+    await expect(rows).toHaveCount(3);
+    await expect(rows.first()).toContainText("20# designlink · sidebar56%");
+    await expect(root(page).locator(".hud")).toContainText("WHICH ONE?");
+    await expect(root(page).locator(".hud-foot")).toContainText("Not sure enough to act. Hold F2 and say the number.");
+    await page.screenshot({ path: test.info().outputPath("marks-pick.png") });
+  });
+  test("confirm: warn brackets, Press F2 to confirm, esc cancels", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/marks?state=confirm");
+    await expect(root(page).locator(".brackets.warn")).toHaveCount(1);
+    await expect(root(page).locator(".hud")).toContainText("STEP 2/6");
+    await expect(root(page).locator(".hud-q")).toContainText("Click “Send now”?");
+    await expect(root(page).locator(".hud-foot")).toHaveText("Press F2 to confirm · esc cancels");
+    await page.screenshot({ path: test.info().outputPath("marks-confirm.png") });
+  });
+  test("the window is empty outside the marks states, and clears on idle", async ({ page }) => {
+    await page.goto("/marks?state=done");
+    await expect(root(page)).toBeAttached();
+    await expect(root(page).locator(".mark")).toHaveCount(0);
+    await page.goto("/marks?state=marks");
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await page.evaluate(() => window.mock.phase("idle"));
+    await expect(root(page).locator(".mark")).toHaveCount(0);
+  });
+});
+
+test("voice control is hidden until the command runner exists: no screen, no key clash", async ({ page }) => {
+  await open(page);
+  await expect(page.getByRole("navigation", { name: "Screens" }).getByRole("button", { name: "Voice control" })).toHaveCount(0);
+  await page.keyboard.press("Meta+8");
+  await expect(h1(page)).toHaveText("The quiet details.");
+  // the hidden command key (F2) does not block F2 for push to talk
+  await nav(page, "Shortcuts");
+  await page.getByRole("button", { name: /^Push to talk:/ }).click();
+  await page.keyboard.press("F2");
+  await expect(page.getByRole("button", { name: /^Push to talk:/ })).toHaveAttribute("aria-label", /^Push to talk: F2\./);
+});
+
+test.describe("voice control", () => {
+  test.beforeEach(({ page }) => page.addInitScript(() => localStorage.setItem("susurro.labs.voice", "1")));
+  test("sidebar shows it with the labs flag, Cmd+8 opens it", async ({ page }) => {
+    await open(page);
+    await page.keyboard.press("Meta+8");
+    await expect(h1(page)).toHaveText("Your screen, by voice.");
+  });
+  test("screen: ready rows, key, risky toggle, pinned model, last run", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    await expect(h1(page)).toHaveText("Your screen, by voice.");
+    const ready = page.locator(".vc-ready");
+    await expect(ready.getByLabel("OpenRouter key: ready")).toBeVisible();
+    await expect(ready.getByLabel("Accessibility: ready")).toBeVisible();
+    await expect(ready.getByLabel("Screen Recording: not ready")).toContainText("asked the first time a step needs to look");
+    await expect(page.locator(".vc-perm")).toHaveCount(0); // not asked until a step needs it
+    await expect(page.getByText("typesafe/jev-1.14")).toBeVisible();
+    await expect(page.locator(".vc-log .row")).toHaveCount(4);
+    await expect(page.locator(".vc-log .row").nth(1)).toContainText("OPENNotes0.19 s$0.000009");
+    await expect(page.locator(".label-row", { hasText: "Last run" })).toContainText("3 steps · 1.55 s · $0.000101");
+    // risky toggle and the on/off switch save
+    await sw(page, "Ask before risky actions").click();
+    await expect(sw(page, "Ask before risky actions")).toHaveAttribute("aria-checked", "false");
+    await expect(page.getByText("Acts right away. Esc still stops it.")).toBeVisible();
+    await expect(sw(page, "Voice control")).toHaveAttribute("aria-checked", "false"); // opt-in (contract.rs default)
+    await sw(page, "Voice control").click();
+    await nav(page, "Home");
+    await nav(page, "Voice control");
+    await expect(sw(page, "Voice control")).toHaveAttribute("aria-checked", "true");
+    await expect(sw(page, "Ask before risky actions")).toHaveAttribute("aria-checked", "false");
+  });
+  test("command key: record F3, a modifier alone is rejected, reset to F2", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    const bind = page.getByRole("button", { name: /^Voice control key:/ });
+    await bind.click();
+    await page.keyboard.press("AltRight");
+    await expect(page.getByRole("alert")).toContainText("only push to talk works with one key alone");
+    await page.keyboard.press("F1");
+    await expect(page.getByRole("alert")).toContainText("Already used by Push to talk");
+    await page.keyboard.press("F3");
+    await expect(bind).toHaveAccessibleName(/F3/);
+    await expect(page.locator(".vc-lede kbd")).toHaveText("F3");
+    await page.getByRole("button", { name: "Reset" }).click();
+    await expect(bind).toHaveAccessibleName(/F2/);
+  });
+  test("Screen Recording card shows only after a step needed it; grant, then restart", async ({ page }) => {
+    await open(page, "/?needscreen");
+    await nav(page, "Voice control");
+    const card = page.locator(".vc-perm");
+    await expect(card).toContainText("Your last command needed a screenshot");
+    await expect(page.locator(".vc-log")).toContainText("SETUP");
+    await card.getByRole("button", { name: "Open System Settings" }).click();
+    await expect(card.getByRole("button", { name: "Restart susurro" })).toBeVisible({ timeout: 5000 });
+    await page.screenshot({ path: test.info().outputPath("voice-needscreen.png") });
+    await card.getByRole("button", { name: "Restart susurro" }).click();
+    await expect(page.locator(".shell")).toBeVisible();
+    await nav(page, "Voice control");
+    await expect(page.locator(".vc-ready").getByLabel("Screen Recording: ready")).toBeVisible();
+  });
+  test("History shows command rows; Home Recent does not", async ({ page }) => {
+    await open(page);
+    await expect(page.locator(".recent .row").first()).toBeVisible();
+    await expect(page.locator(".recent")).not.toContainText("open my DM with Ana");
+    await nav(page, "History");
+    const row = page.locator(".h-item.cmd", { hasText: "open my DM with Ana" });
+    await expect(row).toContainText("CMD“open my DM with Ana” → Clicked “Ana Silva” (link, sidebar)");
+    await expect(page.locator(".h-item.cmd", { hasText: "delete this email" })).toContainText("stopped");
+    await row.locator(".h-row").click();
+    await expect(row.locator(".cmd-said")).toContainText("Saidopen my DM with AnaDidClicked “Ana Silva” (link, sidebar)");
+    await expect(row.getByRole("button", { name: "Copy command" })).toBeVisible();
+    await expect(row.getByRole("button", { name: /Retry/ })).toHaveCount(0);
+  });
+});
+
 test.describe("overlay", () => {
   const pill = (page) => page.locator(".pill");
   const cases = [
@@ -1369,6 +1542,16 @@ test.describe("overlay", () => {
     ["nofield", "v-notice", "No text field. Copied"],
     ["error", "v-error", "Mic disconnected"],
     ["notice", "v-notice", "Switched to MacBook Pro Microphone"],
+    ["cmd-listening", "v-cmd-listening", "CMD"],
+    ["cmd-thinking", "v-cmd-thinking", "open my DM with Ana"],
+    ["cmd-acting", "v-cmd-acting", "CLICKAna Silva"],
+    ["cmd-pick", "v-cmd-pick", "Which one?F2say its number"],
+    ["cmd-confirm", "v-cmd-confirm", "Click “Send now”?F2yesescno"],
+    ["cmd-done", "v-cmd-done", "Done · 2 steps"],
+    ["cmd-stopped", "v-cmd-stopped", "Stopped"],
+    ["cmd-unsure", "v-cmd-unsure", "Not sure where. Say it again."],
+    ["cmd-blocked", "v-cmd-blocked", "Password field. susurro won't touch it."],
+    ["cmd-setup", "v-cmd-setup", "Voice control needs Screen Recording"],
   ];
   for (const [state, cls, text] of cases)
     test(`state ${state}`, async ({ page }) => {
@@ -1387,6 +1570,56 @@ test.describe("overlay", () => {
       }
       await page.screenshot({ path: test.info().outputPath(`overlay-${state}.png`) });
     });
+  test("command pills stay compact (300 px max) and count the steps", async ({ page }) => {
+    for (const s of ["cmd-thinking", "cmd-acting", "cmd-pick", "cmd-confirm", "cmd-setup"]) {
+      await page.goto(`/overlay?state=${s}`);
+      await expect(pill(page)).toHaveClass(new RegExp(`\\bv-${s}\\b`));
+      await page.waitForTimeout(400);
+      expect((await pill(page).boundingBox()).width, s).toBeLessThanOrEqual(300);
+    }
+    await page.goto("/overlay?state=cmd-thinking");
+    await expect(pill(page).getByLabel("Step 1 of 6")).toBeVisible();
+  });
+  test("the pill reports its rect for click-through on every size change", async ({ page }) => {
+    await page.goto("/overlay"); // no ?state: its 50 ms freeze timer would undo the dictate below
+    await expect(pill(page)).toHaveClass(/\bv-idle\b/);
+    const rect = () => page.evaluate(() => window.mock.pillRect);
+    // the rect is in window coordinates: the browser preview draws the window as #root
+    const box = async () => {
+      const b = await pill(page).boundingBox();
+      const w = await page.locator("#root").boundingBox();
+      return { x: Math.round(b.x - w.x), y: Math.round(b.y - w.y), w: Math.round(b.width), h: Math.round(b.height) };
+    };
+    await expect.poll(rect).toMatchObject({ w: 44, h: 8 });
+    await page.waitForFunction(() => window.mock);
+    // every rect reported during the morph: the hit zone grows with the pill, not ahead of it
+    const seen = await page.evaluate(async () => {
+      const out = [];
+      void window.mock.dictate();
+      const t0 = performance.now();
+      while (performance.now() - t0 < 500) {
+        out.push(window.mock.pillRect.w);
+        await new Promise(requestAnimationFrame);
+      }
+      return out;
+    });
+    expect(seen.some((w) => w > 44 && w < 200), `mid-morph widths: ${[...new Set(seen)]}`).toBe(true);
+    await expect.poll(rect).toMatchObject({ w: 200, h: 36 });
+    await page.waitForTimeout(400); // after the morph, the reported rect is where the pill is
+    const r = await rect();
+    expect(await box()).toEqual({ x: r.x, y: r.y, w: r.w, h: r.h });
+  });
+  test("a command run: listen, think, act, done, back to idle", async ({ page }) => {
+    await page.goto("/overlay?state=idle");
+    await expect(pill(page)).toHaveClass(/\bv-idle\b/);
+    await page.waitForFunction(() => window.mock);
+    await page.evaluate(() => void window.mock.command()); // do not await the whole run
+    await expect(pill(page)).toHaveClass(/\bv-cmd-listening\b/);
+    await expect(pill(page)).toHaveClass(/\bv-cmd-thinking\b/);
+    await expect(pill(page)).toHaveClass(/\bv-cmd-acting\b/);
+    await expect(pill(page)).toHaveClass(/\bv-cmd-done\b/, { timeout: 4000 });
+    await expect(pill(page)).toHaveClass(/\bv-idle\b/, { timeout: 4000 });
+  });
   test("a long error message ends in an ellipsis inside 300 px", async ({ page }) => {
     await page.goto("/overlay?state=error");
     await expect(pill(page)).toHaveClass(/\bv-error\b/);

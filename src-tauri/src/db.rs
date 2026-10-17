@@ -16,7 +16,9 @@ CREATE TABLE dict(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL
   starred INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
 "#,
 // v2: dict.created_at in ms like every other timestamp (v1 stored seconds).
-"UPDATE dict SET created_at = created_at * 1000 WHERE created_at < 100000000000;"];
+"UPDATE dict SET created_at = created_at * 1000 WHERE created_at < 100000000000;",
+// v3: voice command rows next to dictations.
+"ALTER TABLE history ADD COLUMN kind TEXT NOT NULL DEFAULT 'dictation';"];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {

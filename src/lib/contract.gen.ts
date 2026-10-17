@@ -11,6 +11,67 @@ export type CleanupLevel = "none" | "light" | "medium";
 
 export type CleanupSettings = { level: CleanupLevel, provider: LlmProvider, openrouter_model: string, local_base_url: string, local_model: string, timeout_ms: number, };
 
+/**
+ * marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
+ * confirm = a risky step waits for the command key (Esc stops).
+ */
+export type CmdStatus = "thinking" | "marks" | "aim" | "pick" | "confirm" | "done" | "stopped" | "unsure" | "blocked" | "setup" | "error";
+
+/**
+ * Voice control: hold the command key, say what to do, Jev picks the action and the target.
+ */
+export type CommandSettings = { 
+/**
+ * Off = the command key is not registered.
+ */
+enabled: boolean, 
+/**
+ * Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+ */
+confirm_risky: boolean, 
+/**
+ * Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+ */
+model: string, };
+
+/**
+ * Payload of `command_step` (all windows) and a row of `command_log`.
+ */
+export type CommandStep = { instruction: string, 
+/**
+ * 1-based; 0 = the fast path (no screen read).
+ */
+step: number, max: number, status: CmdStatus, 
+/**
+ * click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
+ * copy_last | new_tab | close_tab | back | forward | reload | done
+ */
+action: string | null, 
+/**
+ * open_app: the app; press_key: the key; focus_and_type: the text.
+ */
+detail: string | null, 
+/**
+ * The display the marks window covers, global points.
+ */
+display: PtRect, 
+/**
+ * Empty = no marks on screen (the marks window hides).
+ */
+marks: Array<Mark>, 
+/**
+ * The chosen mark (aim, confirm).
+ */
+target: number | null, 
+/**
+ * pick: the top 3 (mark id, confidence).
+ */
+choices: Array<[number, number]>, latency_ms: number, cost_usd: number, 
+/**
+ * unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
+ */
+message: string | null, };
+
 export type DayStat = { 
 /**
  * YYYY-MM-DD
@@ -34,9 +95,18 @@ export type DictOpts = { fuzzy: boolean, };
 
 export type ElevenOpts = { model_id: string, send_keyterms: boolean, max_keyterms: number, };
 
-export type HistoryItem = { id: number, created_at: number, app_bundle: string | null, app_name: string | null, raw: string, final_text: string, provider: string, cleanup: string | null, duration_ms: number, words: number, latency_ms: number, status: HistoryStatus, has_audio: boolean, error: string | null, };
+export type HistoryItem = { id: number, created_at: number, 
+/**
+ * Command rows: raw = the spoken instruction, final_text = what susurro did, error = why it stopped.
+ */
+kind: HistoryKind, app_bundle: string | null, app_name: string | null, raw: string, final_text: string, provider: string, cleanup: string | null, duration_ms: number, words: number, latency_ms: number, status: HistoryStatus, has_audio: boolean, error: string | null, };
 
-export type HistoryStatus = "pasted" | "copied" | "cancelled" | "failed";
+export type HistoryKind = "dictation" | "command";
+
+/**
+ * Done: a voice command finished. A command that stopped, was unsure or blocked is Cancelled; Setup/Error is Failed.
+ */
+export type HistoryStatus = "pasted" | "copied" | "cancelled" | "failed" | "done";
 
 /**
  * Payload of the `hotkey_status` event: the push-to-talk binding is live, or why not.
@@ -52,7 +122,11 @@ export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: bool
 /**
  * Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
  */
-copy_last: string, };
+copy_last: string, 
+/**
+ * Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+ */
+command: string, };
 
 export type KeyName = "elevenlabs" | "openrouter" | "local_stt" | "local_llm";
 
@@ -61,6 +135,19 @@ export type KeyStatus = { elevenlabs: boolean, openrouter: boolean, local_stt: b
 export type KnownDevice = { id: string, name: string, kind: DeviceKind, last_seen: number, };
 
 export type LlmProvider = "openrouter" | "local";
+
+/**
+ * One actionable Accessibility element, numbered for the marks window and the Jev choice.
+ */
+export type Mark = { id: number, rect: PtRect, name: string, 
+/**
+ * "button", "text field", "checkbox", ...
+ */
+role: string, 
+/**
+ * "sidebar" | "toolbar" | "main" | "bottom" | ...
+ */
+region: string, };
 
 /**
  * start/end are char offsets in the output text.
@@ -90,7 +177,23 @@ export type Navigate = { screen: string, };
 
 export type OpenAiCompat = { base_url: string, model: string, send_hotwords: boolean, };
 
-export type OrModel = { id: string, name: string, };
+export type OrModel = { id: string, name: string, 
+/**
+ * 1-based place in the OpenRouter transcription ranking (hardcoded top 10, stt kind only).
+ */
+rank: number | null, 
+/**
+ * USD per hour of audio. None = priced per token (or a chat model).
+ */
+price_hour: number | null, 
+/**
+ * The model gets the dictionary words as provider options (MAI phrase list, ElevenLabs keyterms).
+ */
+keywords: boolean, 
+/**
+ * The default pick (microsoft/mai-transcribe-2).
+ */
+recommended: boolean, };
 
 export type OverlayOpts = { show_idle: boolean, };
 
@@ -101,7 +204,7 @@ export type PasteOpts = { restore_clipboard: boolean,
  */
 restore_delay_ms: number, press_enter_command: boolean, };
 
-export type PermKind = "microphone" | "accessibility" | "input_monitoring" | "fn_key";
+export type PermKind = "microphone" | "accessibility" | "input_monitoring" | "fn_key" | "screen_recording";
 
 export type PermState = "granted" | "denied" | "undetermined";
 
@@ -113,13 +216,22 @@ fn_key_free: boolean | null,
 /**
  * Input Monitoring is granted, but this process cannot use it until it restarts (relaunch_app).
  */
-needs_relaunch: boolean, };
+needs_relaunch: boolean, 
+/**
+ * Voice control asks for it only when a step needs a screenshot.
+ */
+screen_recording: boolean, };
 
-export type Phase = "idle" | "recording" | "locked" | "processing" | "done" | "error";
+export type Phase = "idle" | "recording" | "locked" | "processing" | "acting" | "done" | "error";
 
 export type PrivacyOpts = { store_history: boolean, store_audio: boolean, audio_retention_days: number, };
 
 export type ProviderTest = { ok: boolean, latency_ms: number, text: string, error: string | null, };
+
+/**
+ * Global points: the CoreGraphics space, origin top-left of the main display, y down.
+ */
+export type PtRect = { x: number, y: number, w: number, h: number, };
 
 export type RecordingOpts = { 
 /**
@@ -132,15 +244,23 @@ max_seconds: number, sounds: boolean, };
  */
 export type SessionState = { phase: Phase, started_at: number | null, device: string | null, app: string | null, 
 /**
- * Done: the HistoryStatus ("pasted" | "copied"). Error: the error text.
+ * Done: the HistoryStatus ("pasted" | "copied" | "done"). Error: the error text.
  */
-message: string | null, };
+message: string | null, 
+/**
+ * Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
+ */
+command: boolean, };
 
 export type Settings = { version: number, onboarded: boolean, 
 /**
  * "auto" | ISO-639-1
  */
-language: string, hotkeys: Hotkeys, mic: MicSettings, stt: SttSettings, cleanup: CleanupSettings, styles: Styles, dictionary: DictOpts, spoken_punctuation: boolean, paste: PasteOpts, recording: RecordingOpts, overlay: OverlayOpts, privacy: PrivacyOpts, autostart: boolean, };
+language: string, hotkeys: Hotkeys, mic: MicSettings, stt: SttSettings, cleanup: CleanupSettings, styles: Styles, dictionary: DictOpts, spoken_punctuation: boolean, paste: PasteOpts, recording: RecordingOpts, overlay: OverlayOpts, privacy: PrivacyOpts, autostart: boolean, 
+/**
+ * Voice control (hold `hotkeys.command`).
+ */
+command: CommandSettings, };
 
 export type Stats = { words_total: number, words_7d: number, sessions_7d: number, wpm: number, minutes_saved: number, daily: Array<DayStat>, };
 

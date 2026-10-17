@@ -3,6 +3,7 @@
 
 pub mod elevenlabs;
 pub mod openai_compat;
+pub mod openrouter;
 pub mod whisper_local;
 
 use crate::AppState;
@@ -57,16 +58,15 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
             model: st.openai_compat.model.clone(),
             key: secrets::get(KeyName::LocalStt),
             hotwords: st.openai_compat.send_hotwords,
-            label: "local STT server",
         }),
         SttProvider::OpenRouter => {
             anyhow::ensure!(!st.openrouter_model.is_empty(), "Pick an OpenRouter transcription model first");
-            Box::new(openai_compat::OpenAiCompat {
+            let clean_key = secrets::get(crate::cleanup::key_name(s));
+            Box::new(openrouter::OpenRouter {
                 base: OPENROUTER_BASE.into(),
                 model: st.openrouter_model.clone(),
-                key: Some(secrets::get(KeyName::Openrouter).ok_or_else(|| anyhow::anyhow!("Add an OpenRouter API key first"))?),
-                hotwords: false,
-                label: "OpenRouter",
+                key: secrets::get(KeyName::Openrouter).ok_or_else(|| anyhow::anyhow!("Add an OpenRouter API key first"))?,
+                clean: crate::cleanup::effective_level(s, clean_key.as_deref()) != crate::contract::CleanupLevel::None,
             })
         }
         SttProvider::ElevenLabs => Box::new(elevenlabs::ElevenLabs {
@@ -248,16 +248,47 @@ pub(crate) fn list_models(base: &str, kind: &str, key: Option<&str>) -> anyhow::
     }
     let v = send_json(rb, "OpenRouter")?;
     let data = v["data"].as_array().ok_or_else(|| anyhow::anyhow!("OpenRouter: no model list in the response"))?;
+    let stt = kind == "stt";
     let mut out: Vec<OrModel> = data
         .iter()
         .filter_map(|m| {
             let id = m["id"].as_str()?.to_string();
             let name = m["name"].as_str().unwrap_or(&id).to_string();
-            Some(OrModel { id, name })
+            let p = |k: &str| m["pricing"][k].as_str().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let rank = RANKED.iter().position(|r| *r == id).map(|i| i as u32 + 1).filter(|_| stt);
+            let price_hour = if stt { price_hour(&id, p("prompt"), p("completion")) } else { None };
+            let keywords = stt && openrouter::options_for(&id, &["x".into()], false).is_some();
+            Some(OrModel { recommended: id == crate::contract::DEFAULT_OPENROUTER_STT, rank, price_hour, keywords, id, name })
         })
         .collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Ranked first in ranking order, then the rest by name.
+    out.sort_by(|a, b| (a.rank.unwrap_or(u32::MAX), a.name.to_lowercase()).cmp(&(b.rank.unwrap_or(u32::MAX), b.name.to_lowercase())));
     Ok(out)
+}
+
+/// ponytail: hardcoded 2026-10-17 pick from the OpenRouter transcription ranking (Pablo's order, MAI first);
+/// no JSON source exists (.lo/openrouter-stt.md). An id gone from the live list simply does not show.
+pub const RANKED: [&str; 10] = [
+    "microsoft/mai-transcribe-2",
+    "openai/whisper-large-v3",
+    "openai/whisper-large-v3-turbo",
+    "elevenlabs/scribe-v2",
+    "openai/gpt-4o-mini-transcribe",
+    "openai/whisper-1",
+    "openai/gpt-transcribe",
+    "x-ai/grok-stt-1.0",
+    "qwen/qwen3-asr-1.7b",
+    "mistralai/voxtral-mini-transcribe",
+];
+
+/// USD per hour of audio from the models API pricing. `pricing.prompt` is per second for audio-priced
+/// models, but MAI-Transcribe's is already per hour ("0.1" = $0.10/h, the real 11 s call cost $0.000306).
+/// A completion price means per-token pricing: None.
+fn price_hour(id: &str, prompt: f64, completion: f64) -> Option<f64> {
+    if completion > 0.0 || prompt <= 0.0 {
+        return None;
+    }
+    Some(if id.starts_with("microsoft/mai-transcribe") { prompt } else { prompt * 3600.0 })
 }
 
 /// kind: "stt" | "chat". The model list is public; the key is sent when present.
@@ -333,12 +364,12 @@ mod tests {
         let base = format!("{}/api/v1", srv.url());
         let m = list_models(&base, "stt", Some("k")).unwrap();
         stt.assert();
-        assert_eq!(m.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["elevenlabs/scribe-v2", "openai/whisper-1"]);
+        assert_eq!(m.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["elevenlabs/scribe-v2", "openai/whisper-1"], "ranked order");
 
         let chat = srv.mock("GET", "/api/v1/models").match_query(mockito::Matcher::Missing).with_body(r#"{"data":[{"id":"a/b"}]}"#).create();
         let m = list_models(&base, "chat", None).unwrap();
         chat.assert();
-        assert_eq!(m, vec![OrModel { id: "a/b".into(), name: "a/b".into() }]);
+        assert_eq!(m, vec![OrModel { id: "a/b".into(), name: "a/b".into(), rank: None, price_hour: None, keywords: false, recommended: false }]);
         assert!(list_models(&base, "tts", None).is_err());
     }
 
@@ -361,5 +392,42 @@ mod tests {
             assert!(e.to_lowercase().contains("credit") || e.contains("quota") || e.contains("Budget"), "{code}: {e}");
             m.remove();
         }
+    }
+}
+
+#[cfg(test)]
+mod ranking_tests {
+    use super::*;
+
+    #[test]
+    fn ranked_first_then_by_name_with_prices() {
+        let mut srv = mockito::Server::new();
+        let _m = srv
+            .mock("GET", "/api/v1/models")
+            .match_query(mockito::Matcher::Any)
+            .with_body(
+                r#"{"data":[
+                {"id":"zeta/asr","name":"Zeta ASR","pricing":{"prompt":"0.0001","completion":"0"}},
+                {"id":"assemblyai/universal-3-6-pro","name":"AssemblyAI: Universal-3.6 Pro","pricing":{"prompt":"0.0000833333","completion":"0"}},
+                {"id":"openai/whisper-large-v3","name":"OpenAI: Whisper Large V3","pricing":{"prompt":"0.0000075","completion":"0"}},
+                {"id":"openai/gpt-4o-mini-transcribe","name":"OpenAI: GPT-4o Mini Transcribe","pricing":{"prompt":"0.00000125","completion":"0.000005"}},
+                {"id":"elevenlabs/scribe-v2","name":"ElevenLabs: Scribe v2","pricing":{"prompt":"0.00003055555555555","completion":"0"}},
+                {"id":"microsoft/mai-transcribe-2","name":"Microsoft AI: MAI-Transcribe 2","pricing":{"prompt":"0.1","completion":"0"}}
+            ]}"#,
+            )
+            .create();
+        let m = list_models(&format!("{}/api/v1", srv.url()), "stt", None).unwrap();
+        let ids: Vec<&str> = m.iter().map(|m| m.id.as_str()).collect();
+        // whisper-large-v3-turbo etc. are missing from the live list: dropped, the order still holds.
+        assert_eq!(ids, ["microsoft/mai-transcribe-2", "openai/whisper-large-v3", "elevenlabs/scribe-v2", "openai/gpt-4o-mini-transcribe", "assemblyai/universal-3-6-pro", "zeta/asr"]);
+        assert_eq!(m.iter().map(|m| m.rank).collect::<Vec<_>>(), [Some(1), Some(2), Some(4), Some(5), None, None]);
+        let ph = |i: usize| m[i].price_hour.map(|p| (p * 1000.0).round() / 1000.0);
+        assert_eq!(ph(0), Some(0.1), "MAI prompt is already per hour");
+        assert_eq!(ph(1), Some(0.027));
+        assert_eq!(ph(2), Some(0.11));
+        assert_eq!(ph(3), None, "token-priced");
+        assert_eq!(ph(4), Some(0.3));
+        assert!(m[0].recommended && !m[1].recommended);
+        assert_eq!(m.iter().map(|m| m.keywords).collect::<Vec<_>>(), [true, false, false, false, false, false]);
     }
 }

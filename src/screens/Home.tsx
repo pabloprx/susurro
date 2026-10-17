@@ -18,7 +18,7 @@ export default function Home({ nav }: { nav: Nav }) {
   const settings = settingsStore.use();
   const load = () => {
     api.getStats().then(setStats);
-    api.historyList(null, null, 5).then(setRecent);
+    api.historyList(null, null, 12).then((l) => setRecent(l.filter((h) => h.kind !== "command").slice(0, 5))); // Recent = dictations
   };
   useEffect(() => {
     load();

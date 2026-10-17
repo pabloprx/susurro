@@ -133,6 +133,7 @@ fn status(with_fn: bool) -> Permissions {
         input_monitoring: granted,
         fn_key_free: if with_fn { fn_usage_type().map(fn_free) } else { None },
         needs_relaunch: needs_relaunch(granted, usable, crate::hotkey::tap_failed()),
+        screen_recording: objc2_core_graphics::CGPreflightScreenCaptureAccess(),
     }
 }
 
@@ -206,6 +207,13 @@ pub fn request_permission(kind: PermKind) -> Result<(), String> {
             }
         }
         PermKind::FnKey => open(KEYBOARD_PANE),
+        PermKind::ScreenRecording if objc2_core_graphics::CGPreflightScreenCaptureAccess() => {}
+        PermKind::ScreenRecording => {
+            // The prompt shows once per app; after that only the Settings pane can grant it.
+            if !objc2_core_graphics::CGRequestScreenCaptureAccess() {
+                open(&format!("{PANE}Privacy_ScreenCapture"));
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     let _ = kind;
@@ -251,7 +259,7 @@ mod tests {
 
     #[test]
     fn watcher_counts_input_monitoring_only_for_modifier_keys() {
-        let all = Permissions { microphone: PermState::Granted, accessibility: true, input_monitoring: false, fn_key_free: None, needs_relaunch: false };
+        let all = Permissions { microphone: PermState::Granted, accessibility: true, input_monitoring: false, fn_key_free: None, needs_relaunch: false, screen_recording: false };
         assert!(!missing(&all, false), "F1 needs no Input Monitoring");
         assert!(missing(&all, true));
         assert!(missing(&Permissions { accessibility: false, ..all.clone() }, false));

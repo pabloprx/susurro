@@ -152,7 +152,61 @@ export default function History() {
   );
 }
 
-function Row({ h, query, open, onToggle, onChange, onDelete }: { h: HistoryItem; query: string; open: boolean; onToggle: () => void; onChange: (h: HistoryItem) => void; onDelete: () => void }) {
+type RowProps = { h: HistoryItem; query: string; open: boolean; onToggle: () => void; onChange: (h: HistoryItem) => void; onDelete: () => void };
+
+function Row(p: RowProps) {
+  return p.h.kind === "command" ? <CommandRow {...p} /> : <Dictation {...p} />;
+}
+
+/** A voice command (F2): raw = what you said, final_text = what susurro did, error = why it stopped. No audio actions. */
+function CommandRow({ h, query, open, onToggle, onDelete }: RowProps) {
+  const state = h.status === "done" ? null : h.status === "failed" ? ["failed", "danger-text"] : ["stopped", "dim"];
+  return (
+    <div className={`h-item cmd${open ? " open" : ""}${h.status === "failed" ? " failed" : ""}`}>
+      <button className="h-row" aria-expanded={open} onClick={onToggle}>
+        <span className="meta">
+          {clock(h.created_at)} · {h.app_name ?? "Unknown"}
+        </span>
+        <span className="text ellipsis">
+          <span className="tag">CMD</span>“{highlight(h.raw, query)}”{h.final_text && <span className="dim"> → {highlight(h.final_text.replace(/\n+/g, " "), query)}</span>}
+        </span>
+        {!open && state && <span className={`status ${state[1]}`}>{state[0]}</span>}
+      </button>
+      <div className="expand">
+        <div>
+          {open && (
+            <div className="h-body">
+              {h.error && (
+                <p className="h-error">
+                  <AlertTriangle size={14} strokeWidth={1.5} /> {h.error}
+                </p>
+              )}
+              <dl className="cmd-said selectable">
+                <dt className="label">Said</dt>
+                <dd>{highlight(h.raw, query)}</dd>
+                <dt className="label">Did</dt>
+                <dd>{h.final_text ? highlight(h.final_text, query) : <span className="dim">nothing</span>}</dd>
+              </dl>
+              <div className="h-actions">
+                <span className="small mono">
+                  {secs(h.latency_ms)} · voice control
+                </span>
+                <button className="btn ghost sm" onClick={() => copy(h.raw)}>
+                  <Copy size={14} strokeWidth={1.5} /> Copy command
+                </button>
+                <button className="icon-btn del" aria-label="Delete" data-tip="Delete" onClick={onDelete}>
+                  <Trash2 size={15} strokeWidth={1.5} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Dictation({ h, query, open, onToggle, onChange, onDelete }: RowProps) {
   const [mode, setMode] = useState<Mode>("final");
   const [busy, setBusy] = useState(false);
   const failed = h.status === "failed";

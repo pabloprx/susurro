@@ -1,6 +1,6 @@
 // DESIGN 6.5
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, Eye, EyeOff, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Eye, EyeOff, Search, X } from "lucide-react";
 import { api, on, type KeyName, type ModelInfo, type OrModel, type ProviderTest, type Settings, type SttProvider } from "../lib/api";
 import { ago, keyStore, modelName, saveSettings, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
@@ -43,6 +43,7 @@ export default function Providers() {
   const keys = keyStore.use();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [lastTest, setLastTest] = useState<Partial<Record<SttProvider, ProviderTest>>>({});
+  const [sttModels, setSttModels] = useState<OrModel[]>([]);
   const loadModels = () => api.whisperModels().then(setModels);
   useEffect(() => void loadModels(), []);
   if (!s || !keys) return <Title parts={S.title.providers} />;
@@ -66,6 +67,7 @@ export default function Providers() {
   const enOnly = usesWhisper && s.language !== "en" && /\.en[-.]/.test(s.stt.whisper_model);
   const langName = s.language === "auto" ? "other languages" : (LANGUAGES.find(([v]) => v === s.language)?.[1] ?? s.language);
   const onTest = (r: ProviderTest) => setLastTest((t) => ({ ...t, [p]: r }));
+  const sttPick = sttModels.find((m) => m.id === s.stt.openrouter_model);
 
   return (
     <>
@@ -191,10 +193,10 @@ export default function Providers() {
           <>
             <div className="form-grid">
               <span className="label">Model</span>
-              <OrPicker kind="stt" hasKey={keys!.openrouter} value={s!.stt.openrouter_model} onChange={(v) => save((x) => void (x.stt.openrouter_model = v))} />
+              <SttPicker hasKey={keys!.openrouter} value={s!.stt.openrouter_model} onChange={(v) => save((x) => void (x.stt.openrouter_model = v))} onList={setSttModels} />
             </div>
             <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
-              <span className="small">{S.help.openrouterStt}</span>
+              <span className="small">{sttPick?.keywords ? S.help.keywordsStt(shortName(sttPick.name)) : S.help.openrouterStt}</span>
               <TestButton which="stt" onResult={onTest} disabled={!keys!.openrouter} />
             </div>
           </>
@@ -276,6 +278,134 @@ function OrPicker({ kind, hasKey, value, onChange }: { kind: "stt" | "chat"; has
         </option>
       ))}
     </select>
+  );
+}
+
+/** "Microsoft AI: MAI-Transcribe 2" -> "MAI-Transcribe 2" (the vendor shows in the id on hover). */
+const shortName = (n: string) => n.replace(/^[^:]+:\s*/, "");
+const price = (m: OrModel) => (m.price_hour == null ? "per token" : `$${m.price_hour < 0.1 ? m.price_hour.toFixed(3) : m.price_hour.toFixed(2)}/h`);
+
+/** OpenRouter STT picker (VOICE_CONTROL.md E.4): ranked models first, MAI-Transcribe 2 recommended, price per hour,
+ *  KEYWORDS on models that take the dictionary words. Combobox: type to filter, arrows move, Enter picks, Esc closes. */
+function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value: string; onChange: (v: string) => void; onList: (l: OrModel[]) => void }) {
+  const [list, setList] = useState<OrModel[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [at, setAt] = useState(0);
+  const root = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (hasKey) api.openrouterModels("stt").then((l) => (setList(l), onList(l)), (e) => setErr(String(e)));
+  }, [hasKey]);
+  useEffect(() => {
+    if (!open) return;
+    const down = (e: PointerEvent) => !root.current?.contains(e.target as Node) && setOpen(false);
+    document.addEventListener("pointerdown", down);
+    return () => document.removeEventListener("pointerdown", down);
+  }, [open]);
+  const shown = (list ?? []).filter((m) => !q || `${m.name} ${m.id}`.toLowerCase().includes(q.toLowerCase()));
+  useEffect(() => {
+    listRef.current?.querySelector(`[data-i="${at}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [at, open]);
+  if (!hasKey) return <span className="small">Add an OpenRouter key below to pick a model.</span>;
+  if (err) return <TextField mono value={value} placeholder="microsoft/mai-transcribe-2" onSave={onChange} />;
+  if (!list)
+    return (
+      <span className="inline small">
+        <Spinner /> Loading models…
+      </span>
+    );
+  const cur = list.find((m) => m.id === value);
+  const pick = (m: OrModel | undefined) => {
+    if (!m) return;
+    onChange(m.id);
+    setOpen(false);
+  };
+  const toggle = () => {
+    setQ("");
+    setAt(Math.max(0, list.findIndex((m) => m.id === value)));
+    setOpen(!open);
+  };
+  const keys = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      setAt((i) => Math.min(shown.length - 1, Math.max(0, i + (e.key === "ArrowDown" ? 1 : -1))));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      pick(shown[at]);
+    } else if (e.key === "Escape") {
+      e.stopPropagation();
+      setOpen(false);
+    }
+  };
+  const firstAll = shown.findIndex((m) => m.rank == null);
+  return (
+    <div className="stt-pick" ref={root}>
+      <button className="input stt-trigger" onClick={toggle} aria-haspopup="listbox" aria-expanded={open} aria-label={`Model: ${cur ? shortName(cur.name) : value || "none"}`}>
+        <span className="ellipsis">{cur ? shortName(cur.name) : value || "Pick a model"}</span>
+        {cur?.recommended && <span className="badge-chip rec">RECOMMENDED</span>}
+        <ChevronDown size={14} strokeWidth={1.5} className="chev" />
+      </button>
+      {open && (
+        <div className="popover left stt-pop">
+          <label className="stt-search">
+            <Search size={14} strokeWidth={1.5} />
+            <input
+              autoFocus
+              value={q}
+              placeholder="Search models…"
+              role="combobox"
+              aria-expanded
+              aria-controls="stt-list"
+              aria-activedescendant={shown[at] ? `stt-${at}` : undefined}
+              aria-label="Search models"
+              onChange={(e) => (setQ(e.target.value), setAt(0))}
+              onKeyDown={keys}
+            />
+          </label>
+          <div className="stt-list" id="stt-list" role="listbox" aria-label="Speech to text models" ref={listRef}>
+            {shown.map((m, i) => (
+              <div key={m.id} className="stt-group-wrap">
+                {i === 0 && m.rank != null && (
+                  <div className="stt-group label" role="presentation">
+                    <span>Ranked</span>
+                    <span>OpenRouter top 10</span>
+                  </div>
+                )}
+                {i === firstAll && (
+                  <div className="stt-group label" role="presentation">
+                    <span>All models</span>
+                  </div>
+                )}
+                <div
+                  id={`stt-${i}`}
+                  data-i={i}
+                  role="option"
+                  aria-selected={m.id === value}
+                  className={`stt-opt${i === at ? " at" : ""}`}
+                  onPointerMove={() => setAt(i)}
+                  onClick={() => pick(m)}
+                  title={m.id}
+                >
+                  <span className="rank">{m.rank != null ? String(m.rank).padStart(2, "0") : ""}</span>
+                  <span className="nm ellipsis">
+                    {shortName(m.name)}
+                  </span>
+                  <span className="chips-r">
+                    {m.recommended && <span className="badge-chip rec">RECOMMENDED</span>}
+                    {m.keywords && <span className="badge-chip">KEYWORDS</span>}
+                  </span>
+                  <span className="price">{price(m)}</span>
+                  <span className="sel">{m.id === value && <Check size={13} strokeWidth={2} />}</span>
+                </div>
+              </div>
+            ))}
+            {!shown.length && <p className="small stt-none">No model matches “{q}”.</p>}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

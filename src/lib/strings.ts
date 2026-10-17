@@ -9,6 +9,7 @@ export const S = {
     providers: "Providers",
     audio: "Audio",
     shortcuts: "Shortcuts",
+    voice: "Voice control",
     settings: "Settings",
   },
   title: {
@@ -18,6 +19,7 @@ export const S = {
     providers: ["Where your ", "voice", " goes."],
     audio: ["Your ", "microphone", ", handled."],
     shortcuts: ["Keys, ", "your", " way."],
+    voice: ["Your screen, ", "by voice."],
     settings: ["The ", "quiet", " details."],
   } as Record<string, string[]>,
   empty: {
@@ -34,6 +36,7 @@ export const S = {
     cleanupFails: "If cleanup fails, susurro pastes the raw transcript.",
     localServer: "whisper-server :8080 or speaches :8000. LM Studio has no transcription endpoint.",
     openrouterStt: "OpenRouter ignores the vocabulary prompt. Your words still apply in cleanup and corrections.",
+    keywordsStt: (model: string) => `${model} gets your dictionary words as hints. Only MAI-Transcribe takes them here.`,
     language: "One language is more accurate than auto.",
     toneNeedsLlm: "Tone rewrites need an LLM. Punctuation and casing rules still apply.",
     bluetooth: "Bluetooth lowers mic quality while in use.",

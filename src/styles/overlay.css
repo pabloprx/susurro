@@ -248,7 +248,120 @@ body,
   .wave { transition: opacity 120ms ease; }
 }
 
-/* Browser-only preview: a fake desktop and the 360x96 window outline (mock mode, not in Tauri). */
+/* ---------------- voice control (F2) ---------------- */
+/* Tally only while it listens and when it needs you (pick, confirm). Thinking and acting stay in plain ink. */
+.pill.v-cmd-listening {
+  box-shadow:
+    var(--shadow-pill),
+    0 0 0 1px rgb(255 106 61 / 0.22),
+    0 0 18px -2px rgb(255 106 61 / 0.18);
+}
+.pill.v-cmd-pick {
+  box-shadow: var(--shadow-pill), 0 0 0 1px var(--tally);
+}
+.pill.v-cmd-confirm {
+  box-shadow: var(--shadow-pill), 0 0 0 1px var(--warn);
+}
+.reticle {
+  color: var(--tally);
+  flex: none;
+}
+.reticle.pulse {
+  animation: tally-pulse 1.2s ease-in-out infinite;
+}
+.cmd-tag,
+.cmd-verb,
+.mono-dim,
+.small-dim {
+  font: 10.5px/14px var(--font-mono);
+  letter-spacing: 0.06em;
+  color: var(--pill-dim);
+  flex: none;
+}
+.cmd-verb {
+  color: var(--pill-text);
+}
+.small-dim {
+  font: 11px/14px var(--font-ui);
+  letter-spacing: 0;
+}
+.mono-dim {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.dim-text {
+  color: var(--pill-dim);
+}
+.instr {
+  max-width: 168px;
+}
+.ticks {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+.ticks i {
+  width: 2px;
+  height: 10px;
+  border-radius: 1px;
+  background: rgb(255 255 255 / 0.18);
+}
+.ticks i.on {
+  background: var(--pill-text);
+}
+.ticks i.now {
+  background: var(--pill-text);
+  animation: tally-pulse 1.2s ease-in-out infinite;
+}
+/* the processing motion, in CSS: 5 dots, opacity travels left to right */
+.dots {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
+  margin-left: 2px;
+}
+.dots i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--pill-text);
+  opacity: 0.3;
+  animation: dot-travel 900ms ease-in-out infinite;
+}
+@keyframes dot-travel {
+  30% { opacity: 1; }
+  60% { opacity: 0.3; }
+}
+.pill-kbd {
+  display: inline-flex;
+  gap: 2px;
+  flex: none;
+}
+.pill-kbd kbd {
+  font: 10px/14px var(--font-mono);
+  color: var(--pill-text);
+  background: rgb(255 255 255 / 0.08);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+/* confirm: a hairline that drains along the bottom edge for the 10 s window */
+.drain {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 0;
+  height: 1px;
+  background: var(--warn);
+  transform-origin: left;
+  animation: drain linear both;
+}
+@keyframes drain {
+  to { transform: scaleX(0); }
+}
+
+/* Browser-only preview: a fake desktop and the 360x64 window outline (mock mode, not in Tauri). */
 body.mock-desk {
   background:
     radial-gradient(120% 140% at 15% 0%, #3a3329 0%, transparent 55%),
@@ -259,7 +372,7 @@ body.mock-desk {
 }
 body.mock-desk #root {
   width: 360px;
-  height: 96px;
+  height: 64px;
   outline: 1px dashed rgb(255 255 255 / 0.12);
   outline-offset: 0;
 }

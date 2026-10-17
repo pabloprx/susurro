@@ -77,3 +77,17 @@ export const keyLabel = (binding: string) => {
 
 /** Undo is only valid for ttl_ms in Rust (session.rs UNDO): its toast must not outlive that window. */
 export const hasDeadline = (t: Pick<Toast, "actions">) => t.actions.some((a) => a.id === "undo");
+
+/** Mono caps verb per action (the pill names what it is about to do). */
+export const VERB: Record<string, string> = {
+  click: "CLICK",
+  double_click: "DOUBLE-CLICK",
+  focus_and_type: "TYPE",
+  scroll_up: "SCROLL ↑",
+  scroll_down: "SCROLL ↓",
+  press_key: "KEY",
+  open_app: "OPEN",
+  paste_last: "PASTE",
+  new_tab: "NEW TAB",
+  done: "DONE",
+};

@@ -3,6 +3,7 @@
 //!   openai_compat_server:    SUSURRO_TEST_OAI_BASE=http://127.0.0.1:<port>/v1   (whisper-server)
 //!   elevenlabs_real:         ELEVENLABS_API_KEY
 //!   openrouter_real:         OPENROUTER_API_KEY
+//!   openrouter_mai_phrase_list, jev_set_of_mark: OPENROUTER_API_KEY
 //!   local_llm_down:          none (talks to a closed port and to Ollama if it runs)
 //! Cloud tests make few calls and use short fixtures. A recording proxy sits between the client and the real
 //! server, so the tests check what was sent (prompt, keyterms) and what came back.
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use susurro_lib::contract::{CleanupLevel, ElevenOpts, LlmProvider, Settings, Style};
 use susurro_lib::dictionary::Hints;
-use susurro_lib::stt::{SttRequest, Transcriber, elevenlabs::ElevenLabs, openai_compat::OpenAiCompat, whisper_local};
+use susurro_lib::stt::{SttRequest, Transcriber, elevenlabs::ElevenLabs, openai_compat::OpenAiCompat, openrouter::OpenRouter, whisper_local};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/e2e/fixtures")
@@ -221,7 +222,7 @@ fn whisper_wer() {
 fn openai_compat_server() {
     let base = std::env::var("SUSURRO_TEST_OAI_BASE").expect("set SUSURRO_TEST_OAI_BASE");
     let (pbase, seen) = proxy(&base);
-    let c = OpenAiCompat { base: pbase, model: "whisper-1".into(), key: Some("local-key".into()), hotwords: true, label: "local STT server" };
+    let c = OpenAiCompat { base: pbase, model: "whisper-1".into(), key: Some("local-key".into()), hotwords: true };
     let h = hints();
     let audio = wav("en_custom.wav");
     let t = Instant::now();
@@ -249,7 +250,7 @@ fn openai_compat_server() {
     drop(s);
 
     // Wrong path -> the server's 404 is a clear "rejected" error, not a panic.
-    let bad = OpenAiCompat { base: format!("{}/nope", base.trim_end_matches("/v1")), model: "whisper-1".into(), key: None, hotwords: false, label: "local STT server" };
+    let bad = OpenAiCompat { base: format!("{}/nope", base.trim_end_matches("/v1")), model: "whisper-1".into(), key: None, hotwords: false };
     let e = bad.transcribe(&SttRequest { audio: &audio, language: Some("en"), hints: &Hints::default() }).unwrap_err().to_string();
     println!("wrong path -> {e}");
     assert!(e.contains("local STT server"), "{e}");
@@ -261,7 +262,7 @@ fn openai_compat_server() {
 fn stt_server_down_message() {
     let audio = wav("en_snippet.wav");
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // closed once dropped
-    let down = OpenAiCompat { base: format!("http://127.0.0.1:{port}/v1"), model: "m".into(), key: None, hotwords: false, label: "local STT server" };
+    let down = OpenAiCompat { base: format!("http://127.0.0.1:{port}/v1"), model: "m".into(), key: None, hotwords: false };
     let e = down.transcribe(&SttRequest { audio: &audio, language: Some("en"), hints: &Hints::default() }).unwrap_err().to_string();
     println!("closed port, multipart POST -> {e}");
     assert!(e.contains("Cannot connect to local STT server"), "{e}");
@@ -309,20 +310,14 @@ fn elevenlabs_real() {
 fn openrouter_real() {
     let key = std::env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY");
     let stt_model = std::env::var("SUSURRO_TEST_OR_STT").unwrap_or("openai/whisper-1".into());
+    let or = |model: &str, key: &str| OpenRouter { base: susurro_lib::stt::OPENROUTER_BASE.into(), key: key.into(), model: model.into(), clean: false };
     let chat_model = std::env::var("SUSURRO_TEST_OR_CHAT").unwrap_or("openai/gpt-4o-mini".into());
-    let (base, seen) = proxy(susurro_lib::stt::OPENROUTER_BASE);
     let h = hints();
 
-    let c = OpenAiCompat { base: base.clone(), model: stt_model.clone(), key: Some(key.clone()), hotwords: false, label: "OpenRouter" };
+    let c = or(&stt_model, &key);
     let t = Instant::now();
     let out = c.transcribe(&SttRequest { audio: &wav("en_custom.wav"), language: Some("en"), hints: &h }).unwrap();
     println!("openrouter {stt_model} en_custom: {} ms {:?} WER {:.3}", t.elapsed().as_millis(), out.text, wer("I pushed the Contaflow fix to Supabase, then ran kubectl apply. Ping Pablo Pérez and Francisca Ugarte.", &out.text));
-    {
-        let s = seen.lock().unwrap();
-        assert_eq!(s[0].path, "/api/v1/audio/transcriptions");
-        assert!(s[0].fields("prompt")[0].contains("Contaflow"));
-        assert!(s[0].fields("hotwords").is_empty());
-    }
     assert!(norm(&out.text).contains(&"supabase".to_string()), "{}", out.text);
 
     // Cleanup with a snippet placeholder: the LLM must keep ⟦1⟧ (pipeline::finish rejects the output otherwise).
@@ -350,10 +345,76 @@ fn openrouter_real() {
     let e = susurro_lib::cleanup::cleanup(&s, Some("sk-or-bad"), &CleanupLevel::Light, "hi there", &h).unwrap_err().to_string();
     println!("cleanup bad key -> {e}");
     assert!(e.contains("OpenRouter: invalid or missing API key"), "{e}");
-    let bad = OpenAiCompat { base, model: stt_model, key: Some("sk-or-bad".into()), hotwords: false, label: "OpenRouter" };
+    let bad = or(&stt_model, "sk-or-bad");
     let e = bad.transcribe(&SttRequest { audio: &wav("en_snippet.wav"), language: Some("en"), hints: &Hints::default() }).unwrap_err().to_string();
     println!("stt bad key -> {e}");
     assert!(e.contains("OpenRouter: invalid or missing API key"), "{e}");
+}
+
+/// MAI-Transcribe 2 with and without the phrase list, on en_rare.wav: 4 invented spellings that MAI cannot guess
+/// (2026-10-17 probe, no list: "Quindrix", "Thilmer", "Fiza", "Zorqual"). The run with no list must miss them, and
+/// the run with the list (sent by the real client, with transcribeStyle "clean") must spell all 4. Cost about $0.0003.
+#[test]
+#[ignore]
+fn openrouter_mai_phrase_list() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY");
+    let audio = wav("en_rare.wav");
+    let terms = ["Kwyndrix", "Thaelmor", "Pheyza", "Zorquell"];
+    let mai = |clean| OpenRouter { base: susurro_lib::stt::OPENROUTER_BASE.into(), key: key.clone(), model: "microsoft/mai-transcribe-2".into(), clean };
+    let found = |text: &str| terms.iter().filter(|t| text.contains(*t)).count();
+    let t = Instant::now();
+    let plain = mai(false).transcribe(&SttRequest { audio: &audio, language: Some("en"), hints: &Hints::default() }).unwrap();
+    println!("MAI, no phrase list ({} ms): {:?}", t.elapsed().as_millis(), plain.text);
+    let h = Hints { terms: terms.iter().map(|t| t.to_string()).collect(), ..Default::default() };
+    let t = Instant::now();
+    let biased = mai(true).transcribe(&SttRequest { audio: &audio, language: Some("en"), hints: &h }).unwrap();
+    println!("MAI, phrase list + clean ({} ms): {:?}", t.elapsed().as_millis(), biased.text);
+    assert!(found(&plain.text) <= 1, "MAI spells the rare words with no list: the clip cannot show the gain: {}", plain.text);
+    assert_eq!(found(&biased.text), terms.len(), "the phrase list did not fix the rare words: {}", biased.text);
+}
+
+// ---------- Jev: Set-of-Mark target pick ----------
+
+/// 24 targets on 4 synthetic pages (fixtures/som: marked screenshots, DOM ground truth as a stand-in for the AX
+/// tree, spoken-style tasks; made by .lo/som-experiment/render.mjs). One Choice question per target, criteria =
+/// "name (role, region[, state])" per mark id, as the runner will send. Plan: at least 22/24. 24 calls, about $0.005.
+#[test]
+#[ignore]
+fn jev_set_of_mark() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY");
+    let dir = fixtures().join("som");
+    let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(dir.join(f)).unwrap()).unwrap() };
+    let tasks = read("tasks.json");
+    let (mut hits, mut cost, mut misses) = (0, 0.0, vec![]);
+    for (page, list) in tasks.as_object().unwrap() {
+        let els = read(&format!("{page}.json"));
+        let crit: serde_json::Map<String, Value> = els
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let state = e["state"].as_str().map(|s| format!(", {s}")).unwrap_or_default();
+                (e["id"].to_string(), Value::from(format!("{} ({}, {}{state})", e["name"].as_str().unwrap(), e["role"].as_str().unwrap(), e["region"].as_str().unwrap())))
+            })
+            .collect();
+        let png = std::fs::read(dir.join(format!("{page}-marks.png"))).unwrap();
+        let state = serde_json::json!([
+            format!("Screenshot of a desktop app ({page}), 1440x900. Every clickable element has a magenta outline and a numbered magenta mark at its top-left corner."),
+            susurro_lib::jev::image(&png, "image/png"),
+        ]);
+        for t in list.as_array().unwrap() {
+            let (instr, want) = (t[0].as_str().unwrap(), t[1].to_string());
+            let q = serde_json::json!({ "target": { "type": "choice", "instructions": format!("Which numbered mark is the element a user must click to do this: \"{instr}\""), "criteria": crit } });
+            let r = susurro_lib::jev::ask(susurro_lib::jev::DECISIONS_URL, &key, susurro_lib::contract::JEV_MODEL, &state, &q).unwrap();
+            let c = susurro_lib::jev::choice(&r.answers, "target").expect("a choice");
+            cost += r.cost;
+            let hit = c.choice == want;
+            println!("{page:9} {:5} {:>3} (want {want:>3}) conf {:.2} {:>4} ms  {instr}", if hit { "hit" } else { "MISS" }, c.choice, c.confidence, r.latency_ms);
+            if hit { hits += 1 } else { misses.push(format!("{page}: {instr} -> {} (want {want})", c.choice)) }
+        }
+    }
+    println!("Jev Set-of-Mark: {hits}/24, usage.cost ${cost:.6}");
+    assert!(hits >= 22, "{hits}/24 under the 22/24 bar: {misses:#?}");
 }
 
 // ---------- local LLM: nothing loaded ----------

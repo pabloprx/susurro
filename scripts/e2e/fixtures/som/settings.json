@@ -1,0 +1,363 @@
+[
+ {
+  "name": "Search settings",
+  "role": "text field",
+  "region": "header",
+  "x": 1124,
+  "y": 13.5,
+  "w": 220,
+  "h": 28,
+  "id": 1
+ },
+ {
+  "name": "Help",
+  "role": "button",
+  "region": "header",
+  "x": 1352,
+  "y": 13.5,
+  "w": 28,
+  "h": 28,
+  "id": 2
+ },
+ {
+  "name": "Close settings",
+  "role": "button",
+  "region": "header",
+  "x": 1388,
+  "y": 13.5,
+  "w": 28,
+  "h": 28,
+  "id": 3
+ },
+ {
+  "name": "Account",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 20,
+  "w": 200,
+  "h": 30,
+  "id": 4
+ },
+ {
+  "name": "Preferences",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 52,
+  "w": 200,
+  "h": 30,
+  "id": 5
+ },
+ {
+  "name": "Devices",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 84,
+  "w": 200,
+  "h": 30,
+  "id": 6
+ },
+ {
+  "name": "Billing",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 116,
+  "w": 200,
+  "h": 30,
+  "id": 7
+ },
+ {
+  "name": "Desktop notifications",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "on",
+  "x": 776,
+  "y": 116.5,
+  "w": 30,
+  "h": 18,
+  "id": 8
+ },
+ {
+  "name": "Share usage analytics",
+  "role": "switch",
+  "region": "Privacy section",
+  "state": "off",
+  "x": 1370,
+  "y": 116.5,
+  "w": 30,
+  "h": 18,
+  "id": 9
+ },
+ {
+  "name": "Sound for new messages",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "off",
+  "x": 776,
+  "y": 146.5,
+  "w": 30,
+  "h": 18,
+  "id": 10
+ },
+ {
+  "name": "Read receipts",
+  "role": "switch",
+  "region": "Privacy section",
+  "state": "on",
+  "x": 1370,
+  "y": 146.5,
+  "w": 30,
+  "h": 18,
+  "id": 11
+ },
+ {
+  "name": "Integrations",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 148,
+  "w": 200,
+  "h": 30,
+  "id": 12
+ },
+ {
+  "name": "Badge app icon",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "on",
+  "x": 776,
+  "y": 176.5,
+  "w": 30,
+  "h": 18,
+  "id": 13
+ },
+ {
+  "name": "Show online status",
+  "role": "switch",
+  "region": "Privacy section",
+  "state": "on",
+  "x": 1370,
+  "y": 176.5,
+  "w": 30,
+  "h": 18,
+  "id": 14
+ },
+ {
+  "name": "Security",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 180,
+  "w": 200,
+  "h": 30,
+  "id": 15
+ },
+ {
+  "name": "Email digests",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "off",
+  "x": 776,
+  "y": 206.5,
+  "w": 30,
+  "h": 18,
+  "id": 16
+ },
+ {
+  "name": "Allow contact discovery",
+  "role": "switch",
+  "region": "Privacy section",
+  "state": "off",
+  "x": 1370,
+  "y": 206.5,
+  "w": 30,
+  "h": 18,
+  "id": 17
+ },
+ {
+  "name": "Help",
+  "role": "link",
+  "region": "sidebar",
+  "x": 10,
+  "y": 212,
+  "w": 200,
+  "h": 30,
+  "id": 18
+ },
+ {
+  "name": "Notify on mentions only",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "off",
+  "x": 776,
+  "y": 236.5,
+  "w": 30,
+  "h": 18,
+  "id": 19
+ },
+ {
+  "name": "Personalized ads",
+  "role": "switch",
+  "region": "Privacy section",
+  "state": "off",
+  "x": 1370,
+  "y": 236.5,
+  "w": 30,
+  "h": 18,
+  "id": 20
+ },
+ {
+  "name": "Show message preview",
+  "role": "switch",
+  "region": "Notifications section",
+  "state": "off",
+  "x": 776,
+  "y": 266.5,
+  "w": 30,
+  "h": 18,
+  "id": 21
+ },
+ {
+  "name": "Dark mode",
+  "role": "switch",
+  "region": "Appearance section",
+  "state": "off",
+  "x": 776,
+  "y": 357.5,
+  "w": 30,
+  "h": 18,
+  "id": 22
+ },
+ {
+  "name": "Sync over cellular",
+  "role": "switch",
+  "region": "Sync section",
+  "state": "off",
+  "x": 1370,
+  "y": 357.5,
+  "w": 30,
+  "h": 18,
+  "id": 23
+ },
+ {
+  "name": "Compact layout",
+  "role": "switch",
+  "region": "Appearance section",
+  "state": "off",
+  "x": 776,
+  "y": 387.5,
+  "w": 30,
+  "h": 18,
+  "id": 24
+ },
+ {
+  "name": "Auto-download media",
+  "role": "switch",
+  "region": "Sync section",
+  "state": "off",
+  "x": 1370,
+  "y": 387.5,
+  "w": 30,
+  "h": 18,
+  "id": 25
+ },
+ {
+  "name": "Show avatars",
+  "role": "switch",
+  "region": "Appearance section",
+  "state": "on",
+  "x": 776,
+  "y": 417.5,
+  "w": 30,
+  "h": 18,
+  "id": 26
+ },
+ {
+  "name": "Backup to cloud",
+  "role": "switch",
+  "region": "Sync section",
+  "state": "on",
+  "x": 1370,
+  "y": 417.5,
+  "w": 30,
+  "h": 18,
+  "id": 27
+ },
+ {
+  "name": "Reduce motion",
+  "role": "switch",
+  "region": "Appearance section",
+  "state": "off",
+  "x": 776,
+  "y": 447.5,
+  "w": 30,
+  "h": 18,
+  "id": 28
+ },
+ {
+  "name": "Sync calendar",
+  "role": "switch",
+  "region": "Sync section",
+  "state": "off",
+  "x": 1370,
+  "y": 447.5,
+  "w": 30,
+  "h": 18,
+  "id": 29
+ },
+ {
+  "name": "High contrast",
+  "role": "switch",
+  "region": "Appearance section",
+  "state": "off",
+  "x": 776,
+  "y": 477.5,
+  "w": 30,
+  "h": 18,
+  "id": 30
+ },
+ {
+  "name": "Sync contacts",
+  "role": "switch",
+  "region": "Sync section",
+  "state": "on",
+  "x": 1370,
+  "y": 477.5,
+  "w": 30,
+  "h": 18,
+  "id": 31
+ },
+ {
+  "name": "Reset to defaults",
+  "role": "button",
+  "region": "footer",
+  "x": 1068.609375,
+  "y": 857.5,
+  "w": 135.0625,
+  "h": 30,
+  "id": 32
+ },
+ {
+  "name": "Cancel",
+  "role": "button",
+  "region": "footer",
+  "x": 1213.671875,
+  "y": 857.5,
+  "w": 73.59375,
+  "h": 30,
+  "id": 33
+ },
+ {
+  "name": "Save changes",
+  "role": "button",
+  "region": "footer",
+  "x": 1297.265625,
+  "y": 857.5,
+  "w": 118.734375,
+  "h": 30,
+  "id": 34
+ }
+]

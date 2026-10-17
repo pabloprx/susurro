@@ -1,4 +1,4 @@
-//! WP2: `POST {base}/audio/transcriptions` multipart. whisper-server, speaches and OpenRouter.
+//! WP2: `POST {base}/audio/transcriptions` multipart: whisper-server, speaches. OpenRouter has its own JSON client (openrouter.rs).
 
 use super::{SttOutput, SttRequest, Transcriber, http, send_json, timeout_for, url, wav_bytes};
 use reqwest::blocking::multipart::{Form, Part};
@@ -13,9 +13,9 @@ pub struct OpenAiCompat {
     pub key: Option<String>,
     /// speaches: also send `hotwords`.
     pub hotwords: bool,
-    /// For error messages: "local STT server" | "OpenRouter".
-    pub label: &'static str,
 }
+
+const LABEL: &str = "local STT server";
 
 impl Transcriber for OpenAiCompat {
     fn transcribe(&self, req: &SttRequest) -> anyhow::Result<SttOutput> {
@@ -39,8 +39,8 @@ impl Transcriber for OpenAiCompat {
         if let Some(k) = self.key.as_deref().filter(|k| !k.is_empty()) {
             rb = rb.bearer_auth(k);
         }
-        let v = send_json(rb, self.label)?;
-        let text = v["text"].as_str().ok_or_else(|| anyhow::anyhow!("{}: no text in the response", self.label))?;
+        let v = send_json(rb, LABEL)?;
+        let text = v["text"].as_str().ok_or_else(|| anyhow::anyhow!("{LABEL}: no text in the response"))?;
         Ok(SttOutput { text: text.trim().to_string(), language: v["language"].as_str().map(str::to_string), note: None, fell_back: false })
     }
 }
@@ -52,7 +52,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn client(base: String, key: Option<&str>, hotwords: bool) -> OpenAiCompat {
-        OpenAiCompat { base, model: "whisper-1".into(), key: key.map(Into::into), hotwords, label: "OpenRouter" }
+        OpenAiCompat { base, model: "whisper-1".into(), key: key.map(Into::into), hotwords }
     }
 
     /// Mock that records the request body and returns `body`.
@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_path_key_language_prompt_hotwords() {
+    fn key_language_prompt_hotwords() {
         let mut srv = mockito::Server::new();
         let (m, seen) = capture(&mut srv, "/api/v1/audio/transcriptions", 200, r#"{"text":"Contaflow rocks","usage":{"seconds":1}}"#);
         let m = m.match_header("authorization", "Bearer sk-or");
@@ -116,7 +116,7 @@ mod tests {
         let req = SttRequest { audio: &[0.0; 160], language: None, hints: &Hints::default() };
         let (m, _) = capture(&mut srv, "/v1/audio/transcriptions", 401, r#"{"error":{"message":"No auth"}}"#);
         let e = client(format!("{}/v1", srv.url()), Some("bad"), false).transcribe(&req).unwrap_err().to_string();
-        assert!(e.contains("OpenRouter: invalid or missing API key (HTTP 401)"), "{e}");
+        assert!(e.contains("local STT server: invalid or missing API key (HTTP 401)"), "{e}");
         m.remove();
         let (_m, _) = capture(&mut srv, "/v1/audio/transcriptions", 500, "upstream down");
         let e = client(format!("{}/v1", srv.url()), None, false).transcribe(&req).unwrap_err().to_string();

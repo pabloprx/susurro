@@ -1,8 +1,8 @@
 // Main window shell (DESIGN 6): sidebar + one screen, onboarding over everything when needed.
 import { Component, useEffect, useState, type ComponentType, type ReactNode } from "react";
-import { AudioLines, BookA, Cpu, House, Keyboard, Mic, PenLine, Settings2 } from "lucide-react";
+import { AudioLines, BookA, Cpu, House, Keyboard, Mic, PenLine, ScanLine, Settings2 } from "lucide-react";
 import { on, type SessionState } from "./lib/api";
-import { applyTheme, getTheme, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
+import { applyTheme, getTheme, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore, VOICE_CONTROL } from "./lib/store";
 import { S } from "./lib/strings";
 import { Dot, Meter, Toasts, useLevel } from "./ui";
 import Home from "./screens/Home";
@@ -13,6 +13,7 @@ import Providers from "./screens/Providers";
 import Audio from "./screens/Audio";
 import Shortcuts from "./screens/Shortcuts";
 import Settings from "./screens/Settings";
+import VoiceControl from "./screens/VoiceControl";
 import Onboarding, { allGranted, PERM_STEP, RESUME_KEY } from "./screens/Onboarding";
 import "./styles/tokens.css";
 import "./styles/app.css";
@@ -24,7 +25,7 @@ export type Nav = {
   openOnboarding: (step: number) => void;
 };
 
-const NAV: [Screen, ComponentType<{ size?: number; strokeWidth?: number }>][] = [
+const ALL_NAV: [Screen, ComponentType<{ size?: number; strokeWidth?: number }>][] = [
   ["home", House],
   ["history", AudioLines],
   ["dictionary", BookA],
@@ -32,8 +33,10 @@ const NAV: [Screen, ComponentType<{ size?: number; strokeWidth?: number }>][] = 
   ["providers", Cpu],
   ["audio", Mic],
   ["shortcuts", Keyboard],
+  ["voice", ScanLine],
   ["settings", Settings2],
 ];
+const NAV = ALL_NAV.filter(([id]) => VOICE_CONTROL || id !== "voice");
 const SCREENS: Record<Screen, ComponentType<{ nav: Nav }>> = {
   home: Home,
   history: History,
@@ -42,6 +45,7 @@ const SCREENS: Record<Screen, ComponentType<{ nav: Nav }>> = {
   providers: Providers,
   audio: Audio,
   shortcuts: Shortcuts,
+  voice: VoiceControl,
   settings: Settings,
 };
 const ANNOUNCE: Record<string, string> = {
@@ -81,7 +85,7 @@ export default function App() {
 
   useEffect(() => {
     const offs = [
-      on("navigate", (n) => n.screen in SCREENS && setScreen(n.screen as Screen)),
+      on("navigate", (n) => NAV.some(([id]) => id === n.screen) && setScreen(n.screen as Screen)),
       on("session_state", (s: SessionState) =>
         setAnnounce(
           s.phase === "done" ? (s.message === "copied" ? "Copied to clipboard" : "Pasted") : s.phase === "error" ? `Error: ${s.message ?? ""}` : (ANNOUNCE[s.phase] ?? ""),
@@ -89,7 +93,7 @@ export default function App() {
       ),
     ];
     const key = (e: KeyboardEvent) => {
-      if (e.metaKey && !e.shiftKey && !e.altKey && /^[1-8]$/.test(e.key)) {
+      if (e.metaKey && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
         e.preventDefault();
         setScreen(NAV[+e.key - 1][0]);
       }

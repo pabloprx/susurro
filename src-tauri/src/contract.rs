@@ -36,6 +36,19 @@ pub struct Settings {
     pub overlay: OverlayOpts,
     pub privacy: PrivacyOpts,
     pub autostart: bool,
+    /// Voice control (hold `hotkeys.command`).
+    pub command: CommandSettings,
+}
+
+/// Voice control: hold the command key, say what to do, Jev picks the action and the target.
+#[serde(default)]
+pub struct CommandSettings {
+    /// Off = the command key is not registered.
+    pub enabled: bool,
+    /// Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+    pub confirm_risky: bool,
+    /// Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+    pub model: String,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -50,6 +63,8 @@ pub struct Hotkeys {
     pub paste_last: String,
     /// Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
     pub copy_last: String,
+    /// Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+    pub command: String,
 }
 
 #[serde(default)]
@@ -131,7 +146,7 @@ pub enum SttProvider {
     OpenAiCompat,
     #[serde(rename = "elevenlabs")]
     ElevenLabs,
-    /// The openai_compat client with base https://openrouter.ai/api/v1.
+    /// OpenRouter's JSON transcription API (stt/openrouter.rs): dictionary words go as provider options.
     #[serde(rename = "openrouter")]
     OpenRouter,
 }
@@ -268,8 +283,10 @@ pub struct SessionState {
     pub started_at: Option<i64>,
     pub device: Option<String>,
     pub app: Option<String>,
-    /// Done: the HistoryStatus ("pasted" | "copied"). Error: the error text.
+    /// Done: the HistoryStatus ("pasted" | "copied" | "done"). Error: the error text.
     pub message: Option<String>,
+    /// Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
+    pub command: bool,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -278,6 +295,8 @@ pub enum Phase {
     Recording,
     Locked,
     Processing,
+    /// A voice command runs (command_step events tell the step).
+    Acting,
     Done,
     Error,
 }
@@ -285,6 +304,8 @@ pub enum Phase {
 pub struct HistoryItem {
     pub id: i64,
     pub created_at: i64,
+    /// Command rows: raw = the spoken instruction, final_text = what susurro did, error = why it stopped.
+    pub kind: HistoryKind,
     pub app_bundle: Option<String>,
     pub app_name: Option<String>,
     pub raw: String,
@@ -300,11 +321,19 @@ pub struct HistoryItem {
 }
 
 #[serde(rename_all = "snake_case")]
+pub enum HistoryKind {
+    Dictation,
+    Command,
+}
+
+/// Done: a voice command finished. A command that stopped, was unsure or blocked is Cancelled; Setup/Error is Failed.
+#[serde(rename_all = "snake_case")]
 pub enum HistoryStatus {
     Pasted,
     Copied,
     Cancelled,
     Failed,
+    Done,
 }
 
 pub struct Stats {
@@ -383,6 +412,8 @@ pub struct Permissions {
     pub fn_key_free: Option<bool>,
     /// Input Monitoring is granted, but this process cannot use it until it restarts (relaunch_app).
     pub needs_relaunch: bool,
+    /// Voice control asks for it only when a step needs a screenshot.
+    pub screen_recording: bool,
 }
 
 /// Payload of the `hotkey_status` event: the push-to-talk binding is live, or why not.
@@ -407,6 +438,7 @@ pub enum PermKind {
     Accessibility,
     InputMonitoring,
     FnKey,
+    ScreenRecording,
 }
 
 pub struct ProviderTest {
@@ -419,6 +451,81 @@ pub struct ProviderTest {
 pub struct OrModel {
     pub id: String,
     pub name: String,
+    /// 1-based place in the OpenRouter transcription ranking (hardcoded top 10, stt kind only).
+    pub rank: Option<u32>,
+    /// USD per hour of audio. None = priced per token (or a chat model).
+    pub price_hour: Option<f64>,
+    /// The model gets the dictionary words as provider options (MAI phrase list, ElevenLabs keyterms).
+    pub keywords: bool,
+    /// The default pick (microsoft/mai-transcribe-2).
+    pub recommended: bool,
+}
+
+// ---------- voice control ----------
+
+/// Global points: the CoreGraphics space, origin top-left of the main display, y down.
+#[derive(Copy, Default)]
+pub struct PtRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// One actionable Accessibility element, numbered for the marks window and the Jev choice.
+pub struct Mark {
+    pub id: u32,
+    pub rect: PtRect,
+    pub name: String,
+    /// "button", "text field", "checkbox", ...
+    pub role: String,
+    /// "sidebar" | "toolbar" | "main" | "bottom" | ...
+    pub region: String,
+}
+
+/// marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
+/// confirm = a risky step waits for the command key (Esc stops).
+#[serde(rename_all = "snake_case")]
+pub enum CmdStatus {
+    Thinking,
+    Marks,
+    Aim,
+    Pick,
+    Confirm,
+    Done,
+    Stopped,
+    Unsure,
+    Blocked,
+    Setup,
+    Error,
+}
+
+/// Payload of `command_step` (all windows) and a row of `command_log`.
+#[derive(Default)]
+#[serde(default)]
+pub struct CommandStep {
+    pub instruction: String,
+    /// 1-based; 0 = the fast path (no screen read).
+    pub step: u32,
+    pub max: u32,
+    pub status: CmdStatus,
+    /// click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
+    /// copy_last | new_tab | close_tab | back | forward | reload | done
+    pub action: Option<String>,
+    /// open_app: the app; press_key: the key; focus_and_type: the text.
+    pub detail: Option<String>,
+    /// The display the marks window covers, global points.
+    pub display: PtRect,
+    /// Empty = no marks on screen (the marks window hides).
+    pub marks: Vec<Mark>,
+    /// The chosen mark (aim, confirm).
+    pub target: Option<u32>,
+    /// pick: the top 3 (mark id, confidence).
+    pub choices: Vec<(u32, f32)>,
+    pub latency_ms: u32,
+    pub cost_usd: f64,
+    /// unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
+    pub message: Option<String>,
 }
 
 /// dBFS, throttled to 30 Hz.
@@ -436,7 +543,10 @@ pub struct Navigate {
 // ---------- defaults (PLAN 1.5) ----------
 
 /// v2: the default ptt became F1; a stored "Fn" moves to it once, and the old 350 ms restore delay becomes 500.
-pub const SETTINGS_VERSION: u32 = 2;
+/// v3: voice control (hotkeys.command = "F2"), and an empty OpenRouter STT model becomes MAI-Transcribe 2.
+pub const SETTINGS_VERSION: u32 = 3;
+pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
+pub const JEV_MODEL: &str = "typesafe/jev-1.14";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -456,6 +566,7 @@ impl Default for Settings {
             overlay: OverlayOpts::default(),
             privacy: PrivacyOpts::default(),
             autostart: false,
+            command: CommandSettings::default(),
         }
     }
 }
@@ -469,6 +580,7 @@ impl Default for Hotkeys {
             cancel: "Escape".into(),
             paste_last: "Ctrl+Cmd+V".into(),
             copy_last: "Ctrl+Cmd+C".into(),
+            command: "F2".into(),
         }
     }
 }
@@ -492,7 +604,7 @@ impl Default for SttSettings {
             whisper_model: "ggml-large-v3-turbo-q5_0.bin".into(),
             openai_compat: OpenAiCompat::default(),
             elevenlabs: ElevenOpts::default(),
-            openrouter_model: String::new(),
+            openrouter_model: DEFAULT_OPENROUTER_STT.into(),
             local_fallback: true,
         }
     }
@@ -561,6 +673,18 @@ impl Default for PrivacyOpts {
 
 impl Default for SessionState {
     fn default() -> Self {
-        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None }
+        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None, command: false }
+    }
+}
+
+impl Default for CommandSettings {
+    fn default() -> Self {
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into() }
+    }
+}
+
+impl Default for CmdStatus {
+    fn default() -> Self {
+        Self::Thinking
     }
 }

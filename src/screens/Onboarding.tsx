@@ -29,7 +29,7 @@ export const allGranted = (p: Permissions, s: Settings) => needs(p, s).every(([,
 
 /** macOS has no grant callback: poll every 1 s while `active`, re-check when the window comes back (the user returns
  *  from System Settings), and take a pushed permissions_changed when Rust sends one. */
-function usePermWatch(active: boolean) {
+export function usePermWatch(active: boolean) {
   useEffect(() => {
     if (!active) return;
     const t = setInterval(recheck, 1000);
@@ -184,7 +184,7 @@ function Welcome({ ptt, onNext }: { ptt: string; onNext: () => void }) {
 const PANE: Record<Need, string> = { microphone: "Microphone", accessibility: "Accessibility", input_monitoring: "Input Monitoring" };
 
 /** A picture of the exact row to turn on in System Settings. */
-function Diagram({ pane }: { pane: string }) {
+export function Diagram({ pane }: { pane: string }) {
   return (
     <div className="diagram" aria-label={`In System Settings, Privacy and Security, ${pane}: turn on susurro`}>
       <div className="bar" aria-hidden>

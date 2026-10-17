@@ -3,11 +3,13 @@
 
 pub mod audio;
 pub mod cleanup;
+pub mod command;
 pub mod contract;
 pub mod db;
 pub mod dictionary;
 pub mod history;
 pub mod hotkey;
+pub mod jev;
 pub mod models;
 pub mod paste;
 pub mod permissions;
@@ -112,6 +114,9 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("overlay") {
                 let _ = w.show();
             }
+            // The transparent window area must not take clicks: only the pill does (Pablo's bug, 2026-10-17).
+            #[cfg(target_os = "macos")]
+            platform::macos::spawn_hit_test(h);
             if first_run {
                 show_main(app.handle());
             }
@@ -163,6 +168,8 @@ pub fn run() {
             permissions::request_permission,
             permissions::relaunch_app,
             hotkey::hotkey_capture,
+            platform::macos::set_pill_rect,
+            command::command_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building susurro");

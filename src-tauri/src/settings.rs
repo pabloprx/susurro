@@ -1,6 +1,6 @@
 //! `{app_data_dir}/settings.json`: load with defaults, atomic save, version migration.
 
-use crate::contract::{MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
+use crate::contract::{DEFAULT_OPENROUTER_STT, Hotkeys, JEV_MODEL, MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
 use std::path::Path;
 
 /// Missing file -> defaults. Corrupt file -> renamed to `settings.json.bad` (kept for the user), defaults.
@@ -37,6 +37,17 @@ fn migrate(mut s: Settings) -> Settings {
             s.paste.restore_delay_ms = PasteOpts::default().restore_delay_ms;
         }
     }
+    // v3: voice control. A missing hotkeys.command gets "F2" from serde; an empty OpenRouter STT model
+    // (the old default) becomes MAI-Transcribe 2.
+    // A user who already holds F2 for another action keeps it: the command key starts unbound.
+    if s.version < 3 {
+        if s.stt.openrouter_model.is_empty() {
+            s.stt.openrouter_model = DEFAULT_OPENROUTER_STT.into();
+        }
+        if crate::hotkey::validate(&s.hotkeys).is_err() && crate::hotkey::validate(&Hotkeys { command: String::new(), ..s.hotkeys.clone() }).is_ok() {
+            s.hotkeys.command.clear();
+        }
+    }
     s.version = SETTINGS_VERSION;
     s
 }
@@ -62,6 +73,8 @@ pub fn get_settings(state: tauri::State<'_, crate::AppState>) -> Settings {
 fn merge(cur: &Settings, mut new: Settings) -> Settings {
     new.version = SETTINGS_VERSION;
     new.mic = MicSettings { show_virtual: new.mic.show_virtual, ..cur.mic.clone() };
+    // The Jev model is pinned (never ~latest): the page cannot change it.
+    new.command.model = JEV_MODEL.into();
     new
 }
 
@@ -69,6 +82,15 @@ fn merge(cur: &Settings, mut new: Settings) -> Settings {
 fn whisper_changed(old: &Settings, new: &Settings) -> bool {
     let (o, n) = (&old.stt, &new.stt);
     o.whisper_model != n.whisper_model || o.provider != n.provider || o.local_fallback != n.local_fallback
+}
+
+/// The bindings that are live: voice control off = its key is not registered, so it cannot clash.
+fn active_hotkeys(s: &Settings) -> Hotkeys {
+    let mut h = s.hotkeys.clone();
+    if !s.command.enabled {
+        h.command.clear();
+    }
+    h
 }
 
 /// Validates hotkeys, applies hotkeys and autostart, preloads whisper if it is newly needed, then persists.
@@ -81,7 +103,7 @@ pub fn save_settings(
     use tauri::Manager;
     use tauri_plugin_autostart::ManagerExt;
 
-    crate::hotkey::validate(&settings.hotkeys).map_err(|e| e.join("; "))?;
+    crate::hotkey::validate(&active_hotkeys(&settings)).map_err(|e| e.join("; "))?;
     let old = state.settings.read().unwrap().clone();
     if old.hotkeys != settings.hotkeys {
         if let Some(h) = app.try_state::<crate::hotkey::HotkeyHandle>() {
@@ -221,6 +243,44 @@ mod tests {
         std::fs::write(&p, r#"{"version":1,"paste":{"restore_delay_ms":900}}"#).unwrap();
         assert_eq!(load(&p).paste.restore_delay_ms, 900);
         assert_eq!(Settings::default().hotkeys.ptt, "F1");
+    }
+
+    #[test]
+    fn v2_gets_voice_control_and_the_mai_default() {
+        let p = tmp_dir("v3mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":2,"hotkeys":{"ptt":"F1"},"stt":{"provider":"openrouter","openrouter_model":""}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!(s.hotkeys.command, "F2");
+        assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
+        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into() }, "opt-in, also for migrated users");
+        assert_eq!(s.version, 3);
+        // A picked model is kept; a v3 user may clear it on purpose.
+        std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
+        assert_eq!(load(&p).stt.openrouter_model, "openai/whisper-1");
+        std::fs::write(&p, r#"{"version":3,"stt":{"openrouter_model":""}}"#).unwrap();
+        assert_eq!(load(&p).stt.openrouter_model, "");
+    }
+
+    #[test]
+    fn migration_leaves_f2_to_the_action_that_holds_it() {
+        let p = tmp_dir("v3f2").join("settings.json");
+        for hk in [r#"{"ptt":"F2"}"#, r#"{"cancel":"f2"}"#, r#"{"paste_last":"F2"}"#, r#"{"hands_free":"F2"}"#] {
+            std::fs::write(&p, format!(r#"{{"version":2,"hotkeys":{hk}}}"#)).unwrap();
+            let s = load(&p);
+            assert_eq!(s.hotkeys.command, "", "{hk}");
+            assert_eq!(crate::hotkey::validate(&s.hotkeys), Ok(()), "{hk}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_command_key_does_not_clash_and_the_model_stays_pinned() {
+        let mut s = Settings::default();
+        s.hotkeys.ptt = "F2".into();
+        assert_eq!(crate::hotkey::validate(&active_hotkeys(&s)), Ok(()));
+        s.command.enabled = true;
+        assert!(crate::hotkey::validate(&active_hotkeys(&s)).is_err());
+        s.command.model = "typesafe/jev~latest".into();
+        assert_eq!(merge(&Settings::default(), s).command.model, JEV_MODEL);
     }
 
     #[test]

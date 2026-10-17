@@ -4,7 +4,7 @@
 use crate::AppState;
 use crate::audio::{self, Clip, Recorder};
 use crate::cleanup;
-use crate::contract::{CleanupLevel, HistoryItem, HistoryStatus, Phase, SessionState, SttProvider, Toast, ToastActionDef, ToastKind};
+use crate::contract::{CleanupLevel, HistoryItem, HistoryKind, HistoryStatus, Phase, SessionState, SttProvider, Toast, ToastActionDef, ToastKind};
 use crate::dictionary::{self, Dictionary, Hints};
 use crate::history;
 use crate::paste::{self, AppRef, PasteOutcome};
@@ -255,6 +255,8 @@ struct Actor {
     /// In-memory last result for paste_last (also when store_history is off).
     last_text: Option<String>,
     last_sweep: Option<Instant>,
+    /// The current recording / processing / acting belongs to a voice command.
+    command: bool,
 }
 
 /// Start the actor: std::thread with a recv_timeout(100ms) loop. lib.rs setup already calls this.
@@ -262,7 +264,7 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
     std::thread::Builder::new()
         .name("session".into())
         .spawn(move || {
-            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None };
+            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None, command: false };
             // Busy guard: hotkey input that queued up while the (blocking) pipeline ran is dropped.
             let drain = |a: &mut Actor, rx: &mpsc::Receiver<SessionCmd>| {
                 for c in rx.try_iter().filter(|c| !is_hotkey_input(c)).collect::<Vec<_>>() {
@@ -306,6 +308,7 @@ impl Actor {
             device: self.ctx.as_ref().and_then(|c| c.device.clone()),
             app: self.ctx.as_ref().and_then(|c| c.app.as_ref().and_then(|a| a.name.clone())),
             message,
+            command: self.command,
         };
         *CURRENT.lock().unwrap() = s.clone();
         let _ = self.app.emit("session_state", s);
@@ -516,6 +519,7 @@ impl Actor {
             status,
             has_audio: false,
             error,
+            kind: HistoryKind::Dictation,
         };
         match &run.outcome {
             Outcome::Skip(None) => {
@@ -912,6 +916,7 @@ mod tests {
             status: HistoryStatus::Failed,
             has_audio: false,
             error: Some(e),
+            kind: crate::contract::HistoryKind::Dictation,
         };
         let item = history::insert(&c, &dir, &row, Some(&clip.samples)).unwrap();
         assert_eq!(item.status, HistoryStatus::Failed);

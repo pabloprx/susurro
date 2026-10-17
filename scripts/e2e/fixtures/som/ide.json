@@ -1,0 +1,782 @@
+[
+ {
+  "name": "File",
+  "role": "button",
+  "region": "menu bar",
+  "x": 8,
+  "y": 5.5,
+  "w": 36.953125,
+  "h": 19,
+  "id": 1
+ },
+ {
+  "name": "Edit",
+  "role": "button",
+  "region": "menu bar",
+  "x": 46.953125,
+  "y": 5.5,
+  "w": 38.40625,
+  "h": 19,
+  "id": 2
+ },
+ {
+  "name": "Selection",
+  "role": "button",
+  "region": "menu bar",
+  "x": 87.359375,
+  "y": 5.5,
+  "w": 69.484375,
+  "h": 19,
+  "id": 3
+ },
+ {
+  "name": "View",
+  "role": "button",
+  "region": "menu bar",
+  "x": 158.84375,
+  "y": 5.5,
+  "w": 43.953125,
+  "h": 19,
+  "id": 4
+ },
+ {
+  "name": "Go",
+  "role": "button",
+  "region": "menu bar",
+  "x": 204.796875,
+  "y": 5.5,
+  "w": 33.34375,
+  "h": 19,
+  "id": 5
+ },
+ {
+  "name": "Run",
+  "role": "button",
+  "region": "menu bar",
+  "x": 240.140625,
+  "y": 5.5,
+  "w": 39.859375,
+  "h": 19,
+  "id": 6
+ },
+ {
+  "name": "Terminal",
+  "role": "button",
+  "region": "menu bar",
+  "x": 282,
+  "y": 5.5,
+  "w": 65.125,
+  "h": 19,
+  "id": 7
+ },
+ {
+  "name": "Help",
+  "role": "button",
+  "region": "menu bar",
+  "x": 349.125,
+  "y": 5.5,
+  "w": 42.75,
+  "h": 19,
+  "id": 8
+ },
+ {
+  "name": "Back",
+  "role": "button",
+  "region": "toolbar",
+  "x": 6,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 9
+ },
+ {
+  "name": "Forward",
+  "role": "button",
+  "region": "toolbar",
+  "x": 32,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 10
+ },
+ {
+  "name": "New file",
+  "role": "button",
+  "region": "toolbar",
+  "x": 69,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 11
+ },
+ {
+  "name": "Open folder",
+  "role": "button",
+  "region": "toolbar",
+  "x": 95,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 12
+ },
+ {
+  "name": "Save",
+  "role": "button",
+  "region": "toolbar",
+  "x": 121,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 13
+ },
+ {
+  "name": "Save all",
+  "role": "button",
+  "region": "toolbar",
+  "x": 147,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 14
+ },
+ {
+  "name": "Undo",
+  "role": "button",
+  "region": "toolbar",
+  "x": 184,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 15
+ },
+ {
+  "name": "Redo",
+  "role": "button",
+  "region": "toolbar",
+  "x": 210,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 16
+ },
+ {
+  "name": "Cut",
+  "role": "button",
+  "region": "toolbar",
+  "x": 236,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 17
+ },
+ {
+  "name": "Copy",
+  "role": "button",
+  "region": "toolbar",
+  "x": 262,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 18
+ },
+ {
+  "name": "Paste",
+  "role": "button",
+  "region": "toolbar",
+  "x": 288,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 19
+ },
+ {
+  "name": "Run configuration",
+  "role": "popup button",
+  "region": "toolbar",
+  "x": 329,
+  "y": 35.5,
+  "w": 96,
+  "h": 22,
+  "id": 20
+ },
+ {
+  "name": "Run",
+  "role": "button",
+  "region": "toolbar",
+  "x": 431,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 21
+ },
+ {
+  "name": "Debug",
+  "role": "button",
+  "region": "toolbar",
+  "x": 457,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 22
+ },
+ {
+  "name": "Stop",
+  "role": "button",
+  "region": "toolbar",
+  "x": 483,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 23
+ },
+ {
+  "name": "Restart",
+  "role": "button",
+  "region": "toolbar",
+  "x": 509,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 24
+ },
+ {
+  "name": "Toggle breakpoint",
+  "role": "button",
+  "region": "toolbar",
+  "x": 546,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 25
+ },
+ {
+  "name": "Step over",
+  "role": "button",
+  "region": "toolbar",
+  "x": 572,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 26
+ },
+ {
+  "name": "Step into",
+  "role": "button",
+  "region": "toolbar",
+  "x": 598,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 27
+ },
+ {
+  "name": "Step out",
+  "role": "button",
+  "region": "toolbar",
+  "x": 624,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 28
+ },
+ {
+  "name": "Find",
+  "role": "button",
+  "region": "toolbar",
+  "x": 661,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 29
+ },
+ {
+  "name": "Replace",
+  "role": "button",
+  "region": "toolbar",
+  "x": 687,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 30
+ },
+ {
+  "name": "Format document",
+  "role": "button",
+  "region": "toolbar",
+  "x": 713,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 31
+ },
+ {
+  "name": "Toggle comment",
+  "role": "button",
+  "region": "toolbar",
+  "x": 739,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 32
+ },
+ {
+  "name": "Toggle sidebar",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1358,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 33
+ },
+ {
+  "name": "Toggle panel",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1384,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 34
+ },
+ {
+  "name": "Split editor",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1410,
+  "y": 34.5,
+  "w": 24,
+  "h": 24,
+  "id": 35
+ },
+ {
+  "name": "Explorer",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 72,
+  "w": 32,
+  "h": 32,
+  "id": 36
+ },
+ {
+  "name": "New file in explorer",
+  "role": "button",
+  "region": "explorer",
+  "x": 174,
+  "y": 71,
+  "w": 24,
+  "h": 24,
+  "id": 37
+ },
+ {
+  "name": "New folder",
+  "role": "button",
+  "region": "explorer",
+  "x": 200,
+  "y": 71,
+  "w": 24,
+  "h": 24,
+  "id": 38
+ },
+ {
+  "name": "Refresh explorer",
+  "role": "button",
+  "region": "explorer",
+  "x": 226,
+  "y": 71,
+  "w": 24,
+  "h": 24,
+  "id": 39
+ },
+ {
+  "name": "Collapse folders",
+  "role": "button",
+  "region": "explorer",
+  "x": 252,
+  "y": 71,
+  "w": 24,
+  "h": 24,
+  "id": 40
+ },
+ {
+  "name": "Close hotkey.ts",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 353.078125,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 41
+ },
+ {
+  "name": "Close main.ts",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 443.984375,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 42
+ },
+ {
+  "name": "Close README.md",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 570.28125,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 43
+ },
+ {
+  "name": "Open changes",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 1358,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 44
+ },
+ {
+  "name": "Split editor right",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 1384,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 45
+ },
+ {
+  "name": "More editor actions",
+  "role": "button",
+  "region": "editor tabs",
+  "x": 1410,
+  "y": 68,
+  "w": 24,
+  "h": 24,
+  "id": 46
+ },
+ {
+  "name": "▾ src",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 96,
+  "w": 240,
+  "h": 20,
+  "id": 47
+ },
+ {
+  "name": "Search",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 114,
+  "w": 32,
+  "h": 32,
+  "id": 48
+ },
+ {
+  "name": "audio.ts",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 116,
+  "w": 240,
+  "h": 19,
+  "id": 49
+ },
+ {
+  "name": "hotkey.ts",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 135,
+  "w": 240,
+  "h": 19,
+  "id": 50
+ },
+ {
+  "name": "main.ts",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 154,
+  "w": 240,
+  "h": 19,
+  "id": 51
+ },
+ {
+  "name": "Source control",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 156,
+  "w": 32,
+  "h": 32,
+  "id": 52
+ },
+ {
+  "name": "transcribe.ts",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 173,
+  "w": 240,
+  "h": 19,
+  "id": 53
+ },
+ {
+  "name": "overlay.ts",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 192,
+  "w": 240,
+  "h": 19,
+  "id": 54
+ },
+ {
+  "name": "Run and debug",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 198,
+  "w": 32,
+  "h": 32,
+  "id": 55
+ },
+ {
+  "name": "▸ tests",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 211,
+  "w": 240,
+  "h": 20,
+  "id": 56
+ },
+ {
+  "name": "package.json",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 231,
+  "w": 240,
+  "h": 19,
+  "id": 57
+ },
+ {
+  "name": "Extensions",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 240,
+  "w": 32,
+  "h": 32,
+  "id": 58
+ },
+ {
+  "name": "README.md",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 250,
+  "w": 240,
+  "h": 19,
+  "id": 59
+ },
+ {
+  "name": "tsconfig.json",
+  "role": "link",
+  "region": "explorer",
+  "x": 44,
+  "y": 269,
+  "w": 240,
+  "h": 19,
+  "id": 60
+ },
+ {
+  "name": "New terminal",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 1304,
+  "y": 682,
+  "w": 24,
+  "h": 24,
+  "id": 61
+ },
+ {
+  "name": "Split terminal",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 1330,
+  "y": 682,
+  "w": 24,
+  "h": 24,
+  "id": 62
+ },
+ {
+  "name": "Kill terminal",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 1356,
+  "y": 682,
+  "w": 24,
+  "h": 24,
+  "id": 63
+ },
+ {
+  "name": "Maximize panel",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 1382,
+  "y": 682,
+  "w": 24,
+  "h": 24,
+  "id": 64
+ },
+ {
+  "name": "Close panel",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 1408,
+  "y": 682,
+  "w": 24,
+  "h": 24,
+  "id": 65
+ },
+ {
+  "name": "Problems",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 292,
+  "y": 685.5,
+  "w": 77.140625,
+  "h": 17,
+  "id": 66
+ },
+ {
+  "name": "Output",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 373.140625,
+  "y": 685.5,
+  "w": 61.234375,
+  "h": 17,
+  "id": 67
+ },
+ {
+  "name": "Debug console",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 438.375,
+  "y": 685.5,
+  "w": 111.96875,
+  "h": 17,
+  "id": 68
+ },
+ {
+  "name": "Terminal",
+  "role": "button",
+  "region": "bottom panel",
+  "x": 554.34375,
+  "y": 685,
+  "w": 71.625,
+  "h": 18,
+  "id": 69
+ },
+ {
+  "name": "Accounts",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 796,
+  "w": 32,
+  "h": 32,
+  "id": 70
+ },
+ {
+  "name": "Manage",
+  "role": "button",
+  "region": "activity bar",
+  "x": 6,
+  "y": 838,
+  "w": 32,
+  "h": 32,
+  "id": 71
+ },
+ {
+  "name": "Branch main",
+  "role": "button",
+  "region": "status bar",
+  "x": 6,
+  "y": 881.5,
+  "w": 48.40625,
+  "h": 15,
+  "id": 72
+ },
+ {
+  "name": "Sync changes",
+  "role": "button",
+  "region": "status bar",
+  "x": 58.40625,
+  "y": 881.5,
+  "w": 52.171875,
+  "h": 15,
+  "id": 73
+ },
+ {
+  "name": "Problems: 1 error 3 warnings",
+  "role": "button",
+  "region": "status bar",
+  "x": 114.578125,
+  "y": 881.5,
+  "w": 55.171875,
+  "h": 15,
+  "id": 74
+ },
+ {
+  "name": "Go to line",
+  "role": "button",
+  "region": "status bar",
+  "x": 1203.578125,
+  "y": 882,
+  "w": 76.71875,
+  "h": 14,
+  "id": 75
+ },
+ {
+  "name": "Select encoding",
+  "role": "button",
+  "region": "status bar",
+  "x": 1284.296875,
+  "y": 882,
+  "w": 46,
+  "h": 14,
+  "id": 76
+ },
+ {
+  "name": "Select language mode",
+  "role": "button",
+  "region": "status bar",
+  "x": 1334.296875,
+  "y": 882,
+  "w": 68.703125,
+  "h": 14,
+  "id": 77
+ },
+ {
+  "name": "Notifications",
+  "role": "button",
+  "region": "status bar",
+  "x": 1407,
+  "y": 879,
+  "w": 27,
+  "h": 20,
+  "id": 78
+ }
+]

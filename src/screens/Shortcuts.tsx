@@ -2,14 +2,14 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { api, type Hotkeys } from "../lib/api";
-import { isModOnly, keyLabel, keysOf, permStore, saveSettings, settingsStore } from "../lib/store";
+import { isModOnly, keyLabel, keysOf, permStore, saveSettings, settingsStore, VOICE_CONTROL } from "../lib/store";
 import { S } from "../lib/strings";
 import { Kbd, Label, Title, Toggle } from "../ui";
 import type { Nav } from "../App";
 
-export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last";
-const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last" };
-const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C" };
+export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last" | "command";
+const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last", command: "Voice control" };
+export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
   ptt: ["F1", "RightOption", "RightCommand"],
@@ -17,6 +17,7 @@ export const PICKS: Record<Slot, string[]> = {
   cancel: ["Escape", "Ctrl+."],
   paste_last: ["Ctrl+Cmd+V", "Alt+Shift+V"],
   copy_last: ["Ctrl+Cmd+C", "Alt+Shift+C"],
+  command: ["F2", "F3", "Ctrl+Alt+Space"],
 };
 const MODS: Record<string, string> = { Control: "Ctrl", Alt: "Alt", Meta: "Cmd", Shift: "Shift" };
 /** KeyboardEvent.code of a modifier -> its modifier-only binding (the contract names in format.ts MOD_ONLY). */
@@ -43,7 +44,7 @@ function keyName(e: KeyboardEvent): string | null {
 
 /** PLAN 4.1 rules. Returns the message to show, or null if the binding is fine. */
 export function validate(binding: string, slot: Slot, hk: Hotkeys, codes: Set<string>): string | null {
-  for (const s of Object.keys(NAMES) as Slot[]) if (s !== slot && hk[s] === binding) return `Already used by ${NAMES[s]}`;
+  for (const s of Object.keys(NAMES) as Slot[]) if (s !== slot && hk[s] === binding && (VOICE_CONTROL || s !== "command")) return `Already used by ${NAMES[s]}`;
   if (isModOnly(binding)) return slot === "ptt" ? null : "Add a key: only push to talk works with one key alone";
   const parts = binding.split("+");
   const key = parts[parts.length - 1];

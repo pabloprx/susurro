@@ -29,7 +29,7 @@
         "title": "susurro overlay",
         "url": "/overlay",
         "width": 360,
-        "height": 96,
+        "height": 64,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -38,6 +38,23 @@
         "focusable": false,
         "alwaysOnTop": true,
         "acceptFirstMouse": true,
+        "skipTaskbar": true,
+        "backgroundThrottling": "disabled",
+        "visible": false
+      },
+      {
+        "label": "marks",
+        "title": "susurro marks",
+        "url": "/marks",
+        "width": 800,
+        "height": 600,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": false,
+        "alwaysOnTop": true,
         "skipTaskbar": true,
         "backgroundThrottling": "disabled",
         "visible": false
@@ -55,7 +72,9 @@
       "signingIdentity": "17E64E8AB144CBEFC799BDB0F306A58DBE09605B",
       "hardenedRuntime": false
     },
-    "resources": ["resources/jfk.wav"],
+    "resources": [
+      "resources/jfk.wav"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

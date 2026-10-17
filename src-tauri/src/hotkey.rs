@@ -214,6 +214,7 @@ pub fn validate(b: &Hotkeys) -> Result<(), Vec<String>> {
         ("Cancel", Some(b.cancel.as_str())),
         ("Paste last", Some(b.paste_last.as_str())),
         ("Copy last", Some(b.copy_last.as_str())),
+        ("Voice control", Some(b.command.trim()).filter(|s| !s.is_empty())),
     ];
     let mut errs = vec![];
     let mut seen: Vec<(String, &str)> = vec![];
@@ -662,6 +663,7 @@ mod tests {
             cancel: cancel.into(),
             paste_last: paste.into(),
             copy_last: "Ctrl+Cmd+C".into(),
+            command: "F2".into(),
         }
     }
 

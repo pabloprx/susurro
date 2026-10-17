@@ -1,0 +1,432 @@
+[
+ {
+  "name": "Huddle",
+  "role": "button",
+  "region": "channel header",
+  "x": 1252,
+  "y": 10.5,
+  "w": 28,
+  "h": 28,
+  "id": 1
+ },
+ {
+  "name": "Members",
+  "role": "button",
+  "region": "channel header",
+  "x": 1288,
+  "y": 10.5,
+  "w": 28,
+  "h": 28,
+  "id": 2
+ },
+ {
+  "name": "Pinned",
+  "role": "button",
+  "region": "channel header",
+  "x": 1324,
+  "y": 10.5,
+  "w": 28,
+  "h": 28,
+  "id": 3
+ },
+ {
+  "name": "Search in channel",
+  "role": "button",
+  "region": "channel header",
+  "x": 1360,
+  "y": 10.5,
+  "w": 28,
+  "h": 28,
+  "id": 4
+ },
+ {
+  "name": "Channel details",
+  "role": "button",
+  "region": "channel header",
+  "x": 1396,
+  "y": 10.5,
+  "w": 28,
+  "h": 28,
+  "id": 5
+ },
+ {
+  "name": "Acme workspace",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 14,
+  "y": 12,
+  "w": 36,
+  "h": 36,
+  "id": 6
+ },
+ {
+  "name": "New message",
+  "role": "button",
+  "region": "sidebar",
+  "x": 280,
+  "y": 16,
+  "w": 28,
+  "h": 28,
+  "id": 7
+ },
+ {
+  "name": "Home",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 18,
+  "y": 58,
+  "w": 28,
+  "h": 28,
+  "id": 8
+ },
+ {
+  "name": "🧵 Threads",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 58,
+  "w": 260,
+  "h": 33,
+  "id": 9
+ },
+ {
+  "name": "@ Mentions",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 91,
+  "w": 260,
+  "h": 25,
+  "id": 10
+ },
+ {
+  "name": "DMs",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 18,
+  "y": 96,
+  "w": 28,
+  "h": 28,
+  "id": 11
+ },
+ {
+  "name": "🔖 Saved items",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 116,
+  "w": 260,
+  "h": 33,
+  "id": 12
+ },
+ {
+  "name": "Activity",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 18,
+  "y": 134,
+  "w": 28,
+  "h": 28,
+  "id": 13
+ },
+ {
+  "name": "Add reaction",
+  "role": "button",
+  "region": "messages",
+  "x": 1307,
+  "y": 141,
+  "w": 28,
+  "h": 28,
+  "id": 14
+ },
+ {
+  "name": "Reply in thread",
+  "role": "button",
+  "region": "messages",
+  "x": 1335,
+  "y": 141,
+  "w": 28,
+  "h": 28,
+  "id": 15
+ },
+ {
+  "name": "Forward message",
+  "role": "button",
+  "region": "messages",
+  "x": 1363,
+  "y": 141,
+  "w": 28,
+  "h": 28,
+  "id": 16
+ },
+ {
+  "name": "More actions",
+  "role": "button",
+  "region": "messages",
+  "x": 1391,
+  "y": 141,
+  "w": 28,
+  "h": 28,
+  "id": 17
+ },
+ {
+  "name": "# general",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 181,
+  "w": 260,
+  "h": 25,
+  "id": 18
+ },
+ {
+  "name": "# engineering",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 206,
+  "w": 260,
+  "h": 25,
+  "id": 19
+ },
+ {
+  "name": "# design",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 231,
+  "w": 260,
+  "h": 25,
+  "id": 20
+ },
+ {
+  "name": "2 replies",
+  "role": "link",
+  "region": "messages",
+  "x": 390,
+  "y": 230,
+  "w": 45.359375,
+  "h": 14,
+  "id": 21
+ },
+ {
+  "name": "# random",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 256,
+  "w": 260,
+  "h": 25,
+  "id": 22
+ },
+ {
+  "name": "# releases",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 281,
+  "w": 260,
+  "h": 25,
+  "id": 23
+ },
+ {
+  "name": "+ Add channels",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 306,
+  "w": 260,
+  "h": 25,
+  "id": 24
+ },
+ {
+  "name": "● Maria Lopez",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 363,
+  "w": 260,
+  "h": 25,
+  "id": 25
+ },
+ {
+  "name": "● Tom Becker",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 388,
+  "w": 260,
+  "h": 25,
+  "id": 26
+ },
+ {
+  "name": "○ Ana Silva",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 413,
+  "w": 260,
+  "h": 25,
+  "id": 27
+ },
+ {
+  "name": "○ Tom Hanks (bot)",
+  "role": "link",
+  "region": "sidebar",
+  "x": 64,
+  "y": 438,
+  "w": 260,
+  "h": 25,
+  "id": 28
+ },
+ {
+  "name": "Bold",
+  "role": "button",
+  "region": "composer",
+  "x": 347,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 29
+ },
+ {
+  "name": "Italic",
+  "role": "button",
+  "region": "composer",
+  "x": 377,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 30
+ },
+ {
+  "name": "Strikethrough",
+  "role": "button",
+  "region": "composer",
+  "x": 407,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 31
+ },
+ {
+  "name": "Link",
+  "role": "button",
+  "region": "composer",
+  "x": 437,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 32
+ },
+ {
+  "name": "Bulleted list",
+  "role": "button",
+  "region": "composer",
+  "x": 467,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 33
+ },
+ {
+  "name": "Code block",
+  "role": "button",
+  "region": "composer",
+  "x": 497,
+  "y": 793,
+  "w": 28,
+  "h": 28,
+  "id": 34
+ },
+ {
+  "name": "Add workspace",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 18,
+  "y": 820,
+  "w": 28,
+  "h": 28,
+  "id": 35
+ },
+ {
+  "name": "Message #engineering",
+  "role": "text field",
+  "region": "composer",
+  "x": 341,
+  "y": 825,
+  "w": 1082,
+  "h": 31,
+  "id": 36
+ },
+ {
+  "name": "Attach file",
+  "role": "button",
+  "region": "composer",
+  "x": 347,
+  "y": 851,
+  "w": 28,
+  "h": 28,
+  "id": 37
+ },
+ {
+  "name": "Emoji",
+  "role": "button",
+  "region": "composer",
+  "x": 377,
+  "y": 851,
+  "w": 28,
+  "h": 28,
+  "id": 38
+ },
+ {
+  "name": "Mention someone",
+  "role": "button",
+  "region": "composer",
+  "x": 407,
+  "y": 851,
+  "w": 28,
+  "h": 28,
+  "id": 39
+ },
+ {
+  "name": "Record audio clip",
+  "role": "button",
+  "region": "composer",
+  "x": 437,
+  "y": 851,
+  "w": 28,
+  "h": 28,
+  "id": 40
+ },
+ {
+  "name": "Send now",
+  "role": "button",
+  "region": "composer",
+  "x": 1353,
+  "y": 851,
+  "w": 34,
+  "h": 28,
+  "id": 41
+ },
+ {
+  "name": "Schedule message",
+  "role": "button",
+  "region": "composer",
+  "x": 1389,
+  "y": 851,
+  "w": 28,
+  "h": 28,
+  "id": 42
+ },
+ {
+  "name": "Preferences",
+  "role": "button",
+  "region": "workspace bar",
+  "x": 18,
+  "y": 858,
+  "w": 28,
+  "h": 28,
+  "id": 43
+ }
+]

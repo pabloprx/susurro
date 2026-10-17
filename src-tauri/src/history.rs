@@ -2,7 +2,7 @@
 //! `created_at` is unix ms. WAVs live in `{data_dir}/audio/{id}.wav`; the `audio` column holds the file name.
 
 use crate::AppState;
-use crate::contract::{DayStat, HistoryItem, HistoryStatus, Stats};
+use crate::contract::{DayStat, HistoryItem, HistoryKind, HistoryStatus, Stats};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
@@ -21,6 +21,7 @@ fn status_str(s: &HistoryStatus) -> &'static str {
         HistoryStatus::Copied => "copied",
         HistoryStatus::Cancelled => "cancelled",
         HistoryStatus::Failed => "failed",
+        HistoryStatus::Done => "done",
     }
 }
 
@@ -29,6 +30,7 @@ fn status_of(s: &str) -> HistoryStatus {
         "pasted" => HistoryStatus::Pasted,
         "copied" => HistoryStatus::Copied,
         "cancelled" => HistoryStatus::Cancelled,
+        "done" => HistoryStatus::Done,
         _ => HistoryStatus::Failed,
     }
 }
@@ -37,7 +39,7 @@ pub fn audio_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("audio")
 }
 
-const COLS: &str = "id, created_at, app_bundle, app_name, raw, final_text, provider, cleanup, duration_ms, words, latency_ms, status, audio, error";
+const COLS: &str = "id, created_at, app_bundle, app_name, raw, final_text, provider, cleanup, duration_ms, words, latency_ms, status, audio, error, kind";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<HistoryItem> {
     Ok(HistoryItem {
@@ -55,6 +57,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<HistoryItem> {
         status: status_of(&r.get::<_, String>(11)?),
         has_audio: r.get::<_, Option<String>>(12)?.is_some(),
         error: r.get(13)?,
+        kind: if r.get::<_, String>(14)? == "command" { HistoryKind::Command } else { HistoryKind::Dictation },
     })
 }
 
@@ -65,9 +68,10 @@ pub fn words(t: &str) -> u32 {
 /// Inserts `h` (its id and has_audio are ignored). With `wav` set, writes `{id}.wav` and links it.
 pub fn insert(conn: &Connection, data_dir: &Path, h: &HistoryItem, wav: Option<&[f32]>) -> anyhow::Result<HistoryItem> {
     conn.execute(
-        "INSERT INTO history(created_at, app_bundle, app_name, raw, final_text, provider, cleanup, duration_ms, words, latency_ms, status, error)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![h.created_at, h.app_bundle, h.app_name, h.raw, h.final_text, h.provider, h.cleanup, h.duration_ms, h.words, h.latency_ms, status_str(&h.status), h.error],
+        "INSERT INTO history(created_at, app_bundle, app_name, raw, final_text, provider, cleanup, duration_ms, words, latency_ms, status, error, kind)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![h.created_at, h.app_bundle, h.app_name, h.raw, h.final_text, h.provider, h.cleanup, h.duration_ms, h.words, h.latency_ms, status_str(&h.status), h.error,
+            if h.kind == HistoryKind::Command { "command" } else { "dictation" }],
     )?;
     let id = conn.last_insert_rowid();
     if let Some(samples) = wav {
@@ -199,6 +203,7 @@ pub fn retry(app: &AppHandle, id: i64) -> anyhow::Result<HistoryItem> {
     let (item, path) = {
         let db = state.db.lock().unwrap();
         let item = get(&db, id)?.ok_or_else(|| anyhow::anyhow!("No history item {id}"))?;
+        anyhow::ensure!(item.kind == HistoryKind::Dictation, "A voice command has no audio to retry");
         (item, audio_file(&db, &state.data_dir, id)?)
     };
     let path = path.filter(|p| p.exists()).ok_or_else(|| anyhow::anyhow!("The audio of this dictation has expired"))?;
@@ -300,6 +305,7 @@ mod tests {
             status,
             has_audio: false,
             error: None,
+            kind: HistoryKind::Dictation,
         }
     }
 

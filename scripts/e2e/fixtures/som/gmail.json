@@ -1,0 +1,482 @@
+[
+ {
+  "name": "Main menu",
+  "role": "button",
+  "region": "header",
+  "x": 12,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 1
+ },
+ {
+  "name": "Search mail",
+  "role": "button",
+  "region": "header",
+  "x": 224,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 2
+ },
+ {
+  "name": "Show search options",
+  "role": "button",
+  "region": "header",
+  "x": 900,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 3
+ },
+ {
+  "name": "Support",
+  "role": "button",
+  "region": "header",
+  "x": 1294,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 4
+ },
+ {
+  "name": "Settings",
+  "role": "button",
+  "region": "header",
+  "x": 1328,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 5
+ },
+ {
+  "name": "Google apps",
+  "role": "button",
+  "region": "header",
+  "x": 1362,
+  "y": 18,
+  "w": 28,
+  "h": 28,
+  "id": 6
+ },
+ {
+  "name": "Google Account: Pablo",
+  "role": "button",
+  "region": "header",
+  "x": 1396,
+  "y": 16,
+  "w": 32,
+  "h": 32,
+  "id": 7
+ },
+ {
+  "name": "Search mail input",
+  "role": "text field",
+  "region": "header",
+  "x": 258,
+  "y": 23,
+  "w": 636,
+  "h": 18,
+  "id": 8
+ },
+ {
+  "name": "Refresh",
+  "role": "button",
+  "region": "toolbar",
+  "x": 302,
+  "y": 73.5,
+  "w": 28,
+  "h": 28,
+  "id": 9
+ },
+ {
+  "name": "More",
+  "role": "button",
+  "region": "toolbar",
+  "x": 334,
+  "y": 73.5,
+  "w": 28,
+  "h": 28,
+  "id": 10
+ },
+ {
+  "name": "Newer",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1280,
+  "y": 73.5,
+  "w": 28,
+  "h": 28,
+  "id": 11
+ },
+ {
+  "name": "Older",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1312,
+  "y": 73.5,
+  "w": 28,
+  "h": 28,
+  "id": 12
+ },
+ {
+  "name": "Input tools",
+  "role": "button",
+  "region": "toolbar",
+  "x": 1344,
+  "y": 73.5,
+  "w": 28,
+  "h": 28,
+  "id": 13
+ },
+ {
+  "name": "Compose",
+  "role": "button",
+  "region": "sidebar",
+  "x": 8,
+  "y": 80,
+  "w": 140,
+  "h": 56,
+  "id": 14
+ },
+ {
+  "name": "Select all",
+  "role": "checkbox",
+  "region": "toolbar",
+  "x": 274,
+  "y": 78.5,
+  "w": 18,
+  "h": 18,
+  "id": 15
+ },
+ {
+  "name": "Calendar",
+  "role": "button",
+  "region": "side panel",
+  "x": 1398,
+  "y": 76,
+  "w": 28,
+  "h": 28,
+  "id": 16
+ },
+ {
+  "name": "📥 Primary",
+  "role": "button",
+  "region": "main",
+  "x": 256,
+  "y": 112,
+  "w": 250,
+  "h": 52,
+  "id": 17
+ },
+ {
+  "name": "🏷 Promotions",
+  "role": "button",
+  "region": "main",
+  "x": 506,
+  "y": 112,
+  "w": 250,
+  "h": 52,
+  "id": 18
+ },
+ {
+  "name": "👥 Social",
+  "role": "button",
+  "region": "main",
+  "x": 756,
+  "y": 112,
+  "w": 250,
+  "h": 52,
+  "id": 19
+ },
+ {
+  "name": "ⓘ Updates",
+  "role": "button",
+  "region": "main",
+  "x": 1006,
+  "y": 112,
+  "w": 250,
+  "h": 52,
+  "id": 20
+ },
+ {
+  "name": "Keep",
+  "role": "button",
+  "region": "side panel",
+  "x": 1398,
+  "y": 118,
+  "w": 28,
+  "h": 28,
+  "id": 21
+ },
+ {
+  "name": "📥 Inbox1,204",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 152,
+  "w": 244,
+  "h": 32,
+  "id": 22
+ },
+ {
+  "name": "Tasks",
+  "role": "button",
+  "region": "side panel",
+  "x": 1398,
+  "y": 160,
+  "w": 28,
+  "h": 28,
+  "id": 23
+ },
+ {
+  "name": "Star: Invoice #4821",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 170.5,
+  "w": 28,
+  "h": 28,
+  "id": 24
+ },
+ {
+  "name": "Select: Invoice #4821",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 175.5,
+  "w": 18,
+  "h": 18,
+  "id": 25
+ },
+ {
+  "name": "☆ Starred",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 184,
+  "w": 244,
+  "h": 32,
+  "id": 26
+ },
+ {
+  "name": "Contacts",
+  "role": "button",
+  "region": "side panel",
+  "x": 1398,
+  "y": 202,
+  "w": 28,
+  "h": 28,
+  "id": 27
+ },
+ {
+  "name": "Star: Flight to Lima",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 210.5,
+  "w": 28,
+  "h": 28,
+  "id": 28
+ },
+ {
+  "name": "🕒 Snoozed",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 216,
+  "w": 244,
+  "h": 32,
+  "id": 29
+ },
+ {
+  "name": "Select: Flight to Lima",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 215.5,
+  "w": 18,
+  "h": 18,
+  "id": 30
+ },
+ {
+  "name": "➤ Sent",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 248,
+  "w": 244,
+  "h": 32,
+  "id": 31
+ },
+ {
+  "name": "Star: Weekly sync notes",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 250.5,
+  "w": 28,
+  "h": 28,
+  "id": 32
+ },
+ {
+  "name": "Get add-ons",
+  "role": "button",
+  "region": "side panel",
+  "x": 1398,
+  "y": 244,
+  "w": 28,
+  "h": 28,
+  "id": 33
+ },
+ {
+  "name": "Select: Weekly sync notes",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 255.5,
+  "w": 18,
+  "h": 18,
+  "id": 34
+ },
+ {
+  "name": "📄 Drafts7",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 280,
+  "w": 244,
+  "h": 32,
+  "id": 35
+ },
+ {
+  "name": "Star: Your receipt from Apple",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 290.5,
+  "w": 28,
+  "h": 28,
+  "id": 36
+ },
+ {
+  "name": "Select: Your receipt from Apple",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 295.5,
+  "w": 18,
+  "h": 18,
+  "id": 37
+ },
+ {
+  "name": "⌄ More",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 312,
+  "w": 244,
+  "h": 32,
+  "id": 38
+ },
+ {
+  "name": "Star: PR review requested",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 330.5,
+  "w": 28,
+  "h": 28,
+  "id": 39
+ },
+ {
+  "name": "Select: PR review requested",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 335.5,
+  "w": 18,
+  "h": 18,
+  "id": 40
+ },
+ {
+  "name": "Create new label",
+  "role": "button",
+  "region": "sidebar",
+  "x": 202,
+  "y": 360,
+  "w": 28,
+  "h": 28,
+  "id": 41
+ },
+ {
+  "name": "Star: Invoice #4790",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 370.5,
+  "w": 28,
+  "h": 28,
+  "id": 42
+ },
+ {
+  "name": "Select: Invoice #4790",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 375.5,
+  "w": 18,
+  "h": 18,
+  "id": 43
+ },
+ {
+  "name": "🏷 Invoices",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 394,
+  "w": 244,
+  "h": 32,
+  "id": 44
+ },
+ {
+  "name": "Star: Dinner Saturday?",
+  "role": "button",
+  "region": "main",
+  "x": 298,
+  "y": 410.5,
+  "w": 28,
+  "h": 28,
+  "id": 45
+ },
+ {
+  "name": "Select: Dinner Saturday?",
+  "role": "checkbox",
+  "region": "main",
+  "x": 270,
+  "y": 415.5,
+  "w": 18,
+  "h": 18,
+  "id": 46
+ },
+ {
+  "name": "🏷 Travel2",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 426,
+  "w": 244,
+  "h": 32,
+  "id": 47
+ },
+ {
+  "name": "🏷 Receipts",
+  "role": "link",
+  "region": "sidebar",
+  "x": 0,
+  "y": 458,
+  "w": 244,
+  "h": 32,
+  "id": 48
+ }
+]

@@ -1,0 +1,6 @@
+{
+ "slack": [["Send the message", 41], ["Open the second channel", 19], ["Click the gear icon at the bottom", 43], ["Reply in thread to Tom's message", 15], ["Make the text bold", 29], ["Open my DM with Ana", 27]],
+ "gmail": [["Compose a new email", 14], ["Star the Apple receipt email", 36], ["Click the gear icon", 5], ["Go to the next page of emails", 12], ["Select the email from GitHub", 40], ["Open the Promotions tab", 18]],
+ "settings": [["Turn on dark mode", 22], ["Turn off read receipts", 11], ["Save changes", 34], ["Disable personalized ads", 20], ["Toggle syncing over cellular data", 23], ["Click the third toggle in the Appearance section", 26]],
+ "ide": [["Run the app", 21], ["Set a breakpoint", 25], ["Close the README tab", 43], ["Open a new terminal", 61], ["Open package.json", 57], ["Click the gear icon at the bottom left", 71]]
+}

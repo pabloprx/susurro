@@ -1,13 +1,15 @@
 // Browser-only fake backend (no Tauri). Covers every screen and state with realistic data and simulated events:
 // audio_level streams, device hot-plug, pipeline phases, model download progress, permission grants.
-// URL flags: ?onboarding (fresh install, onboarding flow), ?empty (fresh install, empty states),
+// URL flags: ?onboarding (fresh install, onboarding flow), ?empty (fresh install, empty states), ?needscreen (the last
+// voice command needed Screen Recording), /marks?state=marks|aim|pick|confirm (voice-control marks window),
+// /overlay?state=cmd-listening|cmd-thinking|cmd-acting|cmd-pick|cmd-confirm|cmd-done|cmd-stopped|cmd-unsure|cmd-blocked|cmd-setup,
 // /overlay?state=idle|hover|listening|handsfree|warning|processing|done|copied|fixax|nofield|error|notice (freeze one pill state).
 // Console: window.mock.plug() / unplug() / dictate() / error() / toast(text).
 // Hotkeys: holding the push-to-talk key (default F1) dictates; a double tap starts hands-free, the next tap stops it.
 // Modifier-only keys need Input Monitoring, like the CGEventTap. window.mock.stale = true: an Input Monitoring grant
 // needs relaunch_app (needs_relaunch), and an Accessibility grant never shows (a stale switch from an older build).
 // mock.perms(patch) edits permissions.
-import type * as C from "./contract.gen";
+import type * as C from "./api";
 
 const q = new URLSearchParams(location.search);
 const onboarding = q.has("onboarding");
@@ -23,7 +25,7 @@ let settings: C.Settings = {
   version: 1,
   onboarded: !onboarding,
   language: "auto",
-  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C" },
+  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" },
   mic: { selection: "auto", priority: [], show_virtual: false },
   stt: {
     provider: "whisper_local",
@@ -49,8 +51,10 @@ let settings: C.Settings = {
   overlay: { show_idle: true },
   privacy: { store_history: true, store_audio: true, audio_retention_days: 14 },
   autostart: false,
+  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14" },
 };
 
+let pillRect: C.PtRect | null = null;
 let keys: C.KeyStatus = { elevenlabs: false, openrouter: !fresh, local_stt: false, local_llm: false };
 
 // relaunch_app reloads the page; permissions survive it like real grants do
@@ -58,8 +62,8 @@ const relaunched = sessionStorage.getItem("mock.perms");
 let perms: C.Permissions = relaunched
   ? JSON.parse(relaunched)
   : onboarding
-    ? { microphone: "undetermined", accessibility: false, input_monitoring: false, fn_key_free: null, needs_relaunch: false }
-    : { microphone: "granted", accessibility: true, input_monitoring: true, fn_key_free: true, needs_relaunch: false };
+    ? { microphone: "undetermined", accessibility: false, input_monitoring: false, fn_key_free: null, needs_relaunch: false, screen_recording: false }
+    : { microphone: "granted", accessibility: true, input_monitoring: true, fn_key_free: true, needs_relaunch: false, screen_recording: false };
 sessionStorage.removeItem("mock.perms");
 /** Grants made in "System Settings" while stale: applied only by a relaunch. */
 let pending: Partial<C.Permissions> = {};
@@ -134,6 +138,7 @@ let history: C.HistoryItem[] = fresh
       return {
         id: 900 - i,
         created_at: T0 - ago,
+        kind: "dictation" as const,
         app_bundle: bundle,
         app_name: name,
         raw,
@@ -149,8 +154,21 @@ let history: C.HistoryItem[] = fresh
       };
     });
 
+// voice commands live in History too (kind "command"): raw = instruction, final_text = what was done
+const cmdRow = (id: number, ago: number, app: string, said: string, did: string, status: C.HistoryStatus, error: string | null = null): C.HistoryItem => ({
+  id, created_at: T0 - ago, kind: "command", app_bundle: null, app_name: app, raw: said, final_text: did, provider: "typesafe/jev-1.14",
+  cleanup: null, duration_ms: 1400, words: 0, latency_ms: 1650, status, has_audio: false, error,
+});
+if (!fresh) {
+  history.push(
+    cmdRow(950, 20 * MIN, "Slack", "open my DM with Ana", "Clicked “Ana Silva” (link, sidebar)", "done"),
+    cmdRow(951, 3 * HOUR + 40 * MIN, "Mail", "delete this email", "", "cancelled", "Stopped before “Delete”: you pressed esc."),
+  );
+  history.sort((a, b) => b.created_at - a.created_at);
+}
+
 function stats(): C.Stats {
-  const week = history.filter((h) => T0 - h.created_at < 7 * DAY && h.status !== "cancelled");
+  const week = history.filter((h) => h.kind === "dictation" && T0 - h.created_at < 7 * DAY && h.status !== "cancelled");
   const words_7d = week.reduce((a, h) => a + h.words, 0);
   const speakMin = week.reduce((a, h) => a + h.duration_ms, 0) / 60_000;
   const wpm = speakMin ? words_7d / speakMin : 0;
@@ -306,10 +324,10 @@ function levels(on: boolean) {
 }
 
 // ---------------- session ----------------
-let session: C.SessionState = { phase: "idle", started_at: null, device: null, app: null, message: null };
+let session: C.SessionState = { phase: "idle", started_at: null, device: null, app: null, message: null, command: false };
 function phase(p: C.Phase, extra: Partial<C.SessionState> = {}) {
   session = { ...session, phase: p, ...extra };
-  if (p === "idle") session = { phase: "idle", started_at: null, device: null, app: null, message: null };
+  if (p === "idle") session = { phase: "idle", started_at: null, device: null, app: null, message: null, command: false };
   levels(p === "recording" || p === "locked");
   mockEmit("session_state", session);
 }
@@ -327,6 +345,7 @@ async function finish() {
   const item: C.HistoryItem = {
     id: nextId++,
     created_at: Date.now(),
+    kind: "dictation",
     app_bundle: "com.tinyspeck.slackmacgap",
     app_name: "Slack",
     raw,
@@ -374,7 +393,7 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   get_settings: () => settings,
   save_settings: (a) => {
     const s = a.settings as C.Settings;
-    const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last, s.hotkeys.copy_last].filter(Boolean);
+    const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last, s.hotkeys.copy_last, s.command.enabled ? s.hotkeys.command : null].filter(Boolean); // off = not registered (settings.rs active_hotkeys)
     if (new Set(all).size !== all.length) throw "Two actions share one shortcut";
     const moved = s.hotkeys.ptt !== settings.hotkeys.ptt;
     settings = s;
@@ -498,11 +517,8 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     await wait(300);
     if (!keys.openrouter) throw "OpenRouter needs a key";
     return a.kind === "stt"
-      ? [
-          { id: "openai/gpt-4o-transcribe", name: "OpenAI: GPT-4o Transcribe" },
-          { id: "openai/gpt-4o-mini-transcribe", name: "OpenAI: GPT-4o mini Transcribe" },
-          { id: "mistralai/voxtral-small-24b", name: "Mistral: Voxtral Small" },
-        ]
+      ? STT_MODELS
+
       : [
           { id: "google/gemini-2.5-flash", name: "Google: Gemini 2.5 Flash" },
           { id: "google/gemini-2.5-flash-lite", name: "Google: Gemini 2.5 Flash Lite" },
@@ -521,6 +537,7 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     if (k === "accessibility") perms = { ...perms, accessibility: true };
     if (k === "input_monitoring") perms = { ...perms, input_monitoring: true, fn_key_free: false };
     if (k === "fn_key") perms = { ...perms, fn_key_free: true };
+    if (k === "screen_recording") perms = { ...perms, screen_recording: true, needs_relaunch: true }; // macOS applies it after a restart
     if (k === "input_monitoring") hotkeyStatus();
   },
   relaunch_app: () => {
@@ -528,6 +545,8 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
     location.reload();
   },
   hotkey_capture: (a) => void (capturing = a.on as boolean),
+  set_pill_rect: (a) => void (pillRect = a.rect as C.PtRect),
+  command_log: () => cmdLog,
 };
 
 const MOD_CODE: Record<string, string> = {
@@ -629,7 +648,15 @@ export function overlayDemo(state: string | null) {
       start("recording");
       setTimeout(() => toast("Switched to MacBook Pro Microphone", "warn", [], 600_000), 400);
     },
+    "cmd-listening": () => phase("recording", { started_at: now(), command: true }),
+    "cmd-thinking": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.thinking)),
+    "cmd-acting": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.aim)),
+    "cmd-pick": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.pick)),
+    "cmd-confirm": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.confirm)),
   };
+  // results: Rust sends the step, then the phase goes idle; the pill holds them (frozen here: the run never ends)
+  for (const k of ["done", "stopped", "unsure", "blocked", "setup"])
+    freeze[`cmd-${k}`] = () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES[k]));
   if (state && freeze[state]) return setTimeout(freeze[state], 50);
   const script: [number, () => void][] = [
     [1600, () => start("recording")],
@@ -646,6 +673,191 @@ export function overlayDemo(state: string | null) {
     setTimeout(() => (fn(), step()), ms);
   };
   step();
+}
+
+
+// ---------------- voice control ----------------
+// Ranked like stt/openrouter.rs RANKED (OpenRouter transcription, requests/week), then the rest by name.
+// Prices are layout data for the mock, not a source.
+const or = (id: string, name: string, rank: number | null, price_hour: number | null, keywords = false): C.OrModel => ({ id, name, rank, price_hour, keywords, recommended: id === "microsoft/mai-transcribe-2" });
+const STT_MODELS: C.OrModel[] = [
+  or("microsoft/mai-transcribe-2", "Microsoft: MAI-Transcribe 2", 1, 0.1, true),
+  or("openai/whisper-large-v3", "OpenAI: Whisper Large V3", 2, 0.027),
+  or("openai/whisper-large-v3-turbo", "OpenAI: Whisper Large V3 Turbo", 3, 0.012),
+  or("elevenlabs/scribe-v2", "ElevenLabs: Scribe v2", 4, 0.11),
+  or("openai/gpt-4o-mini-transcribe", "OpenAI: GPT-4o mini Transcribe", 5, null),
+  or("openai/whisper-1", "OpenAI: Whisper 1", 6, 0.36),
+  or("openai/gpt-transcribe", "OpenAI: GPT Transcribe", 7, null),
+  or("x-ai/grok-stt-1.0", "xAI: Grok STT 1.0", 8, 0.06),
+  or("qwen/qwen3-asr-1.7b", "Qwen: Qwen3 ASR 1.7B", 9, 0.009),
+  or("mistralai/voxtral-mini-transcribe", "Mistral: Voxtral Mini Transcribe", 10, 0.06),
+  or("assemblyai/universal-3.6-pro", "AssemblyAI: Universal-3.6 Pro", null, 0.3),
+  or("deepgram/nova-3", "Deepgram: Nova 3", null, 0.26),
+  or("google/chirp-3", "Google: Chirp 3", null, 0.96),
+  or("openai/gpt-4o-transcribe", "OpenAI: GPT-4o Transcribe", null, null),
+];
+
+/** A Slack-like window read as an AX tree (.lo/som-experiment slack page): id, name, role, region, x, y, w, h. */
+const AX: [number, string, string, string, number, number, number, number][] = [
+  [1, "Huddle", "button", "channel header", 1252, 10.5, 28, 28],
+  [2, "Members", "button", "channel header", 1288, 10.5, 28, 28],
+  [3, "Pinned", "button", "channel header", 1324, 10.5, 28, 28],
+  [4, "Search in channel", "button", "channel header", 1360, 10.5, 28, 28],
+  [5, "Channel details", "button", "channel header", 1396, 10.5, 28, 28],
+  [6, "Acme workspace", "button", "workspace bar", 14, 12, 36, 36],
+  [7, "New message", "button", "sidebar", 280, 16, 28, 28],
+  [8, "Home", "button", "workspace bar", 18, 58, 28, 28],
+  [9, "Threads", "link", "sidebar", 64, 58, 260, 33],
+  [10, "Mentions", "link", "sidebar", 64, 91, 260, 25],
+  [11, "DMs", "button", "workspace bar", 18, 96, 28, 28],
+  [12, "Saved items", "link", "sidebar", 64, 116, 260, 33],
+  [13, "Activity", "button", "workspace bar", 18, 134, 28, 28],
+  [14, "Add reaction", "button", "messages", 1307, 141, 28, 28],
+  [15, "Reply in thread", "button", "messages", 1335, 141, 28, 28],
+  [16, "Forward message", "button", "messages", 1363, 141, 28, 28],
+  [17, "More actions", "button", "messages", 1391, 141, 28, 28],
+  [18, "# general", "link", "sidebar", 64, 181, 260, 25],
+  [19, "# engineering", "link", "sidebar", 64, 206, 260, 25],
+  [20, "# design", "link", "sidebar", 64, 231, 260, 25],
+  [21, "2 replies", "link", "messages", 390, 230, 45, 14],
+  [22, "# random", "link", "sidebar", 64, 256, 260, 25],
+  [23, "# releases", "link", "sidebar", 64, 281, 260, 25],
+  [24, "+ Add channels", "link", "sidebar", 64, 306, 260, 25],
+  [25, "Maria Lopez", "link", "sidebar", 64, 363, 260, 25],
+  [26, "Tom Becker", "link", "sidebar", 64, 388, 260, 25],
+  [27, "Ana Silva", "link", "sidebar", 64, 413, 260, 25],
+  [28, "Tom Hanks (bot)", "link", "sidebar", 64, 438, 260, 25],
+  [29, "Bold", "button", "composer", 347, 793, 28, 28],
+  [30, "Italic", "button", "composer", 377, 793, 28, 28],
+  [31, "Strikethrough", "button", "composer", 407, 793, 28, 28],
+  [32, "Link", "button", "composer", 437, 793, 28, 28],
+  [33, "Bulleted list", "button", "composer", 467, 793, 28, 28],
+  [34, "Code block", "button", "composer", 497, 793, 28, 28],
+  [35, "Add workspace", "button", "workspace bar", 18, 820, 28, 28],
+  [36, "Message #engineering", "text field", "composer", 341, 825, 1082, 31],
+  [37, "Attach file", "button", "composer", 347, 851, 28, 28],
+  [38, "Emoji", "button", "composer", 377, 851, 28, 28],
+  [39, "Mention someone", "button", "composer", 407, 851, 28, 28],
+  [40, "Record audio clip", "button", "composer", 437, 851, 28, 28],
+  [41, "Send now", "button", "composer", 1353, 851, 34, 28],
+  [42, "Schedule message", "button", "composer", 1389, 851, 28, 28],
+  [43, "Preferences", "button", "workspace bar", 18, 858, 28, 28],
+];
+const DISPLAY: C.PtRect = { x: 0, y: 0, w: 1440, h: 900 };
+// the window sits under the 24 pt menu bar
+const MARKS: C.Mark[] = AX.map(([id, name, role, region, x, y, w, h]) => ({ id, name, role, region, rect: { x, y: 24 + y * (876 / 900), w, h: h * (876 / 900) } }));
+
+const cmd = (status: C.CmdStatus, extra: Partial<C.CommandStep> = {}): C.CommandStep => ({
+  instruction: "send the message",
+  step: 1,
+  max: 6,
+  status,
+  action: null,
+  detail: null,
+  display: DISPLAY,
+  marks: [],
+  target: null,
+  choices: [],
+  latency_ms: 0,
+  cost_usd: 0,
+  message: null,
+  ...extra,
+});
+/** One frozen state per name, for the overlay and marks pages (?state=) and the screenshots. */
+export const CMD_STATES: Record<string, C.CommandStep> = {
+  thinking: cmd("thinking", { instruction: "open my DM with Ana" }),
+  marks: cmd("marks", { instruction: "open my DM with Ana", marks: MARKS }),
+  aim: cmd("aim", { instruction: "open my DM with Ana", marks: MARKS, action: "click", target: 27, latency_ms: 702, cost_usd: 0.000046 }),
+  pick: cmd("pick", { instruction: "open the second channel", marks: MARKS, action: "click", target: 20, choices: [[20, 0.56], [19, 0.31], [18, 0.08]] }),
+  confirm: cmd("confirm", { instruction: "send the message", step: 2, marks: MARKS, action: "click", target: 41 }),
+  done: cmd("done", { instruction: "open my DM with Ana", step: 2, action: "done" }),
+  stopped: cmd("stopped", { step: 2 }),
+  unsure: cmd("unsure", { instruction: "click the blue thing", message: "Not sure where. Say it again." }),
+  blocked: cmd("blocked", { instruction: "type my password", message: "Password field. susurro won't touch it." }),
+  setup: cmd("setup", { instruction: "click the search field", message: "screen_recording" }),
+};
+
+// ?needscreen: the last run stopped because a step needed Screen Recording (Voice control shows the permission card)
+let cmdLog: C.CommandStep[] = q.has("needscreen")
+  ? [cmd("setup", { instruction: "click the red button", message: "screen_recording" })]
+  : fresh
+  ? []
+  : [
+      cmd("thinking", { instruction: "open notes and click the search field", action: "open_app", detail: "Notes", step: 0, latency_ms: 190, cost_usd: 0.000009 }),
+      cmd("aim", { instruction: "open notes and click the search field", step: 2, action: "click", target: 4, marks: MARKS, latency_ms: 702, cost_usd: 0.000046 }),
+      cmd("done", { instruction: "open notes and click the search field", step: 3, action: "done", latency_ms: 655, cost_usd: 0.000046 }),
+    ];
+
+/** A scripted command run, as Rust would emit it: listen, STT, AX read + marks, aim, act, done. */
+async function command(instruction = "open my DM with Ana", risky = false) {
+  phase("recording", { started_at: Date.now(), command: true });
+  await wait(1400);
+  phase("processing", { command: true });
+  await wait(600);
+  const run: C.CommandStep[] = [];
+  const emit = (c: C.CommandStep) => (run.push(c), mockEmit("command_step", c));
+  phase("acting", { command: true });
+  emit(cmd("thinking", { instruction }));
+  await wait(300);
+  emit(cmd("marks", { instruction, marks: MARKS }));
+  await wait(700);
+  const target = risky ? 41 : 27;
+  emit(cmd(risky ? "confirm" : "aim", { instruction, marks: MARKS, action: "click", target, latency_ms: 702, cost_usd: 0.000046 }));
+  await wait(risky ? 2500 : 300);
+  emit(cmd("thinking", { instruction, step: 2 }));
+  await wait(650);
+  emit(cmd("done", { instruction, step: 2, action: "done", latency_ms: 655, cost_usd: 0.000046 }));
+  cmdLog = run;
+  phase("idle");
+}
+
+/** Marks page in a browser: a wireframe of the app under the marks, then one frozen state or the loop. */
+export function marksDemo(state: string | null) {
+  const app = document.createElement("div");
+  app.className = "mock-app";
+  const el = (cls: string, r: C.PtRect, text = "") => {
+    const d = document.createElement("div");
+    d.className = cls;
+    Object.assign(d.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px` });
+    d.textContent = text;
+    return app.appendChild(d);
+  };
+  el("pane", { x: 0, y: 24, w: 64, h: 876 }).style.background = "#3f0e40";
+  el("pane", { x: 64, y: 24, w: 260, h: 876 }).style.background = "#4a154b";
+  const mb = document.createElement("div");
+  mb.className = "mb";
+  mb.textContent = "  Slack     File   Edit   View   Go   Window   Help";
+  app.appendChild(mb);
+  for (const m of MARKS) {
+    const e = el(`el ${m.role.replace(" ", "")}`, m.rect, m.role === "link" || m.role === "text field" ? m.name : "");
+    if (m.region === "sidebar" || m.region === "workspace bar") e.style.color = "#e9dbe9";
+  }
+  const msgs: [number, string, string][] = [
+    [96, "Maria Lopez  10:02", "Deploy to staging is done, please test the login flow."],
+    [168, "Tom Becker  10:05", "Login works. The settings page is still slow though."],
+    [218, "Ana Silva  10:11", "I will profile it after lunch. Can someone share the trace?"],
+    [284, "Maria Lopez  10:15", "Trace attached: settings-trace.json"],
+  ];
+  for (const [y, who, text] of msgs) {
+    const m = el("msg", { x: 390, y, w: 800, h: 40 });
+    m.innerHTML = `<b></b>`;
+    m.firstChild!.textContent = who;
+    m.append(text);
+  }
+  el("el", { x: 340, y: 30, w: 300, h: 30 }, "# engineering").style.fontWeight = "700";
+  document.body.prepend(app);
+  if (state && CMD_STATES[state]) {
+    phase("acting", { command: true });
+    return setTimeout(() => mockEmit("command_step", CMD_STATES[state]), 50);
+  }
+  const loop = async () => {
+    await command("open my DM with Ana");
+    await wait(900);
+    await command("send the message", true);
+    await wait(900);
+    void loop();
+  };
+  void loop();
 }
 
 /** Main window in a browser: a mic gets plugged in a few seconds after load. */
@@ -692,5 +904,10 @@ if (inBrowser) Object.assign(window, {
       stale = v;
     },
     perms: (p: Partial<C.Permissions>) => void ((perms = { ...perms, ...p }), hotkeyStatus()),
+    command,
+    step: (k: string) => mockEmit("command_step", CMD_STATES[k]),
+    get pillRect() {
+      return pillRect;
+    },
   },
 });
