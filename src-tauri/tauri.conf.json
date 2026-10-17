@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "susurro",
+  "version": "0.1.0",
+  "identifier": "app.susurro.desktop",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "susurro",
+        "url": "/",
+        "width": 1040,
+        "height": 700,
+        "minWidth": 880,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "title": "susurro overlay",
+        "url": "/overlay",
+        "width": 360,
+        "height": 96,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": false,
+        "alwaysOnTop": true,
+        "acceptFirstMouse": true,
+        "skipTaskbar": true,
+        "backgroundThrottling": "disabled",
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": ["resources/jfk.wav"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

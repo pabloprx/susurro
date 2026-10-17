@@ -1,0 +1,97 @@
+:root {
+  /* ---------- type ---------- */
+  --font-display: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", ui-sans-serif, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* ---------- color: dark (default) ---------- */
+  --bg:         #0E0D0B;  /* window */
+  --bg-sunk:    #0A0908;  /* sidebar, wells, inputs */
+  --surface:    #1B1A17;  /* cards */
+  --surface-2:  #23211D;  /* hover, raised rows, popovers */
+  --line:       #2E2B26;  /* hairlines */
+  --line-strong:#423E37;  /* input borders, dividers that must read */
+  --text:       #EDE8DF;  /* 15.9:1 on bg */
+  --text-2:     #A39C90;  /* 6.4:1 on surface */
+  --text-3:     #918A7D;  /* 5.1:1 on surface; placeholder, meta */
+  --tally:      #FF6A3D;  /* the one accent; 6.8:1 on bg */
+  --tally-ink:  #1A0A04;  /* text on tally fill; 6.8:1 */
+  --tally-soft: rgb(255 106 61 / 0.14); /* selected row, focus halo */
+  --ok:         #7FD1A8;  /* 9.6:1 */
+  --warn:       #F5B94A;  /* 9.9:1 */
+  --danger:     #FF5C7A;  /* 5.9:1 */
+  --meter-low:  #7FD1A8;
+  --meter-mid:  #F5B94A;
+  --meter-hot:  #FF5C7A;
+
+  /* ---------- space (4px grid) ---------- */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 20px; --s-6: 24px; --s-8: 32px; --s-10: 40px; --s-12: 48px; --s-16: 64px;
+
+  /* ---------- radius ---------- */
+  --r-xs: 4px;    /* chips, kbd keys */
+  --r-sm: 6px;    /* inputs, buttons */
+  --r-md: 10px;   /* cards, popovers */
+  --r-lg: 14px;   /* modal sheets */
+  --r-pill: 999px;
+
+  /* ---------- elevation (dark: lines do the work, shadows only off-surface) ---------- */
+  --shadow-pop:  0 0 0 1px var(--line-strong), 0 8px 24px -6px rgb(0 0 0 / 0.6);
+  --shadow-sheet:0 0 0 1px var(--line-strong), 0 24px 64px -12px rgb(0 0 0 / 0.7);
+  --shadow-pill: 0 0 0 1px rgb(255 255 255 / 0.07), 0 10px 30px -8px rgb(0 0 0 / 0.75), inset 0 1px 0 rgb(255 255 255 / 0.06);
+  --glow-tally:  0 0 0 1px rgb(255 106 61 / 0.55), 0 0 18px -2px rgb(255 106 61 / 0.45);
+
+  /* ---------- motion ---------- */
+  --ease-out:    cubic-bezier(0.23, 1, 0.32, 1);    /* enter, press release */
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);   /* on-screen morph */
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);    /* sheets, pill width */
+  --d-press: 120ms;   /* :active scale */
+  --d-fast:  150ms;   /* hover color, tooltips */
+  --d-base:  200ms;   /* popovers, toasts, tab underline */
+  --d-morph: 260ms;   /* pill state morph */
+  --d-sheet: 320ms;   /* modal sheet, onboarding step */
+
+  /* ---------- focus ---------- */
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--tally);
+
+  /* ---------- layout ---------- */
+  --sidebar-w: 216px;
+  --content-max: 880px;
+  --titlebar-h: 44px;
+
+  color-scheme: dark;
+}
+
+/* ---------- color: light ("paper") ---------- */
+:root[data-theme="light"] {
+  --bg:         #F4F1EA;
+  --bg-sunk:    #ECE7DD;
+  --surface:    #FBF9F4;
+  --surface-2:  #ECE7DD;
+  --line:       #DDD6C9;
+  --line-strong:#C6BEAF;
+  --text:       #1A1813;  /* 15.7:1 */
+  --text-2:     #5E574B;  /* 6.8:1 */
+  --text-3:     #7A7264;  /* 4.5:1 */
+  --tally:      #C2410C;  /* 4.9:1 on surface; darker so it reads on paper */
+  --tally-ink:  #FFF6F0;  /* 4.9:1 */
+  --tally-soft: rgb(194 65 12 / 0.10);
+  --ok:         #1F7A52;  /* 5.0:1 */
+  --warn:       #8A5A00;  /* 5.6:1 */
+  --danger:     #B4233F;  /* 6.1:1 */
+  --shadow-pop:  0 0 0 1px var(--line-strong), 0 8px 24px -8px rgb(60 45 20 / 0.18);
+  --shadow-sheet:0 0 0 1px var(--line-strong), 0 24px 64px -16px rgb(60 45 20 / 0.25);
+  color-scheme: light;
+}
+
+/* The overlay pill is ALWAYS dark, in both themes. It floats over any app. */
+.pill-root { --pill-bg: #121110; --pill-text: #EDE8DF; --pill-dim: #918A7D; }
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --d-morph: 0ms; --d-sheet: 120ms; --d-base: 120ms; }
+}
+
+/* DESIGN 9.8: macOS "Increase contrast" */
+@media (prefers-contrast: more) {
+  :root, :root[data-theme="light"] { --line: var(--line-strong); --text-3: var(--text-2); }
+}

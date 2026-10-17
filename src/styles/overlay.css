@@ -1,0 +1,259 @@
+/* The overlay pill (DESIGN 5). Always dark, in both themes. */
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.pill-root {
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 18px;
+  box-sizing: border-box;
+  font: 12px/16px var(--font-ui);
+  color: var(--pill-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.pill {
+  position: relative;
+  overflow: hidden;
+  background: var(--pill-bg);
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-pill);
+  transition:
+    width var(--d-morph) var(--ease-drawer),
+    height var(--d-morph) var(--ease-drawer),
+    box-shadow var(--d-morph) var(--ease-out),
+    background-color var(--d-fast) ease,
+    opacity var(--d-base) var(--ease-out);
+}
+
+.pill.v-idle {
+  background: rgb(18 17 16 / 0.7);
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.1), 0 4px 12px -4px rgb(0 0 0 / 0.5);
+  cursor: pointer;
+}
+.pill.v-idle.hover {
+  background: var(--pill-bg);
+}
+.pill.hidden:not(.hover) {
+  opacity: 0;
+}
+
+/* "On air": the only glow in the product, at 40% strength. */
+.pill.v-listening {
+  box-shadow:
+    var(--shadow-pill),
+    0 0 0 1px rgb(255 106 61 / 0.22),
+    0 0 18px -2px rgb(255 106 61 / 0.18);
+}
+.pill.v-handsfree {
+  box-shadow: var(--shadow-pill), 0 0 0 1px var(--tally);
+}
+
+.pill.shake {
+  animation: pill-shake 160ms linear;
+}
+@keyframes pill-shake {
+  25% { translate: -3px 0; }
+  50% { translate: 3px 0; }
+  75% { translate: -3px 0; }
+}
+
+/* content layers cross-fade with a 2px blur */
+.layer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.layer.in {
+  animation: layer-in 160ms var(--ease-out) 60ms both;
+}
+.layer.out {
+  opacity: 0;
+  filter: blur(2px);
+  transition: opacity 120ms var(--ease-out), filter 120ms var(--ease-out);
+  animation: layer-out 120ms var(--ease-out) both;
+  pointer-events: none;
+}
+@keyframes layer-in {
+  from { opacity: 0; }
+}
+@keyframes layer-out {
+  from { opacity: 1; filter: blur(0); }
+  to { opacity: 0; filter: blur(2px); }
+}
+
+.content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  width: max-content;
+  max-width: 272px;
+}
+
+.wave {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--d-morph) var(--ease-drawer),
+    opacity 120ms var(--ease-out);
+}
+.wave.on {
+  opacity: 1;
+}
+.wave-slot {
+  width: 120px;
+  height: 24px;
+  margin: 0 -2px;
+  flex: none;
+}
+
+.tally-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tally);
+  flex: none;
+}
+.tally-dot.pulse {
+  animation: tally-pulse 1.2s ease-in-out infinite;
+}
+@keyframes tally-pulse {
+  50% { opacity: 0.35; }
+}
+
+.pill-btn {
+  all: unset;
+  width: 20px;
+  height: 20px;
+  margin: -4px; /* 28px hit area, 20px visual (DESIGN 9.7) */
+  padding: 4px;
+  box-sizing: content-box;
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--pill-dim);
+  cursor: pointer;
+  position: relative;
+}
+.pill-btn::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.06);
+  transition: background-color var(--d-fast) ease;
+}
+.pill-btn > svg {
+  position: relative;
+  transition: transform var(--d-press) var(--ease-out);
+}
+@media (hover: hover) {
+  .pill-btn:hover { color: var(--pill-text); }
+  .pill-btn:hover::before { background: rgb(255 255 255 / 0.12); }
+}
+.pill-btn:active > svg {
+  transform: scale(0.9);
+}
+.pill-btn:focus-visible::before {
+  box-shadow: 0 0 0 2px var(--tally);
+}
+
+.timer {
+  font: 11px/14px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--pill-dim);
+  min-width: 26px;
+  text-align: right;
+}
+.timer.warn {
+  color: var(--warn);
+}
+
+.hint {
+  font: 10px/12px var(--font-mono);
+  letter-spacing: 0.04em;
+  color: var(--pill-dim);
+  opacity: 0;
+  transition: opacity var(--d-fast) ease;
+}
+.pill.hover .hint {
+  opacity: 1;
+}
+
+.msg {
+  font-size: 12px;
+  color: var(--pill-text);
+}
+.ellipsis {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ok { color: var(--ok); flex: none; }
+.warn { color: var(--warn); flex: none; }
+.danger { color: var(--danger); flex: none; }
+.dim { color: var(--pill-dim); flex: none; }
+
+.link {
+  all: unset;
+  font-size: 12px;
+  color: var(--pill-text);
+  text-decoration: underline;
+  text-decoration-color: rgb(237 232 223 / 0.35);
+  text-underline-offset: 3px;
+  cursor: pointer;
+  flex: none;
+  padding: 4px 2px;
+}
+.link:hover {
+  text-decoration-color: var(--pill-text);
+}
+.link:focus-visible {
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--tally);
+}
+
+.dots-static {
+  font: 16px/1 var(--font-mono);
+  color: var(--pill-text);
+  animation: tally-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill { transition: opacity 120ms ease; }
+  .layer.in { animation-duration: 120ms; animation-delay: 0ms; }
+  .wave { transition: opacity 120ms ease; }
+}
+
+/* Browser-only preview: a fake desktop and the 360x96 window outline (mock mode, not in Tauri). */
+body.mock-desk {
+  background:
+    radial-gradient(120% 140% at 15% 0%, #3a3329 0%, transparent 55%),
+    radial-gradient(90% 120% at 100% 100%, #2a2f33 0%, transparent 60%),
+    #1d1b18;
+  display: grid;
+  place-items: center;
+}
+body.mock-desk #root {
+  width: 360px;
+  height: 96px;
+  outline: 1px dashed rgb(255 255 255 / 0.12);
+  outline-offset: 0;
+}
