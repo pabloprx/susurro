@@ -48,7 +48,19 @@ pub fn context(state: &AppState, file: &str) -> anyhow::Result<Arc<WhisperContex
     Ok(ctx)
 }
 
-/// Load `settings.stt.whisper_model` on a background thread into AppState.whisper.
+/// The model to load: `file` if it is downloaded, else the best downloaded one (catalog order) and a note
+/// for the user. Nothing downloaded: `file`, so the load fails with "not downloaded".
+pub fn usable(data_dir: &Path, file: &str) -> (String, Option<String>) {
+    if model_path(data_dir, file).exists() {
+        return (file.into(), None);
+    }
+    match crate::models::CATALOG.iter().map(|(f, ..)| *f).find(|f| model_path(data_dir, f).exists()) {
+        Some(f) => (f.into(), Some(format!("Whisper model {file} is not downloaded - used {f}"))),
+        None => (file.into(), None),
+    }
+}
+
+/// Load `settings.stt.whisper_model` (or the `usable` stand-in) on a background thread into AppState.whisper.
 /// Called at startup and by save_settings when the model changes. Never at the first press.
 /// Skipped when nothing uses whisper (a cloud provider without local fallback).
 pub fn load_in_background(app: AppHandle) {
@@ -58,11 +70,12 @@ pub fn load_in_background(app: AppHandle) {
         if s.provider != SttProvider::WhisperLocal && !s.local_fallback {
             return;
         }
-        if !model_path(&state.data_dir, &s.whisper_model).exists() {
-            log::info!("whisper preload: {} is not downloaded", s.whisper_model);
+        let (file, _) = usable(&state.data_dir, &s.whisper_model);
+        if !model_path(&state.data_dir, &file).exists() {
+            log::info!("whisper preload: {file} is not downloaded");
             return;
         }
-        if let Err(e) = context(&state, &s.whisper_model) {
+        if let Err(e) = context(&state, &file) {
             log::warn!("whisper preload failed: {e:#}");
         }
     });
@@ -70,11 +83,13 @@ pub fn load_in_background(app: AppHandle) {
 
 pub struct Whisper {
     ctx: Arc<WhisperContext>,
+    /// Shown to the user with the text (a stand-in model was used, see `usable`).
+    pub note: Option<String>,
 }
 
 impl Whisper {
     pub fn new(ctx: Arc<WhisperContext>) -> Self {
-        Self { ctx }
+        Self { ctx, note: None }
     }
 }
 
@@ -115,7 +130,7 @@ impl Transcriber for Whisper {
             .map(|(_, t)| t)
             .collect();
         let language = whisper_rs::get_lang_str(st.full_lang_id_from_state()).map(str::to_string);
-        Ok(SttOutput { text: text.trim().to_string(), language, note: None, fell_back: false })
+        Ok(SttOutput { text: text.trim().to_string(), language, note: self.note.clone(), fell_back: false })
     }
 }
 
@@ -129,6 +144,23 @@ fn peak_db(a: &[f32], t0: i64, t1: i64) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_model_falls_back_to_the_best_downloaded_one() {
+        let d = std::env::temp_dir().join(format!("susurro-usable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("models")).unwrap();
+        let turbo = "ggml-large-v3-turbo-q5_0.bin";
+        assert_eq!(super::usable(&d, turbo), (turbo.to_string(), None), "nothing downloaded: the load reports it");
+        for f in ["ggml-base-q5_1.bin", "ggml-tiny-q5_1.bin"] {
+            std::fs::write(d.join("models").join(f), b"x").unwrap();
+        }
+        let (f, note) = super::usable(&d, turbo);
+        assert_eq!(f, "ggml-base-q5_1.bin", "best downloaded in catalog order");
+        assert!(note.unwrap().contains("not downloaded - used ggml-base-q5_1.bin"));
+        assert_eq!(super::usable(&d, "ggml-tiny-q5_1.bin"), ("ggml-tiny-q5_1.bin".to_string(), None), "a downloaded pick is kept");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn peak_db_spans_are_clamped() {
         let mut a = vec![0.0f32; 1600];

@@ -2100,10 +2100,10 @@ mark {
 }
 .keypicks {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: var(--s-2);
   width: 100%;
-  max-width: 480px;
+  max-width: 580px;
   margin-top: var(--s-4);
 }
 .keypicks [role="radiogroup"] {

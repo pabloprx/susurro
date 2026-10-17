@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { Info, Plus, Trash2 } from "lucide-react";
 import { api, type CleanupLevel, type Style } from "../lib/api";
-import { keyStore, saveSettings, settingsStore } from "../lib/store";
+import { keyStore, save, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
 import { Label, Popover, radioKeys, Segmented, Title } from "../ui";
 import type { Nav } from "../App";
@@ -44,7 +44,7 @@ export default function Styles({ nav }: { nav: Nav }) {
   const names = new Map<string, string>([...Object.entries(KNOWN), ...recent]);
   const current = STYLES.find((x) => x.value === s.styles.style)!;
   const candidates = [...recent, ...Object.entries(KNOWN).filter(([b]) => !recent.some(([r]) => r === b))].filter(([b]) => !s.styles.raw_apps.includes(b));
-  const addRaw = (bundle: string) => saveSettings((x) => void (x.styles.raw_apps = [...new Set([...x.styles.raw_apps, bundle.trim()])]));
+  const addRaw = (bundle: string) => save((x) => void (x.styles.raw_apps = [...new Set([...x.styles.raw_apps, bundle.trim()])]));
 
   return (
     <>
@@ -53,7 +53,7 @@ export default function Styles({ nav }: { nav: Nav }) {
       <Segmented<CleanupLevel>
         label="Cleanup level"
         value={s.cleanup.level}
-        onChange={(v) => saveSettings((x) => void (x.cleanup.level = v))}
+        onChange={(v) => save((x) => void (x.cleanup.level = v))}
         options={[
           { value: "none", label: "None" },
           { value: "light", label: "Light" },
@@ -68,7 +68,7 @@ export default function Styles({ nav }: { nav: Nav }) {
       <div className="card style-grid">
         <div className="style-list" role="radiogroup" aria-label="Style" onKeyDown={radioKeys}>
           {STYLES.map((o) => (
-            <button key={o.value} className="style-opt" role="radio" aria-checked={o.value === s.styles.style} tabIndex={o.value === s.styles.style ? 0 : -1} onClick={() => saveSettings((x) => void (x.styles.style = o.value))}>
+            <button key={o.value} className="style-opt" role="radio" aria-checked={o.value === s.styles.style} tabIndex={o.value === s.styles.style ? 0 : -1} onClick={() => save((x) => void (x.styles.style = o.value))}>
               <span className="radio" />
               <span>
                 <div>{o.name}</div>
@@ -141,7 +141,7 @@ export default function Styles({ nav }: { nav: Nav }) {
                 <span className="bundle ellipsis">{b}</span>
                 <span className="meta">raw text</span>
                 <span className="actions" style={{ marginLeft: 0 }}>
-                  <button className="icon-btn sm del" aria-label={`Remove ${b}`} onClick={() => saveSettings((x) => void (x.styles.raw_apps = x.styles.raw_apps.filter((a) => a !== b)))}>
+                  <button className="icon-btn sm del" aria-label={`Remove ${b}`} onClick={() => save((x) => void (x.styles.raw_apps = x.styles.raw_apps.filter((a) => a !== b)))}>
                     <Trash2 size={14} strokeWidth={1.5} />
                   </button>
                 </span>

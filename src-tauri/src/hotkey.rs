@@ -712,6 +712,15 @@ mod tests {
     }
 
     #[test]
+    fn supr_is_forward_delete() {
+        // global-hotkey 0.8 maps Code::Delete to 0x75 = kVK_ForwardDelete (fn+⌫ on Apple keyboards), not ⌫ (0x33).
+        assert_eq!(validate(&hk("Delete", None, "Escape", "Ctrl+Cmd+V")), Ok(()));
+        let sc: Shortcut = parse("Delete").unwrap().canonical().parse().unwrap();
+        assert_eq!(sc.key, tauri_plugin_global_shortcut::Code::Delete);
+        assert!(sc.mods.is_empty());
+    }
+
+    #[test]
     fn modifier_only_names() {
         for k in &MOD_KEYS {
             assert_eq!(mod_key(k.name), Some(k), "{}", k.name);

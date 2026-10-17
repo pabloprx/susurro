@@ -457,7 +457,7 @@ pub struct OrModel {
     pub price_hour: Option<f64>,
     /// The model gets the dictionary words as provider options (MAI phrase list, ElevenLabs keyterms).
     pub keywords: bool,
-    /// The default pick (microsoft/mai-transcribe-2).
+    /// The default pick (DEFAULT_OPENROUTER_STT for STT, DEFAULT_OPENROUTER_CLEANUP for chat).
     pub recommended: bool,
 }
 
@@ -544,8 +544,12 @@ pub struct Navigate {
 
 /// v2: the default ptt became F1; a stored "Fn" moves to it once, and the old 350 ms restore delay becomes 500.
 /// v3: voice control (hotkeys.command = "F2"), and an empty OpenRouter STT model becomes MAI-Transcribe 2.
-pub const SETTINGS_VERSION: u32 = 3;
+/// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
+pub const SETTINGS_VERSION: u32 = 4;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
+/// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
+/// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
+pub const DEFAULT_OPENROUTER_CLEANUP: &str = "google/gemini-2.5-flash-lite";
 pub const JEV_MODEL: &str = "typesafe/jev-1.14";
 
 impl Default for Settings {
@@ -627,7 +631,7 @@ impl Default for CleanupSettings {
         Self {
             level: CleanupLevel::Light,
             provider: LlmProvider::OpenRouter,
-            openrouter_model: String::new(),
+            openrouter_model: DEFAULT_OPENROUTER_CLEANUP.into(),
             local_base_url: "http://127.0.0.1:1234/v1".into(),
             local_model: String::new(),
             timeout_ms: 8000,

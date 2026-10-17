@@ -48,6 +48,8 @@ const GLYPH: Record<string, string> = {
   Space: "Space",
   Enter: "↩",
   Backspace: "⌫",
+  // forward delete (kVK_ForwardDelete): its own key on full keyboards, fn+⌫ on Apple laptops
+  Delete: "Supr ⌦",
   Tab: "⇥",
   Up: "↑",
   Down: "↓",

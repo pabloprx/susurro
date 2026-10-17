@@ -1,13 +1,12 @@
 // DESIGN 6.8
 import { useState, type ReactNode } from "react";
 import { Copy } from "lucide-react";
-import { api, type Settings as T } from "../lib/api";
-import { applyTheme, getTheme, saveSettings, settingsStore, type Theme } from "../lib/store";
+import { api } from "../lib/api";
+import { applyTheme, getTheme, save, settingsStore, type Theme } from "../lib/store";
 import { S } from "../lib/strings";
 import { copy, Label, Segmented, Sheet, Title, Toggle, toast } from "../ui";
 
 const DATA_DIR = "~/Library/Application Support/app.susurro.desktop";
-const save = (f: (s: T) => void) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 
 function Row({ title, help, children }: { title: string; help?: string; children: ReactNode }) {
   return (

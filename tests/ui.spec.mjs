@@ -749,14 +749,24 @@ test.describe("providers", () => {
     await page.keyboard.press("ArrowUp");
     await expect(prov(page, "Local server")).toHaveAttribute("aria-checked", "true");
   });
+  test("a rejected save shows an error and reverts", async ({ page }) => {
+    await page.evaluate(() => (window.mock.failSave = "save settings: disk full"));
+    await prov(page, "OpenRouter").click();
+    await expect(toastText(page, "Not saved: save settings: disk full")).toBeVisible();
+    await expect(prov(page, "Local Whisper")).toHaveAttribute("aria-checked", "true");
+  });
   test("cleanup: off, local, openrouter + test", async ({ page }) => {
     const sel = page.getByRole("combobox", { name: "Cleanup provider" });
     const card = page.locator(".card.pad");
     await expect(sel).toHaveValue("openrouter");
     await card.locator(".test-btn").click();
     await expect(card.locator(".test-result")).toContainText("612 ms");
-    await card.getByRole("combobox", { name: "Model" }).selectOption("anthropic/claude-haiku-4.5");
-    await expect(card.getByRole("combobox", { name: "Model" })).toHaveValue("anthropic/claude-haiku-4.5");
+    await card.getByRole("button", { name: "Model: Gemini 2.5 Flash" }).click();
+    const models = card.getByRole("listbox", { name: "Cleanup models" });
+    await expect(models.getByRole("option", { name: /Gemini 2.5 Flash Lite/ })).toContainText("RECOMMENDED");
+    await card.getByRole("combobox", { name: "Search models" }).fill("haiku");
+    await models.getByRole("option", { name: /Claude Haiku 4.5/ }).click();
+    await expect(card.getByRole("button", { name: "Model: Claude Haiku 4.5" })).toBeVisible();
     await sel.selectOption("local");
     await expect(card).toContainText("LM Studio");
     await card.getByPlaceholder("qwen3-8b").fill("qwen3-8b");
@@ -1043,7 +1053,7 @@ test.describe("shortcuts", () => {
   test("quick picks per action", async ({ page }) => {
     await bind(page, "Push to talk").click();
     const picks = page.getByLabel("Quick picks for Push to talk").getByRole("button");
-    await expect(picks).toHaveText(["F1", "right ⌥", "right ⌘"]);
+    await expect(picks).toHaveText(["F1", "Supr ⌦", "right ⌥", "right ⌘"]);
     await expect(picks.first()).toBeDisabled(); // the current binding
     await page.getByRole("button", { name: "Use Right ⌘" }).click();
     await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: RightCommand\./);
@@ -1054,6 +1064,21 @@ test.describe("shortcuts", () => {
     await bind(page, "Paste last").click();
     await page.getByLabel("Quick picks for Paste last").getByRole("button", { name: "Use ⌥ ⇧ V" }).click();
     await expect(bind(page, "Paste last")).toHaveAttribute("aria-label", /^Paste last: Alt\+Shift\+V\./);
+  });
+  test("Supr (forward delete): the recorder binds it, and holding it dictates", async ({ page }) => {
+    await bind(page, "Push to talk").click();
+    await page.keyboard.press("Delete");
+    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: Delete\./);
+    await expect(row(page, "Push to talk").locator(".bind kbd")).toHaveText("Supr ⌦");
+    const live = page.locator(".shell > .sr-only");
+    // the hotkeys resume a moment after the recorder closes (hotkey_capture off)
+    await expect(async () => {
+      await page.keyboard.down("Delete");
+      await expect(live).toHaveText("Listening", { timeout: 300 });
+    }).toPass();
+    await page.waitForTimeout(400);
+    await page.keyboard.up("Delete");
+    await expect(live).toHaveText("Pasted");
   });
   test("holding F1 dictates; a tap does not; a double tap is hands-free", async ({ page }) => {
     const live = page.locator(".shell > .sr-only");

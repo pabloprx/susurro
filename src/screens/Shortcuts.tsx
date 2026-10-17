@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { api, type Hotkeys } from "../lib/api";
-import { isModOnly, keyLabel, keysOf, permStore, saveSettings, settingsStore, VOICE_CONTROL } from "../lib/store";
+import { isModOnly, keyLabel, keysOf, permStore, save, saveSettings, settingsStore, VOICE_CONTROL } from "../lib/store";
 import { S } from "../lib/strings";
 import { Kbd, Label, Title, Toggle } from "../ui";
 import type { Nav } from "../App";
@@ -12,7 +12,7 @@ const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-fr
 export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
-  ptt: ["F1", "RightOption", "RightCommand"],
+  ptt: ["F1", "Delete", "RightOption", "RightCommand"],
   hands_free: ["Alt+Space", "Ctrl+Alt+Space"],
   cancel: ["Escape", "Ctrl+."],
   paste_last: ["Ctrl+Cmd+V", "Alt+Shift+V"],
@@ -38,7 +38,7 @@ function keyName(e: KeyboardEvent): string | null {
   if (c.startsWith("Digit")) return c.slice(5);
   if (/^F\d+$/.test(c)) return c;
   if (c.startsWith("Arrow")) return c.slice(5);
-  const m: Record<string, string> = { Space: "Space", Enter: "Enter", Backspace: "Backspace", Tab: "Tab", Escape: "Escape", Minus: "-", Equal: "=", Comma: ",", Period: ".", Slash: "/", Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Backquote: "`" };
+  const m: Record<string, string> = { Space: "Space", Enter: "Enter", Backspace: "Backspace", Delete: "Delete", Tab: "Tab", Escape: "Escape", Minus: "-", Equal: "=", Comma: ",", Period: ".", Slash: "/", Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Backquote: "`" };
   return m[c] ?? null;
 }
 
@@ -202,7 +202,7 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
           </div>
           <span className="inline">
             <span className="inline" style={{ gap: 8 }}>
-              <Toggle label="Double-tap push to talk" on={hk.double_tap} onChange={(v) => saveSettings((x) => void (x.hotkeys.double_tap = v))} />
+              <Toggle label="Double-tap push to talk" on={hk.double_tap} onChange={(v) => save((x) => void (x.hotkeys.double_tap = v))} />
               <span className="small">double-tap {ptt}</span>
             </span>
             <span className="small">or</span>

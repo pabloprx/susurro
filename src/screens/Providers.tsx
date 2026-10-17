@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Eye, EyeOff, Search, X } from "lucide-react";
 import { api, on, type KeyName, type ModelInfo, type OrModel, type ProviderTest, type Settings, type SttProvider } from "../lib/api";
-import { ago, keyStore, modelName, saveSettings, settingsStore } from "../lib/store";
+import { ago, keyStore, modelName, save, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
 import { Dot, Label, radioKeys, Spinner, Title, Toggle, toast } from "../ui";
 
@@ -19,7 +19,6 @@ export const LANGUAGES: [string, string][] = [
   ["zh", "中文"],
 ];
 
-const save = (f: (s: Settings) => void) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 
 /** Host of a server URL, or null if it does not parse (a hand-edited settings.json can hold anything). */
 const hostOf = (u: string) => {
@@ -193,7 +192,7 @@ export default function Providers() {
           <>
             <div className="form-grid">
               <span className="label">Model</span>
-              <SttPicker hasKey={keys!.openrouter} value={s!.stt.openrouter_model} onChange={(v) => save((x) => void (x.stt.openrouter_model = v))} onList={setSttModels} />
+              <ModelPicker kind="stt" hasKey={keys!.openrouter} value={s!.stt.openrouter_model} onChange={(v) => save((x) => void (x.stt.openrouter_model = v))} onList={setSttModels} />
             </div>
             <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
               <span className="small">{sttPick?.keywords ? S.help.keywordsStt(shortName(sttPick.name)) : S.help.openrouterStt}</span>
@@ -234,7 +233,7 @@ function Cleanup({ s, hasKey }: { s: Settings; hasKey: boolean }) {
         {prov === "openrouter" && (
           <>
             <span className="label">Model</span>
-            <OrPicker kind="chat" hasKey={hasKey} value={s.cleanup.openrouter_model} onChange={(v) => save((x) => void (x.cleanup.openrouter_model = v))} />
+            <ModelPicker kind="chat" hasKey={hasKey} value={s.cleanup.openrouter_model} onChange={(v) => save((x) => void (x.cleanup.openrouter_model = v))} />
           </>
         )}
         {prov === "local" && (
@@ -254,40 +253,14 @@ function Cleanup({ s, hasKey }: { s: Settings; hasKey: boolean }) {
   );
 }
 
-function OrPicker({ kind, hasKey, value, onChange }: { kind: "stt" | "chat"; hasKey: boolean; value: string; onChange: (v: string) => void }) {
-  const [list, setList] = useState<OrModel[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  useEffect(() => {
-    if (hasKey) api.openrouterModels(kind).then(setList, (e) => setErr(String(e)));
-  }, [hasKey, kind]);
-  if (!hasKey) return <span className="small">Add an OpenRouter key below to pick a model.</span>;
-  if (err) return <TextField mono value={value} placeholder="google/gemini-2.5-flash" onSave={onChange} />;
-  if (!list)
-    return (
-      <span className="inline small">
-        <Spinner /> Loading models…
-      </span>
-    );
-  return (
-    <select className="input mono" style={{ maxWidth: 360 }} value={value} onChange={(e) => onChange(e.target.value)} aria-label="Model">
-      {!value && <option value="">Pick a model</option>}
-      {value && !list.some((m) => m.id === value) && <option value={value}>{value}</option>}
-      {list.map((m) => (
-        <option key={m.id} value={m.id}>
-          {m.id}
-        </option>
-      ))}
-    </select>
-  );
-}
-
 /** "Microsoft AI: MAI-Transcribe 2" -> "MAI-Transcribe 2" (the vendor shows in the id on hover). */
 const shortName = (n: string) => n.replace(/^[^:]+:\s*/, "");
 const price = (m: OrModel) => (m.price_hour == null ? "per token" : `$${m.price_hour < 0.1 ? m.price_hour.toFixed(3) : m.price_hour.toFixed(2)}/h`);
 
-/** OpenRouter STT picker (VOICE_CONTROL.md E.4): ranked models first, MAI-Transcribe 2 recommended, price per hour,
- *  KEYWORDS on models that take the dictionary words. Combobox: type to filter, arrows move, Enter picks, Esc closes. */
-function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value: string; onChange: (v: string) => void; onList: (l: OrModel[]) => void }) {
+/** OpenRouter model picker for STT (VOICE_CONTROL.md E.4: ranked models first, MAI-Transcribe 2 recommended, price
+ *  per hour, KEYWORDS on models that take the dictionary words) and for cleanup (470+ chat models: a native select is
+ *  no way to find one). Combobox: type to filter, arrows move, Enter picks, Esc closes. */
+function ModelPicker({ kind, hasKey, value, onChange, onList }: { kind: "stt" | "chat"; hasKey: boolean; value: string; onChange: (v: string) => void; onList?: (l: OrModel[]) => void }) {
   const [list, setList] = useState<OrModel[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -296,8 +269,8 @@ function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value
   const root = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (hasKey) api.openrouterModels("stt").then((l) => (setList(l), onList(l)), (e) => setErr(String(e)));
-  }, [hasKey]);
+    if (hasKey) api.openrouterModels(kind).then((l) => (setList(l), onList?.(l)), (e) => setErr(String(e)));
+  }, [hasKey, kind]);
   useEffect(() => {
     if (!open) return;
     const down = (e: PointerEvent) => !root.current?.contains(e.target as Node) && setOpen(false);
@@ -309,7 +282,7 @@ function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value
     listRef.current?.querySelector(`[data-i="${at}"]`)?.scrollIntoView({ block: "nearest" });
   }, [at, open]);
   if (!hasKey) return <span className="small">Add an OpenRouter key below to pick a model.</span>;
-  if (err) return <TextField mono value={value} placeholder="microsoft/mai-transcribe-2" onSave={onChange} />;
+  if (err) return <TextField mono value={value} placeholder={kind === "stt" ? "microsoft/mai-transcribe-2" : "google/gemini-2.5-flash-lite"} onSave={onChange} />;
   if (!list)
     return (
       <span className="inline small">
@@ -357,14 +330,14 @@ function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value
               placeholder="Search models…"
               role="combobox"
               aria-expanded
-              aria-controls="stt-list"
-              aria-activedescendant={shown[at] ? `stt-${at}` : undefined}
+              aria-controls={`${kind}-list`}
+              aria-activedescendant={shown[at] ? `${kind}-${at}` : undefined}
               aria-label="Search models"
               onChange={(e) => (setQ(e.target.value), setAt(0))}
               onKeyDown={keys}
             />
           </label>
-          <div className="stt-list" id="stt-list" role="listbox" aria-label="Speech to text models" ref={listRef}>
+          <div className="stt-list" id={`${kind}-list`} role="listbox" aria-label={kind === "stt" ? "Speech to text models" : "Cleanup models"} ref={listRef}>
             {shown.map((m, i) => (
               <div key={m.id} className="stt-group-wrap">
                 {i === 0 && m.rank != null && (
@@ -379,7 +352,7 @@ function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value
                   </div>
                 )}
                 <div
-                  id={`stt-${i}`}
+                  id={`${kind}-${i}`}
                   data-i={i}
                   role="option"
                   aria-selected={m.id === value}
@@ -396,7 +369,7 @@ function SttPicker({ hasKey, value, onChange, onList }: { hasKey: boolean; value
                     {m.recommended && <span className="badge-chip rec">RECOMMENDED</span>}
                     {m.keywords && <span className="badge-chip">KEYWORDS</span>}
                   </span>
-                  <span className="price">{price(m)}</span>
+                  <span className="price">{kind === "stt" && price(m)}</span>
                   <span className="sel">{m.id === value && <Check size={13} strokeWidth={2} />}</span>
                 </div>
               </div>

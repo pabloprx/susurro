@@ -1,6 +1,6 @@
 //! `{app_data_dir}/settings.json`: load with defaults, atomic save, version migration.
 
-use crate::contract::{DEFAULT_OPENROUTER_STT, Hotkeys, JEV_MODEL, MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
+use crate::contract::{DEFAULT_OPENROUTER_CLEANUP, DEFAULT_OPENROUTER_STT, Hotkeys, JEV_MODEL, MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
 use std::path::Path;
 
 /// Missing file -> defaults. Corrupt file -> renamed to `settings.json.bad` (kept for the user), defaults.
@@ -47,6 +47,10 @@ fn migrate(mut s: Settings) -> Settings {
         if crate::hotkey::validate(&s.hotkeys).is_err() && crate::hotkey::validate(&Hotkeys { command: String::new(), ..s.hotkeys.clone() }).is_ok() {
             s.hotkeys.command.clear();
         }
+    }
+    // v4: an empty cleanup model left cleanup off with no sign of it.
+    if s.version < 4 && s.cleanup.openrouter_model.trim().is_empty() {
+        s.cleanup.openrouter_model = DEFAULT_OPENROUTER_CLEANUP.into();
     }
     s.version = SETTINGS_VERSION;
     s
@@ -255,12 +259,22 @@ mod tests {
         assert_eq!(s.hotkeys.command, "F2");
         assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
         assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into() }, "opt-in, also for migrated users");
-        assert_eq!(s.version, 3);
+        assert_eq!(s.version, SETTINGS_VERSION);
         // A picked model is kept; a v3 user may clear it on purpose.
         std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
         assert_eq!(load(&p).stt.openrouter_model, "openai/whisper-1");
         std::fs::write(&p, r#"{"version":3,"stt":{"openrouter_model":""}}"#).unwrap();
         assert_eq!(load(&p).stt.openrouter_model, "");
+    }
+
+    #[test]
+    fn v3_gets_a_cleanup_model() {
+        let p = tmp_dir("v4mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":3,"cleanup":{"provider":"openrouter","openrouter_model":""}}"#).unwrap();
+        assert_eq!(load(&p).cleanup.openrouter_model, DEFAULT_OPENROUTER_CLEANUP);
+        std::fs::write(&p, r#"{"version":3,"cleanup":{"openrouter_model":"openai/gpt-4.1-mini"}}"#).unwrap();
+        assert_eq!(load(&p).cleanup.openrouter_model, "openai/gpt-4.1-mini", "a picked model is kept");
+        assert_eq!(Settings::default().cleanup.openrouter_model, DEFAULT_OPENROUTER_CLEANUP);
     }
 
     #[test]
@@ -296,3 +310,4 @@ mod tests {
         assert_eq!(d, serde_json::json!({"device": {"id": "x"}}));
     }
 }
+

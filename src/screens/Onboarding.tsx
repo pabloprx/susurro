@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, Keyboard, Mic, MousePointerClick, RotateCw } from "lucide-react";
 import { api, on, type HistoryItem, type ModelInfo, type ModelProgress, type Permissions, type Settings } from "../lib/api";
-import { hotkeyStore, isModOnly, keyLabel, keysOf, micStore, modelName, permStore, saveSettings, secs, settingsStore } from "../lib/store";
+import { hotkeyStore, isModOnly, keyLabel, keysOf, micStore, modelName, permStore, save, saveSettings, secs, settingsStore } from "../lib/store";
 import { Kbd, Meter, radioKeys, Serif, Toggle, useLevel } from "../ui";
 import { LANGUAGES } from "./Providers";
 import { useRecorder } from "./Shortcuts";
@@ -63,7 +63,7 @@ export default function Onboarding({ start, onDone, nav }: { start: number; onDo
     localStorage.removeItem(RESUME_KEY);
     sessionStorage.setItem("susurro.skipOnboarding", "1");
     // Wispr turns on open at login at first launch; a dictation app that is not running does nothing
-    if (!repair) await saveSettings((x) => void ((x.onboarded = true), (x.autostart = true)));
+    if (!repair) await save((x) => void ((x.onboarded = true), (x.autostart = true)));
     onDone();
   };
   const go = async (n: number) => {
@@ -88,7 +88,7 @@ export default function Onboarding({ start, onDone, nav }: { start: number; onDo
 
   const steps: ReactNode[] = [
     <Welcome key="w" ptt={s.hotkeys.ptt} onNext={next} />,
-    <PermsStep key="p" onNext={next} onRestart={restart} repair={repair} onUseF1={() => saveSettings((x) => void (x.hotkeys.ptt = "F1"))} />,
+    <PermsStep key="p" onNext={next} onRestart={restart} repair={repair} onUseF1={() => save((x) => void (x.hotkeys.ptt = "F1"))} />,
     <MicStep key="m" onNext={next} />,
     <TalkKeyStep key="k" onNext={next} onRestart={restart} />,
     <TryStep key="t" onFinish={finish} onCloud={async () => (await finish(), nav.go("providers"))} />,
@@ -401,6 +401,7 @@ function MicStep({ onNext }: { onNext: () => void }) {
 
 const KEY_PICKS: [string, string][] = [
   ["F1", "Recommended"],
+  ["Delete", "fn + ⌫ on a Mac"],
   ["RightOption", "+1 permission"],
   ["RightCommand", "+1 permission"],
 ];
@@ -504,14 +505,14 @@ function TalkKeyStep({ onNext, onRestart }: { onNext: () => void; onRestart: () 
             <span className="t">Hands-free</span>
             <span className="d">Double-tap {label} to talk without holding. Tap it again to stop.</span>
           </span>
-          <Toggle label="Double-tap for hands-free" on={s.hotkeys.double_tap} onChange={(v) => saveSettings((x) => void (x.hotkeys.double_tap = v))} />
+          <Toggle label="Double-tap for hands-free" on={s.hotkeys.double_tap} onChange={(v) => save((x) => void (x.hotkeys.double_tap = v))} />
         </div>
         <div className="pref">
           <span>
             <span className="t">Language</span>
             <span className="d">One language is more accurate than auto.</span>
           </span>
-          <select className="input" value={s.language} onChange={(e) => saveSettings((x) => void (x.language = e.target.value))} aria-label="Language">
+          <select className="input" value={s.language} onChange={(e) => save((x) => void (x.language = e.target.value))} aria-label="Language">
             {LANGUAGES.slice(0, 3).map(([v, n]) => (
               <option key={v} value={v}>
                 {n}
@@ -622,6 +623,13 @@ function TryStep({ onFinish, onCloud }: { onFinish: () => void; onCloud: () => v
 
   // focus the field, so a real paste lands in it like it would in any app
   useEffect(() => void (!allDone && field.current?.focus()), [at, needModel]);
+
+  // The picked model is not downloaded but another one is: pick the best downloaded one (the list is best first).
+  useEffect(() => {
+    const have = models?.find((m) => m.downloaded);
+    if (have && s.stt.provider === "whisper_local" && !models!.some((m) => m.downloaded && m.file === s.stt.whisper_model))
+      void save((x) => void (x.stt.whisper_model = have.file));
+  }, [models]);
 
   // no model yet: base q5_1 first so the first try is fast, then turbo q5_0 in the background (DESIGN 6.9)
   useEffect(() => {

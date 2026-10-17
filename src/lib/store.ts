@@ -1,5 +1,6 @@
 // Tiny shared stores (no state library, DESIGN 11) + formatting helpers used by many screens.
 import { useEffect, useSyncExternalStore } from "react";
+import { toast } from "../ui";
 import { api, on, type DeviceKind, type HotkeyStatus, type KeyStatus, type MicState, type Permissions, type Settings } from "./api";
 
 function store<T>(load: () => Promise<T>) {
@@ -81,6 +82,9 @@ export function saveSettings(mutate: (s: Settings) => void): Promise<void> {
     }
   });
 }
+
+/** saveSettings for callers with no error UI of their own: a rejected save shows a toast, never a silent revert. */
+export const save = (mutate: (s: Settings) => void) => saveSettings(mutate).catch((e) => toast(`Not saved: ${e}`, { kind: "error" }));
 
 export * from "./format";
 

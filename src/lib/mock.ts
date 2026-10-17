@@ -68,6 +68,7 @@ sessionStorage.removeItem("mock.perms");
 /** Grants made in "System Settings" while stale: applied only by a relaunch. */
 let pending: Partial<C.Permissions> = {};
 let stale = false;
+let failSave: string | null = null; // window.mock.failSave = "reason": every save_settings rejects
 let capturing = false;
 
 // ---------------- devices ----------------
@@ -392,6 +393,7 @@ function unplug() {
 const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   get_settings: () => settings,
   save_settings: (a) => {
+    if (failSave) throw failSave;
     const s = a.settings as C.Settings;
     const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last, s.hotkeys.copy_last, s.command.enabled ? s.hotkeys.command : null].filter(Boolean); // off = not registered (settings.rs active_hotkeys)
     if (new Set(all).size !== all.length) throw "Two actions share one shortcut";
@@ -520,12 +522,12 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
       ? STT_MODELS
 
       : [
-          { id: "google/gemini-2.5-flash", name: "Google: Gemini 2.5 Flash" },
-          { id: "google/gemini-2.5-flash-lite", name: "Google: Gemini 2.5 Flash Lite" },
-          { id: "anthropic/claude-haiku-4.5", name: "Anthropic: Claude Haiku 4.5" },
-          { id: "openai/gpt-4.1-mini", name: "OpenAI: GPT-4.1 mini" },
-          { id: "meta-llama/llama-3.3-70b-instruct", name: "Meta: Llama 3.3 70B" },
-        ];
+          ["anthropic/claude-haiku-4.5", "Anthropic: Claude Haiku 4.5"],
+          ["google/gemini-2.5-flash", "Google: Gemini 2.5 Flash"],
+          ["google/gemini-2.5-flash-lite", "Google: Gemini 2.5 Flash Lite"],
+          ["meta-llama/llama-3.3-70b-instruct", "Meta: Llama 3.3 70B"],
+          ["openai/gpt-4.1-mini", "OpenAI: GPT-4.1 mini"],
+        ].map(([id, name]): C.OrModel => ({ id, name, rank: null, price_hour: null, keywords: false, recommended: id === "google/gemini-2.5-flash-lite" }));
   },
   permissions_status: () => perms,
   request_permission: async (a) => {
@@ -560,7 +562,7 @@ const MOD_CODE: Record<string, string> = {
   LeftShift: "ShiftLeft",
 };
 /** KeyboardEvent.code of the talk key: a held modifier (CGEventTap) or an F-key (RegisterEventHotKey). */
-const pttCode = (b: string) => MOD_CODE[b] ?? (/^F\d+$/.test(b) ? b : null);
+const pttCode = (b: string) => MOD_CODE[b] ?? (/^F\d+$/.test(b) || b === "Delete" ? b : null);
 const needsTap = (b: string) => b === "Fn" || b in MOD_CODE;
 function hotkeyStatus() {
   const b = settings.hotkeys.ptt;
@@ -902,6 +904,9 @@ if (inBrowser) Object.assign(window, {
     phase,
     set stale(v: boolean) {
       stale = v;
+    },
+    set failSave(v: string | null) {
+      failSave = v;
     },
     perms: (p: Partial<C.Permissions>) => void ((perms = { ...perms, ...p }), hotkeyStatus()),
     command,

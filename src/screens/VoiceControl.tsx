@@ -3,15 +3,14 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Check, MonitorUp, RotateCw } from "lucide-react";
 import { api, on, type CommandStep } from "../lib/api";
-import { keyLabel, keysOf, keyStore, permStore, saveSettings, settingsStore, VERB } from "../lib/store";
+import { keyLabel, keysOf, keyStore, permStore, save, saveSettings, settingsStore, VERB } from "../lib/store";
 import { S } from "../lib/strings";
-import { Kbd, Label, Title, Toggle, toast } from "../ui";
+import { Kbd, Label, Title, Toggle } from "../ui";
 import { Diagram, usePermWatch } from "./Onboarding";
 import { DEFAULTS, PICKS, useRecorder } from "./Shortcuts";
 import type { Nav } from "../App";
 
 const PINNED_MODEL = "typesafe/jev-1.14";
-const save = (f: Parameters<typeof saveSettings>[0]) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 const ENDED: CommandStep["status"][] = ["done", "stopped", "unsure", "blocked", "setup", "error"];
 
 export default function VoiceControl({ nav }: { nav: Nav }) {

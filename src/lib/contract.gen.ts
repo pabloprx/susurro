@@ -191,7 +191,7 @@ price_hour: number | null,
  */
 keywords: boolean, 
 /**
- * The default pick (microsoft/mai-transcribe-2).
+ * The default pick (DEFAULT_OPENROUTER_STT for STT, DEFAULT_OPENROUTER_CLEANUP for chat).
  */
 recommended: boolean, };
 

@@ -51,7 +51,14 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
     let st = &s.stt;
     let primary: Box<dyn Transcriber> = match st.provider {
         SttProvider::WhisperLocal => {
-            return Ok(Box::new(whisper_local::Whisper::new(whisper_local::context(state, &st.whisper_model)?)));
+            let (file, note) = whisper_local::usable(&state.data_dir, &st.whisper_model);
+            anyhow::ensure!(
+                whisper_local::model_path(&state.data_dir, &file).exists(),
+                "No Whisper model is downloaded yet ({file}). Wait for the download to finish, or download one in Providers"
+            );
+            let mut w = whisper_local::Whisper::new(whisper_local::context(state, &file)?);
+            w.note = note;
+            return Ok(Box::new(w));
         }
         SttProvider::OpenAiCompat => Box::new(openai_compat::OpenAiCompat {
             base: st.openai_compat.base_url.clone(),
@@ -79,7 +86,8 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
         return Ok(primary);
     }
     // ponytail: only an already-loaded context is used (try_lock, no wait on a running preload).
-    let local = state.whisper.try_lock().ok().and_then(|g| g.as_ref().filter(|(f, _)| *f == st.whisper_model).map(|(_, c)| c.clone()));
+    let (file, _) = whisper_local::usable(&state.data_dir, &st.whisper_model);
+    let local = state.whisper.try_lock().ok().and_then(|g| g.as_ref().filter(|(f, _)| *f == file).map(|(_, c)| c.clone()));
     Ok(match local {
         Some(ctx) => Box::new(WithFallback { primary, local: whisper_local::Whisper::new(ctx) }),
         None => primary,
@@ -258,7 +266,8 @@ pub(crate) fn list_models(base: &str, kind: &str, key: Option<&str>) -> anyhow::
             let rank = RANKED.iter().position(|r| *r == id).map(|i| i as u32 + 1).filter(|_| stt);
             let price_hour = if stt { price_hour(&id, p("prompt"), p("completion")) } else { None };
             let keywords = stt && openrouter::options_for(&id, &["x".into()], false).is_some();
-            Some(OrModel { recommended: id == crate::contract::DEFAULT_OPENROUTER_STT, rank, price_hour, keywords, id, name })
+            let rec = if stt { crate::contract::DEFAULT_OPENROUTER_STT } else { crate::contract::DEFAULT_OPENROUTER_CLEANUP };
+            Some(OrModel { recommended: id == rec, rank, price_hour, keywords, id, name })
         })
         .collect();
     // Ranked first in ranking order, then the rest by name.

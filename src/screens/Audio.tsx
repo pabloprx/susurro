@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ChevronRight, GripVertical } from "lucide-react";
 import { api, type DeviceInfo, type KnownDevice } from "../lib/api";
-import { KIND_LABEL, micStore, saveSettings, settingsStore } from "../lib/store";
+import { KIND_LABEL, micStore, save, settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
 import { Dot, Empty, Label, Meter, radioKeys, Title, useLevel } from "../ui";
 import type { Nav } from "../App";
@@ -196,7 +196,7 @@ export default function Audio({ nav }: { nav: Nav }) {
           })}
         </div>
         {virtuals.length > 0 && (
-          <button className="disclosure" aria-expanded={showVirtual} onClick={() => saveSettings((x) => void (x.mic.show_virtual = !showVirtual))}>
+          <button className="disclosure" aria-expanded={showVirtual} onClick={() => save((x) => void (x.mic.show_virtual = !showVirtual))}>
             <ChevronRight size={14} strokeWidth={1.5} />
             {showVirtual ? "Hide" : "Show"} virtual devices ({virtuals.length})<span className="small ellipsis">{virtuals.map((v) => v.name).join(", ")}</span>
           </button>
