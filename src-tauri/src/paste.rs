@@ -375,6 +375,9 @@ pub fn paste(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> PasteOutcome
         let snap = if o.restore_clipboard { mac::snapshot(&pb) } else { None };
         let ours = mac::write_text(&pb, &text, true);
         mac::key(9, CGEventFlags::CGEventFlagCommand); // kVK_ANSI_V
+        if let Some(f) = front.as_ref() {
+            crate::learn::watch(f.pid, &text); // learn from the user's edits (learn.rs)
+        }
         if let Some(snap) = snap {
             let bundle = front.as_ref().and_then(|f| f.bundle_id.as_deref());
             mac::restore_later(ours, snap, restore_delay(bundle, o.restore_delay_ms));

@@ -4,7 +4,9 @@ use super::{SttOutput, SttRequest, Transcriber};
 use crate::AppState;
 use crate::contract::SttProvider;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use crate::dictionary::Hints;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 use tauri::{AppHandle, Manager};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -95,15 +97,27 @@ impl Whisper {
 
 impl Transcriber for Whisper {
     fn transcribe(&self, req: &SttRequest) -> anyhow::Result<SttOutput> {
+        self.run(req, "")
+    }
+}
+
+impl Whisper {
+    /// `prev`: the text of the chunk before this one (streaming), the last words go into the initial prompt.
+    fn run(&self, req: &SttRequest, prev: &str) -> anyhow::Result<SttOutput> {
         let lang = req.lang();
         // An English-only model turns other speech into invented English: fail (the WAV is kept for Retry).
         anyhow::ensure!(self.ctx.is_multilingual() || lang == Some("en"), "{}", ENGLISH_ONLY);
-        let prompt = if req.hints.terms.is_empty() {
-            String::new()
-        } else {
-            let count = |s: &str| self.ctx.tokenize(s, 1024).map(|t| t.len()).unwrap_or(usize::MAX);
-            crate::dictionary::whisper_prompt(req.hints, lang, PROMPT_TOKENS, &count).replace('\0', "")
-        };
+        let count = |s: &str| self.ctx.tokenize(s, 1024).map(|t| t.len()).unwrap_or(usize::MAX);
+        // Half the budget for the previous chunk's last words, the rest for the dictionary terms.
+        let mut tail: Vec<&str> = prev.split_whitespace().collect();
+        tail.drain(..tail.len().saturating_sub(60));
+        while !tail.is_empty() && count(&tail.join(" ")) > PROMPT_TOKENS / 2 {
+            tail.remove(0);
+        }
+        let tail = tail.join(" ");
+        let budget = PROMPT_TOKENS - if tail.is_empty() { 0 } else { count(&tail) + 1 };
+        let terms = if req.hints.terms.is_empty() { String::new() } else { crate::dictionary::whisper_prompt(req.hints, lang, budget, &count) };
+        let prompt = [terms.as_str(), tail.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ").replace('\0', "");
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         p.set_language(Some(lang.unwrap_or("auto")));
         p.set_no_context(true);
@@ -112,7 +126,9 @@ impl Transcriber for Whisper {
         p.set_print_realtime(false);
         p.set_print_special(false);
         p.set_print_timestamps(false);
-        p.set_n_threads(std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4) as i32);
+        // SUSURRO_WHISPER_THREADS: a cap for benchmarks on a shared Mac.
+        let threads = std::env::var("SUSURRO_WHISPER_THREADS").ok().and_then(|v| v.parse().ok());
+        p.set_n_threads(threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4)) as i32);
         if !prompt.is_empty() {
             p.set_initial_prompt(&prompt);
         }
@@ -131,6 +147,67 @@ impl Transcriber for Whisper {
             .collect();
         let language = whisper_rs::get_lang_str(st.full_lang_id_from_state()).map(str::to_string);
         Ok(SttOutput { text: text.trim().to_string(), language, note: self.note.clone(), fell_back: false })
+    }
+}
+
+/// Streaming: one worker thread transcribes the chunks in order while the user still speaks (one context,
+/// one chunk at a time, the previous chunk's text as the prompt). `finish` adds the tail and joins the texts.
+pub struct Stream {
+    tx: Option<mpsc::Sender<Vec<f32>>>,
+    done: Option<std::thread::JoinHandle<anyhow::Result<SttOutput>>>,
+    abort: Arc<AtomicBool>,
+}
+
+impl Stream {
+    pub fn spawn(w: Whisper, language: Option<String>, hints: Hints) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let abort = Arc::new(AtomicBool::new(false));
+        let stop = abort.clone();
+        let done = std::thread::Builder::new()
+            .name("whisper-stream".into())
+            .spawn(move || {
+                let (mut texts, mut lang) = (Vec::<String>::new(), None);
+                for audio in rx {
+                    if stop.load(Ordering::SeqCst) {
+                        anyhow::bail!("aborted");
+                    }
+                    let t = Instant::now();
+                    // "auto": the first chunk's language holds for the rest, like single-shot (whisper detects once).
+                    let auto = language.as_deref().is_none_or(|l| l.is_empty() || l == "auto");
+                    let req = SttRequest { audio: &audio, language: if auto { lang.as_deref().or(language.as_deref()) } else { language.as_deref() }, hints: &hints };
+                    let o = w.run(&req, texts.last().map_or("", String::as_str))?;
+                    log::info!("whisper stream: chunk {} ({} ms audio) in {} ms", texts.len() + 1, audio.len() / 16, t.elapsed().as_millis());
+                    if !o.text.is_empty() {
+                        lang = lang.or(o.language); // a noise-only chunk's language is a guess
+                        texts.push(o.text);
+                    }
+                }
+                Ok(SttOutput { text: texts.join(" "), language: lang, note: w.note.clone(), fell_back: false })
+            })
+            .expect("spawn whisper-stream");
+        Self { tx: Some(tx), done: Some(done), abort }
+    }
+
+    pub fn push(&self, chunk: Vec<f32>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(chunk);
+        }
+    }
+
+    /// Blocks until every chunk (and `tail`) is transcribed. Err = some chunk failed: run the clip single-shot.
+    pub fn finish(mut self, tail: Option<Vec<f32>>) -> anyhow::Result<SttOutput> {
+        if let Some(t) = tail {
+            self.push(t);
+        }
+        self.tx = None;
+        self.done.take().unwrap().join().map_err(|_| anyhow::anyhow!("whisper stream panicked"))?
+    }
+}
+
+impl Drop for Stream {
+    /// Cancel: the worker skips the queued chunks (the one on the GPU finishes).
+    fn drop(&mut self) {
+        self.abort.store(true, Ordering::SeqCst);
     }
 }
 

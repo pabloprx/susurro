@@ -37,7 +37,7 @@ pub fn key(s: &str) -> String {
 }
 
 /// Top 5000 words per language, from hermitdave/FrequencyWords (OpenSubtitles 2018, MIT).
-fn is_common(w: &str) -> bool {
+pub(crate) fn is_common(w: &str) -> bool {
     static SET: OnceLock<HashSet<String>> = OnceLock::new();
     SET.get_or_init(|| {
         [include_str!("../data/common_en.txt"), include_str!("../data/common_es.txt")]
@@ -50,7 +50,7 @@ fn is_common(w: &str) -> bool {
 }
 
 /// Damerau-Levenshtein (optimal string alignment).
-fn dl(a: &[char], b: &[char]) -> usize {
+pub(crate) fn dl(a: &[char], b: &[char]) -> usize {
     let (n, m) = (a.len(), b.len());
     let mut d = vec![vec![0usize; m + 1]; n + 1];
     for (i, row) in d.iter_mut().enumerate() {

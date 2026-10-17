@@ -11,7 +11,7 @@ use crate::history;
 use crate::paste::{self, AppRef, PasteOutcome};
 use crate::pipeline::{self, Done, Outcome};
 use crate::secrets;
-use crate::stt::{self, SttRequest};
+use crate::stt::{self, SttRequest, whisper_local};
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -79,6 +79,8 @@ pub enum Act {
     ProcessKept,
     /// Toast "1 minute left".
     Warn,
+    /// A hold was released: the recording goes on `ms` more for a press that locks hands-free (overlay countdown).
+    Grace { ms: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,7 +90,11 @@ enum St {
     Rec { start: Instant, down: Instant },
     /// Released after a short tap: wait for the 2nd tap (the recorder keeps running).
     TapWait { start: Instant, until: Instant },
+    /// Released after a hold: a press before `until` locks hands-free and keeps this recording; else Process.
+    Grace { start: Instant, until: Instant },
     Locked { start: Instant },
+    /// Pressed again in the grace: hands-free (Locked) unless this press turns out to be a hold, whose release processes.
+    Regrab { start: Instant, down: Instant },
     Busy,
 }
 
@@ -97,20 +103,22 @@ pub struct Machine {
     st: St,
     pub double_tap: bool,
     pub max: Duration,
+    /// Hands-free grace after a hold (hotkeys.hands_free_grace_ms). Zero = a release processes at once.
+    pub grace: Duration,
     warned: bool,
     undo_until: Option<Instant>,
 }
 
 impl Machine {
     pub fn new(double_tap: bool, max: Duration) -> Self {
-        Self { st: St::Idle, double_tap, max, warned: false, undo_until: None }
+        Self { st: St::Idle, double_tap, max, grace: Duration::ZERO, warned: false, undo_until: None }
     }
 
     pub fn phase(&self) -> Phase {
         match self.st {
             St::Idle => Phase::Idle,
-            St::Rec { .. } | St::TapWait { .. } => Phase::Recording,
-            St::Locked { .. } => Phase::Locked,
+            St::Rec { .. } | St::TapWait { .. } | St::Grace { .. } => Phase::Recording,
+            St::Locked { .. } | St::Regrab { .. } => Phase::Locked,
             St::Busy => Phase::Processing,
         }
     }
@@ -130,17 +138,25 @@ impl Machine {
                 (Busy, Some(Act::ProcessKept))
             }
             (Rec { start, down }, Ev::Up) if self.double_tap && now - down < TAP => (TapWait { start, until: now + DOUBLE }, None),
-            (Rec { .. } | TapWait { .. } | Locked { .. }, Ev::Stop) => (Busy, Some(Act::Process)),
+            (Rec { .. } | TapWait { .. } | Grace { .. } | Locked { .. } | Regrab { .. }, Ev::Stop) => (Busy, Some(Act::Process)),
+            (Rec { start, .. }, Ev::Up) if !self.grace.is_zero() => (Grace { start, until: now + self.grace }, Some(Act::Grace { ms: self.grace.as_millis() as u32 })),
             (Rec { .. }, Ev::Up) => (Busy, Some(Act::Process)),
-            (Rec { start, .. } | TapWait { start, .. }, Ev::Toggle) | (TapWait { start, .. }, Ev::Down) => (Locked { start }, Some(Act::Lock)),
+            (Grace { start, until }, Ev::Down) if now < until => (Regrab { start, down: now }, Some(Act::Lock)),
+            (Regrab { down, .. }, Ev::Up) if now - down >= TAP => (Busy, Some(Act::Process)),
+            (Regrab { start, .. }, Ev::Up) => (Locked { start }, None),
+            (Regrab { .. }, Ev::Toggle) => (Busy, Some(Act::Process)),
+            // The tick did not run yet: a late press still ends the grace (and is dropped by the busy guard).
+            (Grace { .. }, Ev::Down) => (Busy, Some(Act::Process)),
+            (Grace { start, until }, Ev::Tick) if now >= until || now - start >= self.max => (Busy, Some(Act::Process)),
+            (Rec { start, .. } | TapWait { start, .. } | Grace { start, .. }, Ev::Toggle) | (TapWait { start, .. }, Ev::Down) => (Locked { start }, Some(Act::Lock)),
             (TapWait { until, .. }, Ev::Tick) if now >= until => (Idle, Some(Act::Discard)),
             (Locked { .. }, Ev::Toggle | Ev::Down) => (Busy, Some(Act::Process)),
             (Rec { down, .. }, Ev::Cancel) if now - down < CHORD => (Idle, Some(Act::Discard)),
-            (Rec { .. } | TapWait { .. } | Locked { .. }, Ev::Cancel) => {
+            (Rec { .. } | TapWait { .. } | Grace { .. } | Locked { .. } | Regrab { .. }, Ev::Cancel) => {
                 self.undo_until = Some(now + UNDO);
                 (Idle, Some(Act::CancelUndoable))
             }
-            (Rec { start, .. } | Locked { start }, Ev::Tick) => {
+            (Rec { start, .. } | Locked { start } | Regrab { start, .. }, Ev::Tick) => {
                 let el = now - start;
                 if el >= self.max {
                     (Busy, Some(Act::Process))
@@ -196,6 +212,11 @@ fn provider_label(s: &crate::contract::Settings, fell_back: bool) -> String {
 
 /// Section 0 with the current settings and dictionary. Blocking (STT, LLM).
 pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run {
+    run_pipeline_with(state, clip, bundle, None)
+}
+
+/// `streamed`: the STT text the streaming worker already made for this clip (local whisper). None = single-shot.
+fn run_pipeline_with(state: &AppState, clip: &Clip, bundle: Option<&str>, streamed: Option<stt::SttOutput>) -> Run {
     let s = state.settings.read().unwrap().clone();
     let entries = dictionary::load(&state.db.lock().unwrap()).unwrap_or_else(|e| {
         log::warn!("dictionary load: {e}");
@@ -206,7 +227,10 @@ pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run 
     let raw_app = bundle.is_some_and(|b| s.styles.raw_apps.iter().any(|r| r == b));
     let key = if raw_app { None } else { secrets::get(cleanup::key_name(&s)) };
     let level = cleanup::effective_level(&s, key.as_deref());
-    let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);
+    let stt_fn = |r: &SttRequest| match &streamed {
+        Some(o) => Ok(o.clone()),
+        None => stt::build(&s, state)?.transcribe(r),
+    };
     let clean_fn = |t: &str, h: &Hints| cleanup::cleanup(&s, key.as_deref(), &level, t, h);
     let clean: pipeline::Cleaner = (level != CleanupLevel::None).then_some(&clean_fn as &dyn Fn(&str, &Hints) -> anyhow::Result<String>);
     let opts = pipeline::Opts {
@@ -288,6 +312,10 @@ struct Actor {
     answering: bool,
     /// The app and start time of the running command (its History row).
     cmd_ctx: Option<Ctx>,
+    /// Local whisper transcribes finished chunks while the user speaks (None: cloud STT, model not loaded, a command).
+    stream: Option<(audio::Chunker, whisper_local::Stream)>,
+    /// The next session_state carries this hands-free grace countdown.
+    grace: Option<u32>,
 }
 
 /// Start the actor: std::thread with a recv_timeout(100ms) loop. lib.rs setup already calls this.
@@ -295,7 +323,7 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
     std::thread::Builder::new()
         .name("session".into())
         .spawn(move || {
-            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None, command: false, acting: false, answering: false, cmd_ctx: None };
+            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None, command: false, acting: false, answering: false, cmd_ctx: None, stream: None, grace: None };
             // Busy guard: hotkey input that queued up while the (blocking) pipeline ran is dropped.
             // Exception: Esc / F2 pressed during a command's STT still stop the command it starts.
             let drain = |a: &mut Actor, rx: &mpsc::Receiver<SessionCmd>| {
@@ -350,6 +378,7 @@ impl Actor {
             app: self.ctx.as_ref().and_then(|c| c.app.as_ref().and_then(|a| a.name.clone())),
             message,
             command: self.command,
+            grace_ms: self.grace.take(),
         };
         *CURRENT.lock().unwrap() = s.clone();
         let _ = self.app.emit("session_state", s);
@@ -387,11 +416,11 @@ impl Actor {
     /// Returns true if the command ran the (blocking) pipeline.
     fn handle(&mut self, cmd: SessionCmd) -> bool {
         let now = Instant::now();
-        let (dt, max) = {
+        let (dt, max, grace) = {
             let s = self.state().settings.read().unwrap();
-            (s.hotkeys.double_tap, Duration::from_secs(s.recording.max_seconds.max(1) as u64))
+            (s.hotkeys.double_tap, Duration::from_secs(s.recording.max_seconds.max(1) as u64), Duration::from_millis(s.hotkeys.hands_free_grace_ms.min(800) as u64))
         };
-        (self.m.double_tap, self.m.max) = (dt, max);
+        (self.m.double_tap, self.m.max, self.m.grace) = (dt, max, grace);
         // A command (recording or acting) owns the session: the dictation keys wait.
         if self.command && matches!(cmd, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle) {
             return false;
@@ -452,7 +481,7 @@ impl Actor {
                 }
             }
             SessionCmd::ToastAction { toast_id, action_id } => {
-                if audio::handle_toast_action(&self.app, &toast_id, &action_id) {
+                if audio::handle_toast_action(&self.app, &toast_id, &action_id) || crate::learn::handle_toast_action(&self.app, &toast_id, &action_id) {
                     return false;
                 }
                 match (toast_id.as_str(), action_id.as_str()) {
@@ -497,7 +526,7 @@ impl Actor {
             SessionCmd::Shutdown => return false,
         };
         if self.command {
-            self.m.double_tap = false; // a command is hold-only
+            (self.m.double_tap, self.m.grace) = (false, Duration::ZERO); // a command is hold-only
         }
         self.act(ev, now)
     }
@@ -507,14 +536,20 @@ impl Actor {
         match act {
             Act::Start { locked } => self.start(locked),
             Act::Lock => self.set(Phase::Locked, None),
+            Act::Grace { ms } => {
+                self.grace = Some(ms);
+                self.set(Phase::Recording, None);
+            }
             Act::Warn => toast(&self.app, None, "time-left", ToastKind::Warn, "1 minute left", &[], 4000),
             Act::Discard | Act::CancelUndoable if self.command => self.drop_command_recording(),
             Act::Discard => {
+                self.stream = None;
                 self.rec = None;
                 self.ctx = None;
                 self.set(Phase::Idle, None);
             }
             Act::CancelUndoable => {
+                self.stream = None;
                 if let (Some(rec), Some(ctx)) = (self.rec.take(), self.ctx.take()) {
                     self.kept = Some((rec.stop(), ctx));
                 }
@@ -564,6 +599,7 @@ impl Actor {
         match rec {
             Ok(r) => {
                 self.ctx = Some(Ctx { app: front, started_at: history::now_ms(), device: Some(r.device().name.clone()) });
+                self.stream = if self.command { None } else { self.streamer(&r) };
                 self.rec = Some(r);
                 self.set(if locked { Phase::Locked } else { Phase::Recording }, None);
             }
@@ -571,6 +607,38 @@ impl Actor {
                 self.m.idle();
                 self.ctx = None;
                 self.fail(format!("{}: {e:#}", dev.info.name));
+            }
+        }
+    }
+
+    /// Streaming needs local whisper with its context already loaded (the preload): else single-shot at the end.
+    fn streamer(&self, rec: &Recorder) -> Option<(audio::Chunker, whisper_local::Stream)> {
+        let state = self.state();
+        let s = state.settings.read().unwrap().clone();
+        if s.stt.provider != SttProvider::WhisperLocal {
+            return None;
+        }
+        let (file, note) = whisper_local::usable(&state.data_dir, &s.stt.whisper_model);
+        let ctx = state.whisper.try_lock().ok()?.as_ref().filter(|(f, _)| *f == file).map(|(_, c)| c.clone())?;
+        let mut d = Dictionary::new(dictionary::load(&state.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone());
+        d.spoken_punctuation = s.spoken_punctuation;
+        let mut w = whisper_local::Whisper::new(ctx);
+        w.note = note;
+        Some((rec.chunker(), whisper_local::Stream::spawn(w, Some(s.language.clone()), d.hints())))
+    }
+
+    /// The streaming transcript of `clip`: the chunks so far plus the tail. None = run it single-shot.
+    fn finish_stream(&mut self, clip: &Clip) -> Option<stt::SttOutput> {
+        let (ch, st) = self.stream.take()?;
+        let t = Instant::now();
+        match st.finish(ch.tail(clip)) {
+            Ok(o) => {
+                log::info!("whisper stream: final text {} ms after the stop", t.elapsed().as_millis());
+                Some(o)
+            }
+            Err(e) => {
+                log::warn!("whisper stream failed, running the clip single-shot: {e:#}");
+                None
             }
         }
     }
@@ -685,7 +753,8 @@ impl Actor {
         self.set(Phase::Processing, None);
         let t = Instant::now();
         let bundle = self.ctx.as_ref().and_then(|c| c.app.as_ref().and_then(|a| a.bundle_id.clone()));
-        let run = run_pipeline(self.state(), &clip, bundle.as_deref());
+        let streamed = self.finish_stream(&clip);
+        let run = run_pipeline_with(self.state(), &clip, bundle.as_deref(), streamed);
         let (s, data_dir) = (self.state().settings.read().unwrap().clone(), self.state().data_dir.clone());
         let ctx = self.ctx.take().unwrap();
         let row = |raw: String, final_text: String, status, error| HistoryItem {
@@ -867,6 +936,16 @@ impl Actor {
     /// Returns true if a max-length stop ran the (blocking) pipeline.
     fn tick(&mut self) -> bool {
         let now = Instant::now();
+        if let (Some((ch, st)), Some(rec)) = (self.stream.as_mut(), self.rec.as_ref()) {
+            match ch.poll(rec) {
+                Ok(Some(chunk)) => st.push(chunk),
+                Ok(None) => {}
+                Err(()) => {
+                    log::info!("whisper stream: the mic changed, the clip goes single-shot");
+                    self.stream = None;
+                }
+            }
+        }
         let busy = self.act(Ev::Tick, now);
         if self.idle_at.is_some_and(|t| now >= t) {
             self.idle_at = None;
@@ -1114,6 +1193,133 @@ mod tests {
         assert!(item.has_audio);
         assert_eq!(history::read_wav(&history::audio_dir(&dir).join(format!("{}.wav", item.id))).unwrap().len(), 16000);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---------- hands-free grace after a hold ----------
+
+    /// A 2 s hold, released at t+2000, with a 400 ms grace.
+    fn released(t: Instant) -> Machine {
+        let mut m = Machine::new(true, Duration::from_secs(600));
+        m.grace = MS(400);
+        assert_eq!(m.step(Ev::Down, t), Some(Act::Start { locked: false }));
+        assert_eq!(m.step(Ev::Up, t + MS(2000)), Some(Act::Grace { ms: 400 }));
+        assert_eq!(m.phase(), Phase::Recording, "the recorder keeps running in the grace window");
+        m
+    }
+
+    #[test]
+    fn grace_window_timing_table() {
+        let t = Instant::now();
+        // (press after the release, ticks before it) -> what the press does
+        let cases: [(u64, &[u64], Option<Act>, Phase); 6] = [
+            (0, &[], Some(Act::Lock), Phase::Locked),
+            (200, &[100], Some(Act::Lock), Phase::Locked),
+            (399, &[100, 200, 300], Some(Act::Lock), Phase::Locked),
+            // 400 = the window is over: the press ends the grace (tick not run yet) and is not a lock
+            (400, &[], Some(Act::Process), Phase::Processing),
+            (401, &[], Some(Act::Process), Phase::Processing),
+            // the tick at 400 already processed: the late press is a busy no-op
+            (401, &[100, 200, 300, 400], None, Phase::Processing),
+        ];
+        for (at, ticks, want, phase) in cases {
+            let mut m = released(t);
+            for &k in ticks {
+                let a = m.step(Ev::Tick, t + MS(2000 + k));
+                assert_eq!(a, (k >= 400).then_some(Act::Process), "tick {k} for press {at}");
+            }
+            assert_eq!(m.step(Ev::Down, t + MS(2000 + at)), want, "press {at} ms after the release");
+            assert_eq!(m.phase(), phase, "press {at}");
+        }
+    }
+
+    #[test]
+    fn no_press_in_the_grace_processes_once() {
+        let t = Instant::now();
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Tick, t + MS(2399)), None);
+        assert_eq!(m.step(Ev::Tick, t + MS(2400)), Some(Act::Process));
+        assert_eq!(m.step(Ev::Tick, t + MS(2500)), None);
+        assert_eq!(m.step(Ev::Up, t + MS(2500)), None, "a stray release does nothing");
+    }
+
+    #[test]
+    fn release_press_release_stays_hands_free_until_the_next_press() {
+        let t = Instant::now();
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Down, t + MS(2150)), Some(Act::Lock));
+        assert_eq!(m.step(Ev::Up, t + MS(2300)), None, "the locking press's release does not stop");
+        assert_eq!(m.step(Ev::Tick, t + MS(9000)), None, "no grace timer left in hands-free");
+        assert_eq!(m.phase(), Phase::Locked);
+        assert_eq!(m.step(Ev::Down, t + MS(12_000)), Some(Act::Process));
+    }
+
+    #[test]
+    fn a_hold_in_the_grace_ends_at_its_release() {
+        // Let go too early, grab the key again and keep talking: the second release ends it (no stuck hands-free).
+        let t = Instant::now();
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Down, t + MS(2100)), Some(Act::Lock));
+        assert_eq!(m.step(Ev::Down, t + MS(2200)), None, "key repeat");
+        assert_eq!(m.step(Ev::Up, t + MS(4000)), Some(Act::Process), "a hold, not a tap: process");
+        // the regrab keeps Esc and the max
+        let mut m = released(t);
+        m.step(Ev::Down, t + MS(2100));
+        assert_eq!(m.step(Ev::Cancel, t + MS(3000)), Some(Act::CancelUndoable));
+        let mut m = Machine::new(true, Duration::from_secs(10));
+        m.grace = MS(400);
+        m.step(Ev::Down, t);
+        m.step(Ev::Up, t + MS(5000));
+        m.step(Ev::Down, t + MS(5100));
+        assert_eq!(m.step(Ev::Tick, t + MS(10_000)), Some(Act::Process));
+    }
+
+    #[test]
+    fn esc_stop_and_toggle_in_the_grace() {
+        let t = Instant::now();
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Cancel, t + MS(2100)), Some(Act::CancelUndoable), "Esc in the window: undoable cancel, not the silent chord");
+        assert_eq!(m.phase(), Phase::Idle);
+        assert_eq!(m.step(Ev::Undo, t + MS(3000)), Some(Act::ProcessKept));
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Stop, t + MS(2100)), Some(Act::Process), "overlay Stop / mic lost: process now");
+        let mut m = released(t);
+        assert_eq!(m.step(Ev::Toggle, t + MS(2100)), Some(Act::Lock), "the hands-free combo locks too");
+    }
+
+    #[test]
+    fn max_length_inside_the_grace_processes() {
+        let t = Instant::now();
+        let mut m = Machine::new(true, Duration::from_secs(10));
+        m.grace = MS(800);
+        m.step(Ev::Down, t);
+        assert_eq!(m.step(Ev::Up, t + MS(9800)), Some(Act::Grace { ms: 800 }));
+        assert_eq!(m.step(Ev::Tick, t + MS(9900)), None);
+        assert_eq!(m.step(Ev::Tick, t + MS(10_000)), Some(Act::Process), "the max wins over the 800 ms window");
+        // locked from the grace: the max still counts from the first press
+        let mut m = Machine::new(true, Duration::from_secs(10));
+        m.grace = MS(400);
+        m.step(Ev::Down, t);
+        m.step(Ev::Up, t + MS(5000));
+        m.step(Ev::Down, t + MS(5100));
+        assert_eq!(m.step(Ev::Tick, t + MS(10_000)), Some(Act::Process));
+    }
+
+    #[test]
+    fn grace_zero_and_double_tap_from_idle_are_unchanged() {
+        let t = Instant::now();
+        let mut m = Machine::new(true, Duration::from_secs(600));
+        m.step(Ev::Down, t);
+        assert_eq!(m.step(Ev::Up, t + MS(2000)), Some(Act::Process), "grace 0 = process at the release");
+        m.idle();
+        m.grace = MS(400);
+        m.step(Ev::Down, t);
+        assert_eq!(m.step(Ev::Up, t + MS(100)), None, "a short tap is the double-tap path, not the grace");
+        assert_eq!(m.step(Ev::Down, t + MS(450)), Some(Act::Lock));
+        let mut m = Machine::new(true, Duration::from_secs(600));
+        m.grace = MS(400);
+        m.step(Ev::Down, t);
+        m.step(Ev::Up, t + MS(100));
+        assert_eq!(m.step(Ev::Tick, t + MS(600)), Some(Act::Discard), "a lone short tap still discards");
     }
 
     #[test]

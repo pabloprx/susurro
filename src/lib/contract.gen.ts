@@ -118,7 +118,11 @@ export type HotkeyStatus = { binding: string, active: boolean, error?: string, }
  * "RightControl", "LeftControl", "RightShift", "LeftShift") use the CGEventTap and work only for ptt;
  * anything else is an accelerator combo for global-shortcut.
  */
-export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, cancel: string, paste_last: string, 
+export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, 
+/**
+ * After a hold is released the recording goes on this long: a press in it locks hands-free (0-800, 0 = off).
+ */
+hands_free_grace_ms: number, cancel: string, paste_last: string, 
 /**
  * Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
  */
@@ -250,7 +254,11 @@ message: string | null,
 /**
  * Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
  */
-command: boolean, };
+command: boolean, 
+/**
+ * Recording, just after a hold was released: the overlay counts this down ("tap again for hands-free").
+ */
+grace_ms?: number, };
 
 export type Settings = { version: number, onboarded: boolean, 
 /**

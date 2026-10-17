@@ -682,6 +682,7 @@ mod tests {
             ptt: ptt.into(),
             hands_free: hf.map(Into::into),
             double_tap: true,
+            hands_free_grace_ms: 400,
             cancel: cancel.into(),
             paste_last: paste.into(),
             copy_last: "Ctrl+Cmd+C".into(),

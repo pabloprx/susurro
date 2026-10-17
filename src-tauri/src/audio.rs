@@ -553,6 +553,11 @@ impl Recorder {
         }
     }
 
+    /// A chunker that follows this recording (streaming transcription).
+    pub fn chunker(&self) -> Chunker {
+        Chunker { seg: self.segments.len(), ..Chunker::new(self.rate) }
+    }
+
     fn mark_recording(&self) {
         if let Some(app) = &self.app {
             app.state::<AppState>().mic.lock().unwrap().recording = self.stream.as_ref().map(|_| self.device.id.clone());
@@ -629,6 +634,105 @@ fn feed(samples: Vec<f32>, mut cb: Cb) -> Feed {
         }
     });
     Feed(stop)
+}
+
+// ---------- streaming cuts (local whisper transcribes finished chunks while the user speaks) ----------
+
+/// Chunker frames are 10 ms. ponytail: the frame counts below are first guesses, tuned on the TTS fixtures only.
+const CUT_MIN: usize = 300; // a chunk holds at least 3 s
+const CUT_SIL: usize = 35; // a pause of 350 ms ends a chunk
+const CUT_HARD: usize = 2000; // 20 s with no pause: cut at the quietest 100 ms
+const CUT_PAD: usize = 2; // 20 ms of overlap on each side of a cut
+/// A frame this far under the loudest frame is a pause. ponytail: measured on TTS, not on room noise.
+const PAUSE_BELOW_DB: f32 = 30.0;
+
+/// RMS dB of each whole 10 ms frame.
+fn frame_db(s: &[f32], flen: usize) -> impl Iterator<Item = f32> + '_ {
+    s.chunks_exact(flen).map(|f| db((f.iter().map(|x| x * x).sum::<f32>() / f.len() as f32).sqrt()))
+}
+
+/// Where to cut the frames `d` (10 ms RMS dB since the chunk start): the middle of the first pause of
+/// CUT_SIL frames that starts after CUT_MIN frames, or (at CUT_HARD frames) the quietest 100 ms.
+pub fn find_cut(d: &[f32]) -> Option<usize> {
+    if d.len() < CUT_MIN + CUT_SIL {
+        return None;
+    }
+    let top = d.iter().cloned().fold(f32::MIN, f32::max);
+    let floor = d.iter().cloned().fold(f32::MAX, f32::min);
+    let thr = (top - PAUSE_BELOW_DB).max(floor + 6.0);
+    // No speech yet (all frames near the floor): wait for the hard cut.
+    if d.iter().filter(|&&x| x > thr).count() >= 50 {
+        let mut run = 0;
+        for (i, &x) in d.iter().enumerate() {
+            run = if x <= thr { run + 1 } else { 0 };
+            if run >= CUT_SIL && i + 1 - run >= CUT_MIN {
+                return Some(i + 1 - run / 2);
+            }
+        }
+    }
+    if d.len() < CUT_HARD {
+        return None;
+    }
+    let w = 10;
+    (CUT_MIN..d.len() - w).min_by(|&a, &b| d[a..a + w].iter().sum::<f32>().total_cmp(&d[b..b + w].iter().sum::<f32>())).map(|i| i + w / 2)
+}
+
+/// Cuts the live recording at pauses. Holds only the audio since the last cut (device rate).
+pub struct Chunker {
+    rate: u32,
+    /// Recorder segment and samples already read from it (a device switch = a new segment: streaming stops).
+    seg: usize,
+    read: usize,
+    buf: Vec<f32>,
+    db: Vec<f32>,
+    /// Device samples before buf[0] since the recording start.
+    start: usize,
+}
+
+impl Chunker {
+    pub fn new(rate: u32) -> Self {
+        Self { rate, seg: 0, read: 0, buf: vec![], db: vec![], start: 0 }
+    }
+
+    /// Read the new samples of `rec`. Err = the device changed: drop the chunker (the whole clip goes single-shot).
+    pub fn poll(&mut self, rec: &Recorder) -> Result<Option<Vec<f32>>, ()> {
+        let g = rec.cur.lock().unwrap();
+        if rec.segments.len() != self.seg || rec.rate != self.rate {
+            return Err(());
+        }
+        let new = g[self.read.min(g.len())..].to_vec();
+        drop(g);
+        self.read += new.len();
+        Ok(self.push(&new))
+    }
+
+    /// Add device-rate samples. Some = a finished chunk, 16 kHz, worth transcribing.
+    pub fn push(&mut self, new: &[f32]) -> Option<Vec<f32>> {
+        let flen = (self.rate / 100) as usize;
+        self.buf.extend_from_slice(new);
+        let have = self.db.len() * flen;
+        let added: Vec<f32> = frame_db(&self.buf[have..], flen).collect();
+        self.db.extend(added);
+        let c = find_cut(&self.db)?;
+        let chunk = resample(&self.buf[..((c + CUT_PAD) * flen).min(self.buf.len())], self.rate);
+        let keep = (c - CUT_PAD) * flen;
+        self.buf.drain(..keep);
+        self.db.drain(..c - CUT_PAD);
+        self.start += keep;
+        worth(&chunk).then_some(chunk)
+    }
+
+    /// The audio after the last cut, from the final 16 kHz clip. None = nothing worth transcribing.
+    pub fn tail(&self, clip: &Clip) -> Option<Vec<f32>> {
+        let at = (self.start as u64 * RATE as u64 / self.rate as u64) as usize;
+        let t = clip.samples[at.min(clip.samples.len())..].to_vec();
+        worth(&t).then_some(t)
+    }
+}
+
+/// At least 100 ms (whisper.cpp skips shorter input) and louder than the silence gate.
+fn worth(s: &[f32]) -> bool {
+    s.len() >= RATE as usize / 10 && db(s.iter().fold(0f32, |m, x| m.max(x.abs()))) >= SILENCE_DB
 }
 
 // ---------- app glue: runtime state, monitor, toasts ----------
@@ -1085,6 +1189,123 @@ mod tests {
         assert!(quiet.silent() && !quiet.too_short());
         let tap = Clip { duration_ms: 200, peak_db: -10.0, ..Default::default() };
         assert!(tap.too_short() && !tap.silent());
+    }
+
+    // ---------- streaming chunker ----------
+
+    /// Voiced audio: a 200 Hz tone with a syllable-rate swell (never near silence).
+    fn voice(rate: u32, secs: f32, gain: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs) as usize;
+        (0..n).map(|i| {
+            let t = i as f32 / rate as f32;
+            gain * 0.3 * (0.6 + 0.4 * (t * 4.0 * std::f32::consts::TAU).sin()) * (t * 200.0 * std::f32::consts::TAU).sin()
+        }).collect()
+    }
+
+    /// Room noise at about -60 dBFS (deterministic).
+    fn hush(rate: u32, secs: f32) -> Vec<f32> {
+        let mut x = 12345u32;
+        (0..(rate as f32 * secs) as usize).map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            ((x >> 16) as f32 / 32768.0 - 1.0) * 0.001
+        }).collect()
+    }
+
+    /// Feed `a` in 100 ms pieces like the session tick. Returns the chunks and the clip-level tail.
+    fn stream(rate: u32, a: &[f32]) -> (Vec<Vec<f32>>, Option<Vec<f32>>, Chunker) {
+        let mut c = Chunker::new(rate);
+        let chunks: Vec<Vec<f32>> = a.chunks(rate as usize / 10).filter_map(|p| c.push(p)).collect();
+        let clip = Clip { samples: resample(a, rate), ..Default::default() };
+        let tail = c.tail(&clip);
+        (chunks, tail, c)
+    }
+
+    fn secs(n: usize) -> f32 {
+        n as f32 / RATE as f32
+    }
+
+    #[test]
+    fn cuts_in_the_middle_of_a_pause_after_3s() {
+        // 1 s voice, 0.5 s pause (too early), 3 s voice, 0.5 s pause (the cut), 2 s voice
+        let a = [voice(16_000, 1.0, 1.0), hush(16_000, 0.5), voice(16_000, 3.0, 1.0), hush(16_000, 0.5), voice(16_000, 2.0, 1.0)].concat();
+        let (chunks, tail, _) = stream(16_000, &a);
+        assert_eq!(chunks.len(), 1, "the pause at 1 s is before the 3 s minimum");
+        // the pause is 4.5..5.0 s; the cut is found once 350 ms of it went by: 4.5 + 0.175 = 4.675 s, + 20 ms pad
+        let end = secs(chunks[0].len());
+        assert!((4.6..4.8).contains(&end), "chunk ends inside the pause: {end}");
+        let tail = tail.unwrap();
+        let start = secs(a.len() - tail.len());
+        assert!((4.6..4.8).contains(&start), "tail starts inside the pause: {start}");
+        assert!(end > start, "20 ms overlap on each side");
+    }
+
+    #[test]
+    fn chunks_and_tail_cover_every_sample_and_overlap_only_in_silence() {
+        let mut a = vec![];
+        let mut pauses = vec![];
+        for (i, v) in [3.5f32, 4.0, 6.0, 3.2, 5.0].iter().enumerate() {
+            a.extend(voice(16_000, *v, 1.0));
+            let p0 = a.len();
+            a.extend(hush(16_000, 0.4 + 0.1 * i as f32));
+            pauses.push(p0..a.len());
+        }
+        a.extend(voice(16_000, 2.0, 1.0));
+        let (chunks, tail, _) = stream(16_000, &a);
+        assert_eq!(chunks.len(), 5, "one cut per pause");
+        // Rebuild: each chunk starts where the previous one's overlap started (16 kHz: no resampling).
+        let mut pos = 0;
+        for (k, c) in chunks.iter().enumerate() {
+            assert_eq!(&a[pos..pos + c.len()], &c[..], "chunk {k} is the audio, no gap");
+            let end = pos + c.len();
+            let next = end - 2 * CUT_PAD * 160;
+            assert!(pauses.iter().any(|p| p.contains(&next) && p.contains(&(end - 1))), "chunk {k}: the overlap is inside a pause");
+            pos = next;
+        }
+        assert_eq!(&a[pos..], &tail.unwrap()[..], "the tail is the rest");
+    }
+
+    #[test]
+    fn no_pause_means_a_hard_cut_at_the_quietest_point() {
+        // 12 s voice, 300 ms soft passage (too short to be a pause, quieter), 13 s voice
+        let a = [voice(16_000, 12.0, 1.0), voice(16_000, 0.3, 0.05), voice(16_000, 13.0, 1.0)].concat();
+        let (chunks, tail, _) = stream(16_000, &a);
+        assert_eq!(chunks.len(), 1);
+        let end = secs(chunks[0].len());
+        assert!((12.0..12.3).contains(&end), "cut in the soft passage: {end}");
+        assert!(tail.is_some());
+    }
+
+    #[test]
+    fn device_rate_audio_is_cut_and_resampled() {
+        let a = [voice(48_000, 4.0, 1.0), hush(48_000, 0.5), voice(48_000, 1.0, 1.0)].concat();
+        let (chunks, tail, _) = stream(48_000, &a);
+        assert_eq!(chunks.len(), 1);
+        let end = secs(chunks[0].len());
+        assert!((4.1..4.3).contains(&end), "16 kHz chunk ends in the pause: {end}");
+        let start = 5.5 - secs(tail.unwrap().len());
+        assert!((4.1..4.3).contains(&start), "tail starts in the pause: {start}");
+    }
+
+    #[test]
+    fn silence_is_never_a_chunk() {
+        let (chunks, tail, _) = stream(16_000, &vec![0.0; 16_000 * 25]);
+        assert!(chunks.is_empty() && tail.is_none(), "digital silence: hard cut, but nothing to transcribe");
+        // a short silent tail after the last cut is skipped too
+        let a = [voice(16_000, 3.5, 1.0), hush(16_000, 0.4)].concat();
+        let (chunks, tail, _) = stream(16_000, &a);
+        assert_eq!(chunks.len(), 1);
+        assert!(tail.is_none(), "the tail is only room noise");
+    }
+
+    #[test]
+    fn find_cut_waits_for_speech_and_length() {
+        assert_eq!(find_cut(&[-20.0; 400]), None, "no pause");
+        assert_eq!(find_cut(&[-90.0; 1000]), None, "no speech, under the hard cut");
+        let mut d = vec![-20.0; 310];
+        d.extend([-80.0; 34]);
+        assert_eq!(find_cut(&d), None, "340 ms is not a pause yet");
+        d.push(-80.0);
+        assert_eq!(find_cut(&d), Some(310 + 18));
     }
 
     // ---------- adversarial (2026-10-17 review) ----------

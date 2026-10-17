@@ -107,7 +107,7 @@ export const words = (s: string) => (s.trim() ? s.trim().split(/\s+/).length : 0
 
 /** Voice control stays hidden until the command runner exists (command.rs has only the log): a dead switch otherwise.
  *  ponytail: a localStorage flag ("susurro.labs.voice" = "1") shows it for dev and the UI tests; drop it when the runner lands. */
-export const VOICE_CONTROL = localStorage.getItem("susurro.labs.voice") === "1";
+export const VOICE_CONTROL = true;
 
 /** Theme lives in localStorage, not Settings (PLAN 9). */
 export type Theme = "system" | "dark" | "light";

@@ -9,7 +9,7 @@ import type { Nav } from "../App";
 
 export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last" | "command";
 const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last", command: "Voice control" };
-export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" };
+export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 400, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
   ptt: ["F1", "Delete", "RightOption", "RightCommand"],
@@ -218,6 +218,25 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
           </span>
           <span />
           <Msg slot="hands_free" />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Hands-free grace</div>
+            <div className="sub">After you let go of {ptt}, tap it within this time to keep talking hands-free</div>
+          </div>
+          <span className="inline">
+            <input
+              type="range"
+              min={0}
+              max={800}
+              step={50}
+              value={hk.hands_free_grace_ms}
+              onChange={(e) => save((x) => void (x.hotkeys.hands_free_grace_ms = +e.target.value))}
+              aria-label="Hands-free grace"
+            />
+            <span className="small">{hk.hands_free_grace_ms ? `${hk.hands_free_grace_ms} ms` : "off"}</span>
+          </span>
+          <span />
         </div>
         <div className="sc-row">
           <div>

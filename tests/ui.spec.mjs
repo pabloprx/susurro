@@ -39,6 +39,7 @@ test.describe("shell", () => {
     ["Providers", "Where your voice goes."],
     ["Audio", "Your microphone, handled."],
     ["Shortcuts", "Keys, your way."],
+    ["Voice control", "Your screen, by voice."],
     ["Settings", "The quiet details."],
   ];
   test("sidebar opens every screen", async ({ page }) => {
@@ -460,18 +461,59 @@ test.describe("dictionary: import/export", () => {
       { kind: "snippet", text: "my phone", expansion: "+56 9 1234 5678" },
     ];
     await page.locator('input[type="file"]').setInputFiles({ name: "d.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(rows)) });
+    await expect(page.getByLabel("Import summary")).toHaveText("2 new · 1 duplicates · 1 invalid");
+    await page.getByRole("button", { name: "Import 2 items" }).click();
     await expect(toastText(page, "2 new · 1 duplicates skipped · 1 invalid")).toBeVisible();
     await expect(page.locator(".d-row", { hasText: "Brand New" })).toHaveCount(1);
   });
   test("import rejects a non-list file", async ({ page }) => {
     await page.locator('input[type="file"]').setInputFiles({ name: "d.json", mimeType: "application/json", buffer: Buffer.from("{nope") });
-    await expect(toastText(page, "That file is not a susurro dictionary export (JSON list).")).toBeVisible();
+    await expect(toastText(page, "Use a susurro export (.json), a Wispr Flow dictionary (.csv) or one word per line (.txt).")).toBeVisible();
   });
   // Was a mock seed bug: "whisper.cpp" had the alias "whisper cpp", which validate() rejects as equal to the text.
   test("export then import round-trips as all duplicates", async ({ page }) => {
     const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Export" }).click()]);
     await page.locator('input[type="file"]').setInputFiles(await dl.path());
-    await expect(toastText(page, "0 new · 18 duplicates skipped · 0 invalid")).toBeVisible();
+    await expect(page.getByLabel("Import summary")).toHaveText("0 new · 18 duplicates · 0 invalid");
+    await expect(page.getByRole("button", { name: /^Import \d/ })).toHaveCount(0);
+    await page.locator("dialog.sheet[open]").getByRole("button", { name: "Done" }).click();
+    await expect(page.locator("dialog.sheet[open]")).toHaveCount(0);
+  });
+  // Wispr Flow bulk import format (docs.wisprflow.ai): `word` or `misspelling,correction`, no header, quotes.
+  test("imports a Wispr Flow dictionary CSV with a preview", async ({ page }) => {
+    const csv = ['Kubernetes', '"Whisper Flow","Wispr Flow"', 'su pavase,Supabase', 'contaflow', 'hello,world,', 'a,b,c', '"open', ' , ', '', 'wispr flou,Wispr Flow'].join("\r\n");
+    await page.locator('input[type="file"]').setInputFiles({ name: "wispr.csv", mimeType: "text/csv", buffer: Buffer.from(csv) });
+    await expect(page.locator("dialog.sheet[open] h2")).toHaveText("Import wispr.csv");
+    // new: Kubernetes, su pavase -> Supabase, hello -> world, wispr flou -> Wispr Flow. Duplicates: whisper flow, contaflow.
+    await expect(page.getByLabel("Import summary")).toHaveText("4 new · 2 duplicates · 3 invalid");
+    await expect(page.locator(".import-row.invalid", { hasText: "More than 2 columns" })).toHaveCount(1);
+    await expect(page.locator(".import-row.invalid", { hasText: "Unterminated quote" })).toHaveCount(1);
+    await page.getByRole("button", { name: "Import 4 items" }).click();
+    await expect(toastText(page, "4 new · 2 duplicates skipped · 3 invalid")).toBeVisible();
+    await radio(page, "Dictionary section", /Corrections/).click();
+    const wispr = page.locator(".d-row", { hasText: "Wispr Flow" });
+    await expect(wispr).toHaveCount(2);
+    await expect(page.locator(".d-row", { hasText: "su pavase" })).toContainText("Supabase");
+  });
+  test("imports plain text one word per line", async ({ page }) => {
+    await page.locator('input[type="file"]').setInputFiles({ name: "words.txt", mimeType: "text/plain", buffer: Buffer.from("Ñandú, S.A.\nContaflow\n\n!!!\n") });
+    await expect(page.getByLabel("Import summary")).toHaveText("1 new · 1 duplicates · 1 invalid");
+    await page.getByRole("button", { name: "Import 1 item" }).click();
+    await expect(page.locator(".d-row", { hasText: "Ñandú, S.A." })).toHaveCount(1);
+  });
+  test("learn toast: Add saves the word with the misheard form", async ({ page }) => {
+    await page.evaluate(() => window.mock.learn("Supabase", "su pavase"));
+    const t = toastText(page, "Add Supabase to your dictionary? (heard: su pavase)");
+    await t.getByRole("button", { name: "Add" }).click();
+    await expect(toastText(page, "Added Supabase to your dictionary")).toBeVisible();
+    await radio(page, "Dictionary section", /Corrections/).click();
+    await expect(page.locator(".d-row", { hasText: "su pavase" })).toContainText("Supabase");
+  });
+  test("learn toast: Not now saves nothing", async ({ page }) => {
+    await page.evaluate(() => window.mock.learn("Vercel", "versel"));
+    await toastText(page, "Add Vercel to your dictionary?").getByRole("button", { name: "Not now" }).click();
+    await radio(page, "Dictionary section", /Corrections/).click();
+    await expect(page.locator(".d-row", { hasText: "versel" })).toHaveCount(0);
   });
   test("empty install: History and Styles empty states", async ({ page }) => {
     await open(page, "/?empty");
@@ -1008,6 +1050,15 @@ test.describe("shortcuts", () => {
     await dt.click();
     await expect(dt).toHaveAttribute("aria-checked", "false");
   });
+  test("hands-free grace slider: 400 ms default, 0 = off", async ({ page }) => {
+    const g = page.getByLabel("Hands-free grace");
+    await expect(g).toHaveValue("400");
+    await expect(row(page, "Hands-free grace")).toContainText("400 ms");
+    await g.fill("0");
+    await expect(row(page, "Hands-free grace")).toContainText("off");
+    await g.fill("800");
+    await expect(row(page, "Hands-free grace")).toContainText("800 ms");
+  });
   test("cancel and paste-last: record and reset", async ({ page }) => {
     await bind(page, "Cancel").click();
     await page.keyboard.press("Control+Period");
@@ -1465,18 +1516,6 @@ test.describe("marks window", () => {
   });
 });
 
-test("voice control is hidden until the command runner exists: no screen, no key clash", async ({ page }) => {
-  await open(page);
-  await expect(page.getByRole("navigation", { name: "Screens" }).getByRole("button", { name: "Voice control" })).toHaveCount(0);
-  await page.keyboard.press("Meta+8");
-  await expect(h1(page)).toHaveText("The quiet details.");
-  // the hidden command key (F2) does not block F2 for push to talk
-  await nav(page, "Shortcuts");
-  await page.getByRole("button", { name: /^Push to talk:/ }).click();
-  await page.keyboard.press("F2");
-  await expect(page.getByRole("button", { name: /^Push to talk:/ })).toHaveAttribute("aria-label", /^Push to talk: F2\./);
-});
-
 test.describe("voice control", () => {
   test.beforeEach(({ page }) => page.addInitScript(() => localStorage.setItem("susurro.labs.voice", "1")));
   test("sidebar shows it with the labs flag, Cmd+8 opens it", async ({ page }) => {
@@ -1558,6 +1597,7 @@ test.describe("overlay", () => {
     ["idle", "v-idle", "Click or hold F1"],
     ["hover", "v-idle", "Click or hold F1"],
     ["listening", "v-listening", null],
+    ["grace", "v-grace", "Tap F1 again for hands-free"],
     ["handsfree", "v-handsfree", /0:4\d/],
     ["warning", "v-handsfree", /left/],
     ["processing", "v-processing", null],

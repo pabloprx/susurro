@@ -360,6 +360,10 @@ body,
 @keyframes drain {
   to { transform: scaleX(0); }
 }
+.drain.soft {
+  background: currentColor;
+  opacity: 0.35;
+}
 
 /* Browser-only preview: a fake desktop and the 360x64 window outline (mock mode, not in Tauri). */
 body.mock-desk {

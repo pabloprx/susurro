@@ -59,6 +59,8 @@ pub struct Hotkeys {
     pub ptt: String,
     pub hands_free: Option<String>,
     pub double_tap: bool,
+    /// After a hold is released the recording goes on this long: a press in it locks hands-free (0-800, 0 = off).
+    pub hands_free_grace_ms: u32,
     pub cancel: String,
     pub paste_last: String,
     /// Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
@@ -287,6 +289,10 @@ pub struct SessionState {
     pub message: Option<String>,
     /// Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
     pub command: bool,
+    /// Recording, just after a hold was released: the overlay counts this down ("tap again for hands-free").
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_ms: Option<u32>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -581,6 +587,7 @@ impl Default for Hotkeys {
             ptt: "F1".into(),
             hands_free: None,
             double_tap: true,
+            hands_free_grace_ms: 400,
             cancel: "Escape".into(),
             paste_last: "Ctrl+Cmd+V".into(),
             copy_last: "Ctrl+Cmd+C".into(),
@@ -677,7 +684,7 @@ impl Default for PrivacyOpts {
 
 impl Default for SessionState {
     fn default() -> Self {
-        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None, command: false }
+        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None, command: false, grace_ms: None }
     }
 }
 

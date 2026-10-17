@@ -8,7 +8,7 @@ import "../styles/tokens.css";
 import "../styles/overlay.css";
 
 type CmdView = "cmd-listening" | "cmd-thinking" | "cmd-acting" | "cmd-pick" | "cmd-confirm" | "cmd-done" | "cmd-stopped" | "cmd-unsure" | "cmd-blocked" | "cmd-setup";
-type View = "idle" | "listening" | "handsfree" | "processing" | "done" | "copied" | "error" | "notice" | CmdView;
+type View = "idle" | "listening" | "grace" | "handsfree" | "processing" | "done" | "copied" | "error" | "notice" | CmdView;
 const IDLE: SessionState = { phase: "idle", started_at: null, device: null, app: null, message: null, command: false };
 const HOLD: Partial<Record<View, number>> = {
   done: 700,
@@ -28,6 +28,7 @@ const CONFIRM_MS = 10_000;
 const SIZE: Record<View, [number, number]> = {
   idle: [44, 8],
   listening: [200, 36],
+  grace: [0, 36],
   handsfree: [232, 36],
   processing: [120, 36],
   done: [120, 36],
@@ -81,7 +82,7 @@ function viewOf(s: SessionState, step: Step | null): View {
   }
   switch (s.phase) {
     case "recording":
-      return "listening";
+      return s.grace_ms ? "grace" : "listening";
     case "locked":
       return "handsfree";
     case "processing":
@@ -275,6 +276,14 @@ export default function Overlay() {
         <PillButton label="Stop and paste" onClick={api.dictationStop}>
           <Square size={9} fill="currentColor" strokeWidth={0} />
         </PillButton>
+      </>
+    ),
+    // a hold was released: the recording goes on for grace_ms; a tap now locks hands-free (session.rs Grace)
+    grace: (
+      <>
+        <span className="tally-dot pulse" />
+        <span className="msg dim-text">Tap {ptt} again for hands-free</span>
+        <span className="drain soft" key={sess.started_at ?? 0} style={{ animationDuration: `${sess.grace_ms ?? 0}ms` }} aria-hidden />
       </>
     ),
     handsfree: (

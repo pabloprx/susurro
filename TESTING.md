@@ -61,6 +61,25 @@ These items also need a human:
 - The fn key. The tests never post fn events, because the system owns fn. Hold fn in TextEdit, Slack and a terminal.
 - The look of the overlay on the real screen, and the system prompts in onboarding from a fresh signed build.
 
+## Streaming transcription (local whisper)
+
+While you hold the key, `audio::Chunker` cuts the audio at pauses (350 ms after at least 3 s, a hard cut at the quietest 100 ms after 20 s). `whisper_local::Stream` transcribes each chunk on one worker thread, with the previous chunk's last words as the prompt. At the release only the tail is left. Cloud providers stay single-shot (a chunked upload was not measured: it costs money and needs keys).
+
+Bench: `SUSURRO_WHISPER_THREADS=6 cargo run --release --manifest-path src-tauri/Cargo.toml --example stream_bench -- ~/.cache/susurro/ggml-large-v3-turbo-q5_0.bin`. It feeds the audio in real time (100 ms pieces, like the session tick) and times the release to the final STT text. The cleanup LLM and the paste are not in it (they are the same for both modes).
+
+Measured 2026-10-17, Mac Studio M4 Max, large-v3-turbo q5_0, 6 threads, another release build compiling at the same time:
+
+| Clip | Audio | Mode | Chunks | Release to text | WER |
+|------|-------|------|--------|-----------------|-----|
+| long.wav, 14 s padding trimmed | 46.6 s | single-shot | 1 | 888 ms | 0.033 |
+| long.wav, 14 s padding trimmed | 46.6 s | streaming | 3 | 244 ms | 0.026 |
+| that clip x3, 0.6 s gaps | 140.9 s | single-shot | 1 | 2644 ms | 0.033 |
+| that clip x3, 0.6 s gaps | 140.9 s | streaming | 9 | 241 ms | 0.026 |
+
+The word lists are the same length in both modes (151 and 453 words): no word lost or doubled at a cut. The one difference is "Ugart" (single-shot) against "Ugarte" (streaming). One run each: the numbers are not a median.
+
+Re-run 2026-10-17 (review), same Mac and command, idle machine, 3 runs: median release to text 874 / 260 ms (long.wav single / streaming) and 2664 / 252 ms (x3). Same WER and chunk counts. The app adds the hands-free grace (default 400 ms, checked on the 100 ms tick) before the STT starts; the bench does not include it.
+
 ## Known limits (2026-10-17)
 
 - base.en writes "Francisco Ugarte" in `long.wav`. The dictionary does not change it on purpose: a fuzzy match must not flip a gendered name.

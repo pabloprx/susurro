@@ -11,6 +11,7 @@ pub mod dictionary;
 pub mod history;
 pub mod hotkey;
 pub mod jev;
+pub mod learn;
 pub mod models;
 pub mod paste;
 pub mod permissions;
@@ -102,6 +103,7 @@ pub fn run() {
                 data_dir,
             });
             let h = app.handle();
+            learn::init(h);
             session::spawn(h.clone(), rx);
             audio::spawn_monitor(h.clone());
             app.manage(hotkey::start(h, &hotkeys, hotkey_tx)?);

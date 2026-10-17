@@ -25,7 +25,7 @@ let settings: C.Settings = {
   version: 1,
   onboarded: !onboarding,
   language: "auto",
-  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" },
+  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 400, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" },
   mic: { selection: "auto", priority: [], show_virtual: false },
   stt: {
     provider: "whisper_local",
@@ -234,6 +234,8 @@ let dict: C.DictEntry[] = fresh
     ];
 
 const norm = (s: string) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+const learnPending = new Map<string, { word: string; heard: string }>();
 
 function validate(e: C.DictEntryInput): C.DictEntryInput {
   const clean = (s: string) => s.trim().replace(/\s+/g, " ");
@@ -452,6 +454,17 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   paste_last: () => undefined,
   get_session_state: () => session,
   toast_action: (a) => {
+    // learn.rs: the user retyped a pasted word; Add saves it with the misheard form as a correction.
+    const learned = learnPending.get(a.toastId as string);
+    if (learned) {
+      learnPending.delete(a.toastId as string);
+      if (a.actionId === "add") {
+        const old = dict.find((d) => d.kind === "word" && norm(d.text) === norm(learned.word));
+        handlers.dict_upsert({ entry: old ? { ...old, aliases: [...old.aliases, learned.heard] } : { id: null, kind: "word", text: learned.word, aliases: [learned.heard], expansion: null, exact_only: false, starred: false } });
+        toast(`Added ${learned.word} to your dictionary`, "success", [], 3000, "learn-added");
+      }
+      return;
+    }
     const id = (a.toastId as string).startsWith("mic-new:") ? (a.toastId as string).slice(8) : null;
     if (id) {
       if (a.actionId === "switch") handlers.set_mic_selection({ selection: { device: { id } } });
@@ -631,6 +644,7 @@ export function overlayDemo(state: string | null) {
     idle: () => phase("idle"),
     hover: () => phase("idle"),
     listening: () => start("recording"),
+    grace: () => phase("recording", { started_at: now() - 3000, grace_ms: 600_000 }),
     handsfree: () => phase("locked", { started_at: now() - 42_000, device: builtin.name, app: "Slack" }),
     warning: () => phase("locked", { started_at: now() - 551_000, device: builtin.name, app: "Slack" }),
     processing: () => phase("processing"),
@@ -901,6 +915,12 @@ if (inBrowser) Object.assign(window, {
     stop: () => void finish(),
     error: (m = "Mic disconnected") => phase("error", { message: m }),
     toast,
+    /** learn.rs suggestion toast, as Rust emits it after the user retyped a pasted word. */
+    learn: (word: string, heard: string) => {
+      const id = `learn:${norm(word)}`;
+      learnPending.set(id, { word, heard });
+      toast(`Add ${word} to your dictionary? (heard: ${heard})`, "info", [{ id: "add", label: "Add" }, { id: "later", label: "Not now" }], 12_000, id);
+    },
     phase,
     set stale(v: boolean) {
       stale = v;
