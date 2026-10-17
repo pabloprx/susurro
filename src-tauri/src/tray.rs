@@ -58,7 +58,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .text("settings", "Settings…")
         .separator()
         .item(&item("paste-last", "Paste last transcript", &paste_last)?)
-        .item(&item("copy-last", "Copy last transcript", &copy_last)?)
+        .item(&item("copy-last", "Paste + copy last transcript", &copy_last)?)
         .separator()
         .item(&mic)
         .item(&CheckMenuItem::with_id(app, "pause", "Pause hotkey", true, paused(app), None::<&str>)?)

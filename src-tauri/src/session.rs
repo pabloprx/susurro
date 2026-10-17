@@ -704,12 +704,28 @@ impl Actor {
                 return false;
             }
             SessionCmd::CopyLast => {
+                // Pablo: the copy-last key (Shift+F12) pastes the last transcript AND leaves it on the
+                // clipboard, so it is ready to paste anywhere else too.
+                if self.m.phase() != Phase::Idle {
+                    return false;
+                }
                 match self.last() {
-                    Some(t) => {
-                        paste::copy(&t);
-                        toast(&self.app, None, "copy-last", ToastKind::Info, "Copied the last transcript", &[], 2500);
-                    }
-                    None => toast(&self.app, None, "copy-last", ToastKind::Info, "Nothing to copy yet", &[], 3000),
+                    Some(t) => match paste::external_target() {
+                        Some(target) => {
+                            let mut opts = self.state().settings.read().unwrap().paste.clone();
+                            opts.restore_clipboard = false;
+                            let msg = match paste::paste(&t, &opts, Some(&target)) {
+                                PasteOutcome::Pasted => "Pasted, and it is on your clipboard",
+                                _ => "Copied: press ⌘V to paste",
+                            };
+                            toast(&self.app, None, "copy-last", ToastKind::Info, msg, &[], 2500);
+                        }
+                        None => {
+                            paste::copy(&t);
+                            toast(&self.app, None, "copy-last", ToastKind::Info, "Copied: press ⌘V to paste", &[], 2500);
+                        }
+                    },
+                    None => toast(&self.app, None, "copy-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
                 }
                 return false;
             }

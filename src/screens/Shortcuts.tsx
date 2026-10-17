@@ -8,7 +8,7 @@ import { Kbd, Label, Title, Toggle } from "../ui";
 import type { Nav } from "../App";
 
 export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last" | "command" | "recents";
-const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last", command: "Voice control", recents: "Recents" };
+const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Paste + copy last", command: "Voice control", recents: "Recents" };
 export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 1000, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2", recents: "Ctrl+F1" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
@@ -265,7 +265,7 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
         </div>
         <div className="sc-row">
           <div>
-            <div className="label">Copy last</div>
+            <div className="label">Paste + copy last</div>
             <div className="sub">The last transcript, to the clipboard</div>
           </div>
           <span className="inline">
