@@ -2,6 +2,8 @@
 // audio_level streams, device hot-plug, pipeline phases, model download progress, permission grants.
 // URL flags: ?onboarding (fresh install, onboarding flow), ?empty (fresh install, empty states), ?needscreen (the last
 // voice command needed Screen Recording), /marks?state=marks|aim|pick|confirm (voice-control marks window),
+// /overlay|/marks?state=live|live-acting|live-done|live-confirm|live-pick|live-paused|live-session (voice control v2),
+// /overlay?state=recents|recents-picked (the Ctrl+ptt list; 1-9, Cmd+1-9, Esc work in the page),
 // /overlay?state=cmd-listening|cmd-thinking|cmd-acting|cmd-pick|cmd-confirm|cmd-done|cmd-stopped|cmd-unsure|cmd-blocked|cmd-setup,
 // /overlay?state=idle|hover|listening|handsfree|warning|processing|done|copied|fixax|nofield|error|notice (freeze one pill state).
 // Console: window.mock.plug() / unplug() / dictate() / error() / toast(text).
@@ -25,7 +27,7 @@ let settings: C.Settings = {
   version: 1,
   onboarded: !onboarding,
   language: "auto",
-  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 400, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" },
+  hotkeys: { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 1000, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2", recents: "Ctrl+F1" },
   mic: { selection: "auto", priority: [], show_virtual: false },
   stt: {
     provider: "whisper_local",
@@ -34,6 +36,7 @@ let settings: C.Settings = {
     elevenlabs: { model_id: "scribe_v2", send_keyterms: false, max_keyterms: 100 },
     openrouter_model: "",
     local_fallback: true,
+    mai_clean: true,
   },
   cleanup: {
     level: fresh ? "none" : "light",
@@ -51,7 +54,7 @@ let settings: C.Settings = {
   overlay: { show_idle: true },
   privacy: { store_history: true, store_audio: true, audio_retention_days: 14 },
   autostart: false,
-  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14" },
+  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-oss-120b" },
 };
 
 let pillRect: C.PtRect | null = null;
@@ -397,7 +400,7 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   save_settings: (a) => {
     if (failSave) throw failSave;
     const s = a.settings as C.Settings;
-    const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last, s.hotkeys.copy_last, s.command.enabled ? s.hotkeys.command : null].filter(Boolean); // off = not registered (settings.rs active_hotkeys)
+    const all = [s.hotkeys.ptt, s.hotkeys.hands_free, s.hotkeys.cancel, s.hotkeys.paste_last, s.hotkeys.copy_last, s.hotkeys.recents, s.command.enabled ? s.hotkeys.command : null].filter(Boolean); // off = not registered (settings.rs active_hotkeys)
     if (new Set(all).size !== all.length) throw "Two actions share one shortcut";
     const moved = s.hotkeys.ptt !== settings.hotkeys.ptt;
     settings = s;
@@ -562,6 +565,8 @@ const handlers: Record<string, (a: Record<string, any>) => unknown> = {
   hotkey_capture: (a) => void (capturing = a.on as boolean),
   set_pill_rect: (a) => void (pillRect = a.rect as C.PtRect),
   command_log: () => cmdLog,
+  command_memory: () => memory,
+  command_memory_clear: () => void (memory = []),
 };
 
 const MOD_CODE: Record<string, string> = {
@@ -638,6 +643,8 @@ function wav(ms: number): ArrayBuffer {
 // ---------------- scenarios ----------------
 
 /** Overlay page in a browser: freeze one pill state (?state=) or loop through all of them. */
+/** The frozen ?state= ran: a scenario started before it would be overwritten by it (tests wait for this). */
+let demoReady = false;
 export function overlayDemo(state: string | null) {
   const now = () => Date.now();
   const freeze: Record<string, () => void> = {
@@ -670,10 +677,14 @@ export function overlayDemo(state: string | null) {
     "cmd-pick": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.pick)),
     "cmd-confirm": () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES.confirm)),
   };
+  for (const k of Object.keys(LIVE_STATES)) freeze[k] = () => freezeLive(k);
+  freeze["live-session"] = () => void liveSession();
+  freeze.recents = () => openRecents();
+  freeze["recents-picked"] = () => (openRecents(), mockEmit("recents", { items: recentItems(), picked: 2 } satisfies C.Recents));
   // results: Rust sends the step, then the phase goes idle; the pill holds them (frozen here: the run never ends)
   for (const k of ["done", "stopped", "unsure", "blocked", "setup"])
     freeze[`cmd-${k}`] = () => (phase("acting", { command: true }), mockEmit("command_step", CMD_STATES[k]));
-  if (state && freeze[state]) return setTimeout(freeze[state], 50);
+  if (state && freeze[state]) return setTimeout(() => (freeze[state](), (demoReady = true)), 50);
   const script: [number, () => void][] = [
     [1600, () => start("recording")],
     [3200, () => void finish()],
@@ -777,6 +788,7 @@ const cmd = (status: C.CmdStatus, extra: Partial<C.CommandStep> = {}): C.Command
   latency_ms: 0,
   cost_usd: 0,
   message: null,
+  order: 0,
   ...extra,
 });
 /** One frozen state per name, for the overlay and marks pages (?state=) and the screenshots. */
@@ -827,6 +839,132 @@ async function command(instruction = "open my DM with Ana", risky = false) {
   phase("idle");
 }
 
+// ---------------- voice control v2: live session (VOICE_CONTROL_V2 1, 3) ----------------
+const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, last_said: "" };
+let liveNow: C.LiveState = LIVE_OFF;
+const live = (p: Partial<C.LiveState>) => mockEmit("command_live", (liveNow = { ...liveNow, on: true, ...p }));
+const ago = (ms: number) => T0 - ms;
+const mem = (at: number, kind: C.MemKind, text: string, app: string, field = ""): C.MemoryEntry => ({ at, kind, text, app, field });
+/** What susurro did, from the real 2026-10-17 log (newest last). */
+let memory: C.MemoryEntry[] = fresh
+  ? []
+  : [
+      mem(ago(9 * MIN), "said", "create a new tab and run the command ls", "Ghostty"),
+      mem(ago(9 * MIN - 900), "key", "⌘T", "Ghostty"),
+      mem(ago(9 * MIN - 1400), "typed", "ls", "Ghostty", "terminal"),
+      mem(ago(9 * MIN - 4200), "key", "⏎", "Ghostty", "terminal"),
+      mem(ago(4 * MIN), "said", "copy the link", "Google Chrome"),
+      mem(ago(4 * MIN - 1100), "copied", "https://chatgpt.com/share/6a1f0c2e", "Google Chrome", "Share link"),
+      mem(ago(3 * MIN), "said", "paste it in the message box", "WhatsApp"),
+      mem(ago(3 * MIN - 1500), "pasted", "https://chatgpt.com/share/6a1f0c2e", "WhatsApp", "Type a message"),
+      mem(ago(2 * MIN), "typed", "hello", "WhatsApp", "Type a message"),
+      mem(ago(MIN), "deleted", "hello", "WhatsApp", "Type a message"),
+    ];
+const remember = (e: C.MemoryEntry) => (memory = [...memory, e].slice(-50));
+
+/** One frozen live state per name (?state= on /overlay and /marks). */
+const LIVE_STATES: Record<string, { live: Partial<C.LiveState>; step?: C.CommandStep }> = {
+  live: { live: { buffer: "create a new tab and run the command", queue: ["⌘T"], last_said: "run the command" } },
+  "live-acting": {
+    live: { buffer: "", queue: ["type “hello there”", "⏎"], last_said: "and type hello there" },
+    step: cmd("aim", { instruction: "open my DM with Ana", op: "click", action: "click", target: 27, marks: MARKS, order: 1 }),
+  },
+  "live-done": {
+    live: { buffer: "and type", queue: ["type “hello there”"], last_said: "and type" },
+    step: cmd("done", { instruction: "open my DM with Ana", op: "click", action: "click", target: 27, marks: MARKS, order: 1 }),
+  },
+  "live-confirm": {
+    live: { queue: ["⏎"], pending: "Press Return? Say yes · F2 · Esc", last_said: "and run it" },
+    step: cmd("confirm", { instruction: "run ls", op: "key", action: "press_key", detail: "Return", order: 2 }),
+  },
+  "live-pick": {
+    live: { queue: ["click “second channel”"], pending: "Which one? 18, 19 or 20", last_said: "open the second channel" },
+    step: cmd("pick", { instruction: "open the second channel", op: "click", action: "click", marks: MARKS, target: 20, choices: [[20, 0.56], [19, 0.31], [18, 0.08]], order: 1 }),
+  },
+  "live-paused": {
+    live: { queue: ["paste"], took_over: true, last_said: "and paste it in the search box" },
+    step: cmd("done", { instruction: "copy the link", op: "copy", action: "copy", marks: MARKS, target: 32, order: 1 }),
+  },
+};
+function freezeLive(k: string) {
+  phase("locked", { started_at: Date.now(), command: true });
+  const { live: l, step } = LIVE_STATES[k];
+  if (step && step.status !== "done") mockEmit("command_step", step);
+  else if (step) mockEmit("command_step", { ...step, status: "aim" }); // the board, then its done step
+  if (step?.status === "done") setTimeout(() => mockEmit("command_step", step), 30);
+  live(l);
+}
+
+/** A scripted live session, as Rust would emit it: chunks arrive, orders are planned and run while Pablo talks. */
+let liveRunning = false; // React StrictMode runs the demo effect twice in dev: one script at a time
+async function liveSession() {
+  if (liveRunning) return;
+  liveRunning = true;
+  liveNow = LIVE_OFF;
+  phase("locked", { started_at: Date.now(), command: true });
+  live({});
+  const said = (t: string) => (live({ buffer: `${liveNow.buffer} ${t}`.trim(), last_said: t }), remember(mem(Date.now(), "said", t, "Slack")));
+  await wait(500);
+  said("open my DM");
+  await wait(500);
+  said("with Ana and");
+  await wait(300);
+  live({ buffer: "and", queue: ["click “Ana Silva”"] }); // order 1 is complete; "and" waits for the rest
+  const instruction = "open my DM with Ana";
+  mockEmit("command_step", cmd("marks", { instruction, marks: MARKS, op: "click", order: 1 }));
+  await wait(400);
+  mockEmit("command_step", cmd("aim", { instruction, marks: MARKS, op: "click", action: "click", target: 27, order: 1, latency_ms: 702 }));
+  said("type hello there");
+  await wait(300);
+  live({ buffer: "", queue: ["type “hello there”"] });
+  mockEmit("command_step", cmd("done", { instruction, marks: MARKS, op: "click", action: "click", target: 27, order: 1 }));
+  remember(mem(Date.now(), "clicked", "Ana Silva", "Slack", "link"));
+  await wait(1300);
+  live({ queue: [] });
+  mockEmit("command_step", cmd("aim", { instruction: "type hello there", marks: MARKS, op: "type", action: "focus_and_type", detail: "hello there", target: 36, order: 2 }));
+  await wait(500);
+  mockEmit("command_step", cmd("done", { instruction: "type hello there", marks: MARKS, op: "type", action: "focus_and_type", detail: "hello there", target: 36, order: 2 }));
+  remember(mem(Date.now(), "typed", "hello there", "Slack", "Message #engineering"));
+  await wait(1200);
+  mockEmit("command_live", (liveNow = LIVE_OFF));
+  phase("idle");
+  liveRunning = false;
+}
+
+// ---------------- recents (Ctrl+ptt, VOICE_CONTROL_V2 4.1) ----------------
+const recentItems = () => history.filter((h) => h.kind === "dictation").slice(0, 9);
+let recentsOpen = false;
+function openRecents() {
+  recentsOpen = true;
+  mockEmit("recents", { items: recentItems(), picked: null } satisfies C.Recents);
+}
+function closeRecents() {
+  recentsOpen = false;
+  mockEmit("recents", { items: [], picked: null } satisfies C.Recents);
+}
+/** Rust registers 1-9, Cmd+1-9 and Esc as global shortcuts while the list is open; the browser preview fakes them. */
+async function pickRecent(n: number, copyOnly: boolean) {
+  const item = recentItems()[n - 1];
+  if (!recentsOpen || !item) return;
+  mockEmit("recents", { items: recentItems(), picked: n } satisfies C.Recents);
+  await wait(300);
+  closeRecents();
+  if (copyOnly) toast("Copied", "success", [], 1500);
+  else {
+    phase("done", { message: "pasted" });
+    await wait(700);
+    phase("idle");
+  }
+}
+if (!("__TAURI_INTERNALS__" in window) && location.pathname.startsWith("/overlay"))
+  addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.code === settings.hotkeys.recents.split("+").pop()) return recentsOpen ? closeRecents() : openRecents();
+    if (!recentsOpen) return;
+    if (e.code === "Escape") return closeRecents();
+    const d = e.code.match(/^Digit([1-9])$/);
+    if (d) void pickRecent(+d[1], e.metaKey);
+  });
+
 /** Marks page in a browser: a wireframe of the app under the marks, then one frozen state or the loop. */
 export function marksDemo(state: string | null) {
   const app = document.createElement("div");
@@ -862,6 +1000,8 @@ export function marksDemo(state: string | null) {
   }
   el("el", { x: 340, y: 30, w: 300, h: 30 }, "# engineering").style.fontWeight = "700";
   document.body.prepend(app);
+  if (state && LIVE_STATES[state]) return setTimeout(() => freezeLive(state), 50);
+  if (state === "live-session") return setTimeout(() => void liveSession(), 50);
   if (state && CMD_STATES[state]) {
     phase("acting", { command: true });
     return setTimeout(() => mockEmit("command_step", CMD_STATES[state]), 50);
@@ -931,6 +1071,16 @@ if (inBrowser) Object.assign(window, {
     perms: (p: Partial<C.Permissions>) => void ((perms = { ...perms, ...p }), hotkeyStatus()),
     command,
     step: (k: string) => mockEmit("command_step", CMD_STATES[k]),
+    /** Voice control v2: a scripted live session; live(patch) emits command_live; takeOver() = Pablo moved the mouse. */
+    liveSession,
+    live,
+    takeOver: () => live({ took_over: true }),
+    recents: openRecents,
+    /** How many listeners an event has (tests wait for the page to subscribe before they emit). */
+    listens: (event: string) => listeners.get(event)?.size ?? 0,
+    get ready() {
+      return demoReady;
+    },
     get pillRect() {
       return pillRect;
     },

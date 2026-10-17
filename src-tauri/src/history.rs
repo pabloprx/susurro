@@ -179,6 +179,16 @@ pub fn stats(conn: &Connection, now: i64) -> rusqlite::Result<Stats> {
 }
 
 /// Reads a 16 kHz mono s16 WAV (our own format).
+/// A hands-free continuation (vc-feedback 17) joins the row it continues: one session, one row.
+pub fn append(conn: &Connection, id: i64, raw: &str, final_text: &str, duration_ms: u32) -> rusqlite::Result<Option<HistoryItem>> {
+    conn.execute(
+        "UPDATE history SET raw = trim(raw || ' ' || ?1), final_text = trim(final_text || ' ' || ?2), duration_ms = duration_ms + ?3,
+         words = words + ?4 WHERE id = ?5",
+        params![raw, final_text, duration_ms, words(final_text), id],
+    )?;
+    get(conn, id)
+}
+
 /// The paste result of a retried row.
 pub fn set_status(conn: &Connection, id: i64, status: &HistoryStatus) -> rusqlite::Result<()> {
     conn.execute("UPDATE history SET status = ?1 WHERE id = ?2", params![status_str(status), id])?;

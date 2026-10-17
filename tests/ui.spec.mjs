@@ -1,7 +1,12 @@
 // UI tests for every screen and control, in the browser mock (src/lib/mock.ts). Run: bun run test:ui
 // Every test fails on a console error, a page error or a failed request.
 import { test as base, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+
+// Voice control v2 screenshots land here too (VOICE_CONTROL_V2 8, the Fable UI work package).
+const SHOTS = new URL("../.lo/shots-vc2/", import.meta.url).pathname;
+mkdirSync(SHOTS, { recursive: true });
+const shot = (page, name) => page.screenshot({ path: `${SHOTS}${name}.png` });
 
 const test = base.extend({
   guard: [
@@ -1050,14 +1055,30 @@ test.describe("shortcuts", () => {
     await dt.click();
     await expect(dt).toHaveAttribute("aria-checked", "false");
   });
-  test("hands-free grace slider: 400 ms default, 0 = off", async ({ page }) => {
+  test("hands-free grace slider: 1000 ms default (vc-feedback 17), 0 = off, up to 1500", async ({ page }) => {
     const g = page.getByLabel("Hands-free grace");
-    await expect(g).toHaveValue("400");
-    await expect(row(page, "Hands-free grace")).toContainText("400 ms");
+    await expect(g).toHaveValue("1000");
+    await expect(g).toHaveAttribute("max", "1500");
+    await expect(row(page, "Hands-free grace")).toContainText("1000 ms");
     await g.fill("0");
     await expect(row(page, "Hands-free grace")).toContainText("off");
-    await g.fill("800");
-    await expect(row(page, "Hands-free grace")).toContainText("800 ms");
+    await g.fill("1500");
+    await expect(row(page, "Hands-free grace")).toContainText("1500 ms");
+    await nav(page, "Home");
+    await nav(page, "Shortcuts");
+    await expect(page.getByLabel("Hands-free grace")).toHaveValue("1500");
+  });
+  test("recents key: Ctrl+F1 default, record Ctrl+F3, a clash is rejected, reset", async ({ page }) => {
+    await expect(bind(page, "Recents")).toHaveAccessibleName(/^Recents: Ctrl\+F1\./);
+    await expect(row(page, "Recents")).toContainText("1-9 pastes, ⌘1-9 copies");
+    await bind(page, "Recents").click();
+    await page.keyboard.press("Control+Meta+V");
+    await expect(page.getByRole("alert")).toContainText("Already used by Paste last");
+    await page.keyboard.press("Control+F3");
+    await expect(bind(page, "Recents")).toHaveAccessibleName(/^Recents: Ctrl\+F3\./);
+    await row(page, "Recents").getByRole("button", { name: "Reset" }).click();
+    await expect(bind(page, "Recents")).toHaveAccessibleName(/^Recents: Ctrl\+F1\./);
+    await shot(page, "shortcuts-grace-recents");
   });
   test("cancel and paste-last: record and reset", async ({ page }) => {
     await bind(page, "Cancel").click();
@@ -1516,6 +1537,64 @@ test.describe("marks window", () => {
   });
 });
 
+test.describe("marks window: live session (vc-feedback 9, 13)", () => {
+  const root = (page) => page.locator(".marks-root");
+  test.beforeEach(({ page }) => page.setViewportSize({ width: 1440, height: 900 }));
+  test("marks stay through the whole session; the target brackets fade after 1 s", async ({ page }) => {
+    await page.goto("/marks?state=live-session");
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await expect(root(page).locator(".mark.chosen .badge")).toHaveText("27"); // aim on Ana Silva
+    await expect(root(page).locator(".hud")).toContainText("LIVE");
+    // the click is done: brackets linger, nobody is faded, the badges stay
+    await expect(root(page)).toHaveClass(/\bs-done\b/);
+    await expect(root(page).locator(".brackets.linger")).toHaveCount(1);
+    await expect(root(page).locator(".mark.faded")).toHaveCount(0);
+    await shot(page, "marks-live-done-linger");
+    await expect(root(page).locator(".brackets")).toHaveCount(0, { timeout: 1500 });
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    // the next order (type into the composer) aims on the same, fresh board
+    await expect(root(page).locator(".mark.chosen .badge")).toHaveText("36", { timeout: 3000 });
+    await expect(root(page).locator(".hud")).toContainText("TYPE");
+    // session over: the window empties
+    await expect(root(page).locator(".mark")).toHaveCount(0, { timeout: 5000 });
+  });
+  test("live HUD: what it heard, what it does, what is queued", async ({ page }) => {
+    await page.goto("/marks?state=live-acting");
+    const hud = root(page).locator(".hud");
+    await expect(hud).toContainText("LIVECLICKAna Silva");
+    await expect(hud.locator(".hud-line.heard")).toContainText("HEARDand type hello there");
+    await expect(hud.locator(".hud-line.heard .hud-v")).toHaveClass(/\bold\b/); // the last chunk, nothing unplanned
+    await expect(hud.locator(".q-chip")).toHaveText(["type “hello there”", "⏎"]);
+    await expect(root(page).locator(".brackets")).toHaveCount(1);
+    await shot(page, "marks-live-acting");
+    await page.goto("/marks?state=live");
+    await expect(hud).toContainText("LISTENING");
+    await expect(hud.locator(".hud-line.heard .hud-v")).toHaveText("create a new tab and run the command");
+    await expect(hud.locator(".hud-line.heard .hud-v")).not.toHaveClass(/\bold\b/);
+    await expect(root(page).locator(".mark")).toHaveCount(0); // no AX read yet: HUD only
+    await shot(page, "marks-live-listening");
+  });
+  test("live confirm and pick ask for a voice answer", async ({ page }) => {
+    await page.goto("/marks?state=live-confirm");
+    await expect(root(page).locator(".hud.warn .hud-q")).toHaveText("Press Return?");
+    await expect(root(page).locator(".hud-foot")).toHaveText("Say “yes” or press F2 to confirm · esc cancels");
+    await shot(page, "marks-live-confirm");
+    await page.goto("/marks?state=live-pick");
+    await expect(root(page).locator(".mark.pick")).toHaveCount(3);
+    await expect(root(page).locator(".hud.ask .hud-foot")).toHaveText("Not sure enough to act. Say the number.");
+    await shot(page, "marks-live-pick");
+  });
+  test("Pablo's own mouse or keys hide the marks at once; the next order shows them again", async ({ page }) => {
+    await page.goto("/marks?state=live-acting");
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await page.evaluate(() => window.mock.takeOver());
+    await expect(root(page)).toHaveClass(/\btook-over\b/);
+    await expect(root(page).locator(".mark, .hud, .brackets")).toHaveCount(0);
+    await page.evaluate(() => window.mock.live({ took_over: false }));
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+  });
+});
+
 test.describe("voice control", () => {
   test.beforeEach(({ page }) => page.addInitScript(() => localStorage.setItem("susurro.labs.voice", "1")));
   test("sidebar shows it with the labs flag, Cmd+8 opens it", async ({ page }) => {
@@ -1558,7 +1637,7 @@ test.describe("voice control", () => {
     await expect(page.getByRole("alert")).toContainText("Already used by Push to talk");
     await page.keyboard.press("F3");
     await expect(bind).toHaveAccessibleName(/F3/);
-    await expect(page.locator(".vc-lede kbd")).toHaveText("F3");
+    await expect(page.locator(".vc-lede kbd")).toHaveText(["F3", "F3"]); // hold, and double-tap
     await page.getByRole("button", { name: "Reset" }).click();
     await expect(bind).toHaveAccessibleName(/F2/);
   });
@@ -1575,6 +1654,54 @@ test.describe("voice control", () => {
     await expect(page.locator(".shell")).toBeVisible();
     await nav(page, "Voice control");
     await expect(page.locator(".vc-ready").getByLabel("Screen Recording: ready")).toBeVisible();
+  });
+  test("planner model: the bench ranking with latency; a pick saves", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    const group = page.getByRole("radiogroup", { name: "Planner model" });
+    const radios = group.getByRole("radio");
+    await expect(radios).toHaveCount(5);
+    await expect(radios.first()).toHaveAccessibleName("gpt-oss-120b");
+    await expect(radios.first()).toHaveAttribute("aria-checked", "true"); // contract.rs DEFAULT_PLANNER
+    await expect(radios.first()).toContainText("FASTEST");
+    await expect(radios.first()).toContainText("60/60");
+    await expect(radios.first()).toContainText("0.78 s");
+    await expect(radios.first()).toContainText("$0.45");
+    await expect(group.getByRole("radio", { name: "Claude Haiku 5.5" })).toContainText("MOST EXACTAnthropic60/602.05 s");
+    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" }).locator(".vc-pl-score.miss")).toHaveText("53/60");
+    await group.scrollIntoViewIfNeeded();
+    await shot(page, "voice-planner");
+    await group.getByRole("radio", { name: "Claude Haiku 5.5" }).click();
+    await expect(group.getByRole("radio", { name: "Claude Haiku 5.5" })).toHaveAttribute("aria-checked", "true");
+    // arrow keys move the pick
+    await group.getByRole("radio", { name: "Claude Haiku 5.5" }).press("ArrowDown");
+    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" })).toHaveAttribute("aria-checked", "true");
+    await nav(page, "Home");
+    await nav(page, "Voice control");
+    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" })).toHaveAttribute("aria-checked", "true");
+    expect(await page.evaluate(() => window.mock && 1)).toBe(1);
+  });
+  test("memory: what susurro did, newest first; clear memory empties it", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    const rows = page.getByLabel("Memory", { exact: true }).locator(".row");
+    await expect(rows).toHaveCount(10);
+    await expect(rows.first()).toContainText("DELETEDhelloWhatsApp · Type a message");
+    await expect(rows.nth(3)).toContainText("SAID“paste it in the message box”WhatsApp");
+    await expect(page.locator(".label-row", { hasText: "Memory" })).toContainText("10 / 50");
+    await rows.first().scrollIntoViewIfNeeded();
+    await shot(page, "voice-memory");
+    await page.getByRole("button", { name: "Clear memory" }).click();
+    await expect(rows).toHaveCount(0);
+    await expect(page.getByText("Nothing yet. susurro remembers what it typed")).toBeVisible();
+    await nav(page, "Home");
+    await nav(page, "Voice control");
+    await expect(rows).toHaveCount(0);
+  });
+  test("lede names the live session with the keys from settings", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    await expect(page.locator(".vc-lede")).toContainText("Double-tap F2 for a live session");
   });
   test("History shows command rows; Home Recent does not", async ({ page }) => {
     await open(page);
@@ -1610,8 +1737,13 @@ test.describe("overlay", () => {
     ["cmd-listening", "v-cmd-listening", "CMD"],
     ["cmd-thinking", "v-cmd-thinking", "open my DM with Ana"],
     ["cmd-acting", "v-cmd-acting", "CLICKAna Silva"],
-    ["cmd-pick", "v-cmd-pick", "Which one?F2say its number"],
-    ["cmd-confirm", "v-cmd-confirm", "Click “Send now”?F2yesescno"],
+    ["cmd-pick", "v-cmd-pick", "Which one?say its number"],
+    ["cmd-confirm", "v-cmd-confirm", "Click “Send now”?say yes ·F2·esc"],
+    ["live", "v-cmd-live", "create a new tab and run the command"],
+    ["live-acting", "v-cmd-acting", "CLICKAna Silva"],
+    ["live-confirm", "v-cmd-confirm", "Press Return?say yes ·F2·esc"],
+    ["live-pick", "v-cmd-pick", "Which one?say its number"],
+    ["live-paused", "v-cmd-paused", "Paused, you took over"],
     ["cmd-done", "v-cmd-done", "Done · 2 steps"],
     ["cmd-stopped", "v-cmd-stopped", "Stopped"],
     ["cmd-unsure", "v-cmd-unsure", "Not sure where. Say it again."],
@@ -1634,7 +1766,87 @@ test.describe("overlay", () => {
         await expect(pill(page).locator("canvas.wave.on")).toHaveCount(1);
       }
       await page.screenshot({ path: test.info().outputPath(`overlay-${state}.png`) });
+      if (state.startsWith("live") || state.startsWith("cmd-c") || state === "cmd-pick") await shot(page, `overlay-${state}`);
     });
+  test("live session: the queue shows one dot per action; the pill stays 272 px while words arrive", async ({ page }) => {
+    await page.goto("/overlay?state=live-acting");
+    await expect(pill(page).getByLabel("2 queued")).toBeVisible();
+    await page.goto("/overlay?state=live");
+    await expect(pill(page)).toHaveClass(/\bv-cmd-live\b/);
+    await expect(pill(page).getByLabel("1 queued")).toBeVisible();
+    await page.waitForTimeout(400);
+    expect((await pill(page).boundingBox()).width).toBe(272);
+    const long = "create a new tab and run the command ls and then open Slack and reply in the thread with the link";
+    await page.evaluate((b) => window.mock.live({ buffer: b, queue: ["⌘T", "type “ls”", "⏎", "open Slack", "click “thread”", "paste", "⏎"] }), long);
+    await expect(pill(page).locator(".heard")).toHaveAttribute("title", long);
+    await expect(pill(page).getByLabel("7 queued")).toContainText("+1");
+    await page.waitForTimeout(300);
+    expect((await pill(page).boundingBox()).width).toBe(272);
+    // the newest words stay in view: the right edge of the text is inside the pill, the start is clipped
+    const m = await pill(page).locator(".layer.in .heard").evaluate((e) => ({ clipped: e.scrollWidth > e.clientWidth, over: getComputedStyle(e).textOverflow }));
+    expect(m).toEqual({ clipped: true, over: "ellipsis" });
+    await shot(page, "overlay-live-long");
+  });
+  test("live session: listening, heard words per chunk, acting, done, idle", async ({ page }) => {
+    // every pill class and heard text, recorded as it renders: a poll under load can miss a 500 ms state
+    await page.addInitScript(() => {
+      window.__seen = { views: [], heard: [] };
+      new MutationObserver(() => {
+        const p = document.querySelector(".pill");
+        const v = p?.className.match(/\bv-[\w-]+/)?.[0];
+        if (v && window.__seen.views.at(-1) !== v) window.__seen.views.push(v);
+        const h = document.querySelector(".pill .layer.in .heard")?.textContent;
+        if (h && window.__seen.heard.at(-1) !== h) window.__seen.heard.push(h);
+      }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    });
+    await page.goto("/overlay?state=live-session");
+    await page.waitForFunction(() => window.__seen.views.includes("v-cmd-listening"));
+    await expect(pill(page)).toHaveClass(/\bv-idle\b/, { timeout: 12000 });
+    const seen = await page.evaluate(() => window.__seen);
+    const run = seen.views.slice(seen.views.indexOf("v-cmd-listening"));
+    const order = ["v-cmd-listening", "v-cmd-done", "v-idle"].map((v) => run.indexOf(v));
+    expect(order.every((i, k) => i >= 0 && (k === 0 || i > order[k - 1])), JSON.stringify(seen.views)).toBe(true);
+    expect(seen.views.some((v) => /^v-cmd-(acting|live)$/.test(v))).toBe(true);
+    // chunks land 500 ms apart: the heard text grows chunk by chunk
+    expect(seen.heard.some((h) => /^open my DM/.test(h))).toBe(true);
+    expect(seen.heard).toContain("open my DM with Ana and");
+  });
+  test("recents list: 9 rows above the pill, flags, 1-9 pastes, Cmd+1-9 copies, Esc closes", async ({ page }) => {
+    await page.goto("/overlay?state=recents");
+    const list = page.getByRole("listbox", { name: "Recent dictations" });
+    const rows = list.getByRole("option");
+    await expect(rows).toHaveCount(9);
+    await expect(rows.first().locator(".rc-n")).toHaveText("1");
+    await expect(list.locator(".rc-flag.copied")).toHaveCount(1);
+    await expect(list.locator(".rc-flag.failed")).toHaveCount(1);
+    await expect(list.locator(".rc-flag.copied")).toHaveText("not pasted");
+    await expect(list.locator(".rc-foot")).toHaveText("1-9 paste⌘1-9 copyesc close");
+    // the list sits above the pill
+    const l = await list.boundingBox();
+    const p = await pill(page).boundingBox();
+    expect(l.y + l.height).toBeLessThanOrEqual(p.y);
+    await shot(page, "overlay-recents");
+    await page.keyboard.press("Digit2");
+    await expect(rows.nth(1)).toHaveClass(/\bpicked\b/);
+    await expect(rows.nth(1)).toHaveAttribute("aria-selected", "true");
+    await expect(list).toHaveCount(0);
+    await expect(pill(page)).toHaveClass(/\bv-done\b/);
+    // Ctrl+ptt opens it again; Cmd+1 copies
+    await page.keyboard.press("Control+F1");
+    await expect(rows).toHaveCount(9);
+    await page.keyboard.press("Meta+Digit1");
+    await expect(list).toHaveCount(0);
+    await expect(pill(page).locator(".layer.in")).toContainText("Copied");
+    await page.keyboard.press("Control+F1");
+    await expect(rows).toHaveCount(9);
+    await page.keyboard.press("Escape");
+    await expect(list).toHaveCount(0);
+  });
+  test("recents: the picked row flashes", async ({ page }) => {
+    await page.goto("/overlay?state=recents-picked");
+    await expect(page.getByRole("option").nth(1)).toHaveClass(/\bpicked\b/);
+    await shot(page, "overlay-recents-picked");
+  });
   test("command pills stay compact (300 px max) and count the steps", async ({ page }) => {
     for (const s of ["cmd-thinking", "cmd-acting", "cmd-pick", "cmd-confirm", "cmd-setup"]) {
       await page.goto(`/overlay?state=${s}`);
@@ -1677,13 +1889,35 @@ test.describe("overlay", () => {
   test("a command run: listen, think, act, done, back to idle", async ({ page }) => {
     await page.goto("/overlay?state=idle");
     await expect(pill(page)).toHaveClass(/\bv-idle\b/);
-    await page.waitForFunction(() => window.mock);
+    // the frozen ?state=idle lands 50 ms after load: a run started before it is overwritten back to idle
+    await page.waitForFunction(() => window.mock?.ready && window.mock.listens("session_state") && window.mock.listens("command_step"));
     await page.evaluate(() => void window.mock.command()); // do not await the whole run
     await expect(pill(page)).toHaveClass(/\bv-cmd-listening\b/);
     await expect(pill(page)).toHaveClass(/\bv-cmd-thinking\b/);
     await expect(pill(page)).toHaveClass(/\bv-cmd-acting\b/);
     await expect(pill(page)).toHaveClass(/\bv-cmd-done\b/, { timeout: 4000 });
     await expect(pill(page)).toHaveClass(/\bv-idle\b/, { timeout: 4000 });
+  });
+  test("vc-feedback 19: a notice with a stuck hover never hides a new recording, and leaves after 8 s", async ({ page }) => {
+    await page.goto("/overlay?state=idle");
+    await page.waitForFunction(() => window.mock?.ready && window.mock.listens("session_state") && window.mock.listens("toast"));
+    await page.evaluate(() => window.mock.toast("Copied the last transcript", "info", [], 2500, "copy-last"));
+    await expect(pill(page)).toHaveClass(/\bv-notice\b/);
+    await pill(page).hover(); // the hover that stays stuck once the window turns click-through
+    await expect(pill(page)).toHaveClass(/\bhover\b/);
+    await page.evaluate(() => window.mock.phase("recording", { started_at: Date.now() }));
+    await expect(pill(page)).toHaveClass(/\bv-listening\b/);
+    // idle again, a new notice, the hover never leaves: gone by 8 s anyway
+    await page.evaluate(() => window.mock.phase("idle"));
+    await page.evaluate(() => window.mock.toast("Copied the last transcript", "info", [], 2500, "copy-last"));
+    await expect(pill(page)).toHaveClass(/\bv-notice\b/);
+    await pill(page).hover();
+    await page.waitForTimeout(4500);
+    await expect(pill(page)).toHaveClass(/\bv-notice\b/, { timeout: 100 }); // the hover holds it past its 2.5 s
+    await expect(pill(page)).not.toHaveClass(/\bv-notice\b/, { timeout: 5000 });
+    // a window blur drops the stuck hover
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await expect(pill(page)).not.toHaveClass(/\bhover\b/);
   });
   test("a long error message ends in an ellipsis inside 300 px", async ({ page }) => {
     await page.goto("/overlay?state=error");

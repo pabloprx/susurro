@@ -92,4 +92,26 @@ export const VERB: Record<string, string> = {
   paste_last: "PASTE",
   new_tab: "NEW TAB",
   done: "DONE",
+  // v2 planner ops (VOICE_CONTROL_V2 1.4)
+  key: "KEY",
+  type: "TYPE",
+  select_typed: "SELECT",
+  delete_typed: "DELETE",
+  copy: "COPY",
+  paste: "PASTE",
+  scroll: "SCROLL",
 };
+
+/** The v2 planner op of a step, else the v1 action. */
+export const opOf = (c: { action: string | null; op?: string | null }) => c.op || c.action || "";
+
+/** The question of LiveState.pending without its key hints (the pill draws its own):
+ *  "Press Return? Say yes · F11 · Esc" or "confirm: press Return in WhatsApp" -> "Press Return?" / "Press Return in WhatsApp?" */
+export function pendingQuestion(p: string | null): string | null {
+  const q = p?.replace(/^(confirm|pick):\s*/i, "").split("?")[0].trim();
+  return q ? `${q[0].toUpperCase()}${q.slice(1)}?` : null;
+}
+/** A pending question that wants a number (a pick), not a yes. */
+export const isPick = (p: string | null) => !!p && /^(pick|which)/i.test(p);
+
+export const firstLine = (t: string) => t.trim().split("\n")[0];

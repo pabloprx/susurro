@@ -27,6 +27,8 @@ pub struct Node {
     pub frame: Option<PtRect>,
     pub children: Vec<Node>,
     pub h: usize,
+    /// AXURL of a link (copy the link without keys).
+    pub url: String,
 }
 
 /// A mark plus what the Jev criteria and the actions need.
@@ -37,6 +39,41 @@ pub struct El {
     pub state: Option<String>,
     /// The reader's handle index (AXPress / focus).
     pub h: usize,
+    /// AXURL (links).
+    pub url: Option<String>,
+    /// AXValue of a text field, 200 chars max (never for secure fields: they are not marked).
+    pub value: Option<String>,
+}
+
+/// The focused element, read right before an action (VOICE_CONTROL_V2 2.1). Ranges are UTF-16 units (AX).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Field {
+    pub app: String,
+    pub bundle: String,
+    pub pid: i32,
+    /// AX role ("AXTextField") or "" when nothing answers (Electron without a tree).
+    pub role: String,
+    pub name: String,
+    /// None = not readable. Never read for a secure field.
+    pub value: Option<String>,
+    /// AXSelectedTextRange (location, length).
+    pub sel: Option<(usize, usize)>,
+    pub selected: Option<String>,
+    /// AXURL of the focused element (a focused link).
+    pub url: Option<String>,
+    pub secure: bool,
+}
+
+/// Value tail sent to the planner.
+pub const VALUE_TAIL: usize = 200;
+
+impl Field {
+    /// The last `VALUE_TAIL` chars of the value.
+    pub fn tail(&self) -> String {
+        let v = self.value.as_deref().unwrap_or("");
+        let n = v.chars().count();
+        v.chars().skip(n.saturating_sub(VALUE_TAIL)).collect()
+    }
 }
 
 /// AX role -> (label, takes text). Anything else is not actionable.
@@ -151,7 +188,9 @@ pub fn collect(root: &Node, win: PtRect) -> Vec<El> {
             let visible = r.w >= 4.0 && r.h >= 4.0 && overlaps(r, win);
             if n.enabled && visible && !out.iter().any(|e| same_rect(e.mark.rect, r)) {
                 let mark = Mark { id: 0, rect: r, name: name_of(n), role: label.into(), region: region_of(r, win).into() };
-                out.push(El { mark, state: state_of(n), h: n.h });
+                let value = (takes_text(label) && !n.value.is_empty()).then(|| n.value.chars().take(VALUE_TAIL).collect());
+                let url = (!n.url.is_empty()).then(|| n.url.clone());
+                out.push(El { mark, state: state_of(n), h: n.h, url, value });
             }
         }
         for c in &n.children {
@@ -239,6 +278,13 @@ pub mod mac {
         v.downcast::<CFNumber>().and_then(|n| n.to_i64()).map(|n| n.to_string()).unwrap_or_default()
     }
 
+    fn url_text(v: &CFType) -> String {
+        if let Some(u) = v.downcast::<core_foundation::url::CFURL>() {
+            return u.get_string().to_string();
+        }
+        text(v)
+    }
+
     fn ax_value<T: Default>(v: &CFType, ty: u32) -> Option<T> {
         if v.type_of() as usize != unsafe { AXValueGetTypeID() } || unsafe { AXValueGetType(v.as_CFTypeRef()) } != ty {
             return None;
@@ -292,6 +338,9 @@ pub mod mac {
             if n.role == "AXStaticText" || role_label(&n.role, &n.subrole).is_some() {
                 n.value = attr(&el, "AXValue").map(|v| text(&v)).unwrap_or_default();
             }
+            if n.role == "AXLink" {
+                n.url = attr(&el, "AXURL").map(|v| url_text(&v)).unwrap_or_default();
+            }
             let kids = get(9).filter(|_| depth < MAX_DEPTH).and_then(|v| array(&v));
             self.handles.push(el);
             if let Some(kids) = kids {
@@ -343,6 +392,51 @@ pub mod mac {
     /// AXPress. false = the element has no press action (the caller clicks its center instead).
     pub fn press(el: &CFType) -> bool {
         unsafe { AXUIElementPerformAction(el.as_CFTypeRef(), CFString::new("AXPress").as_concrete_TypeRef()) == 0 }
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CFRange {
+        location: isize,
+        length: isize,
+    }
+    const AX_CFRANGE: u32 = 4;
+
+    unsafe extern "C" {
+        fn AXUIElementGetPid(el: CFTypeRef, pid: *mut i32) -> i32;
+        fn AXValueCreate(ty: u32, ptr: *const c_void) -> CFTypeRef;
+    }
+
+    /// The focused element (system-wide) and its handle, for set_selection. None = no AX answer.
+    pub fn focused() -> Option<(Field, CFType)> {
+        let sys = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+        unsafe { AXUIElementSetMessagingTimeout(sys.as_CFTypeRef(), 0.25) };
+        let el = attr(&sys, "AXFocusedUIElement")?;
+        let s = |a| attr(&el, a).map(|v| text(&v)).unwrap_or_default();
+        let mut f = Field { role: s("AXRole"), ..Default::default() };
+        let subrole = s("AXSubrole");
+        unsafe { AXUIElementGetPid(el.as_CFTypeRef(), &mut f.pid) };
+        f.secure = is_secure(&Node { role: f.role.clone(), subrole, ..Default::default() });
+        f.name = [s("AXTitle"), s("AXDescription"), s("AXPlaceholderValue")].into_iter().find(|t| !t.trim().is_empty()).unwrap_or_default();
+        if f.secure {
+            return Some((f, el));
+        }
+        f.value = attr(&el, "AXValue").and_then(|v| v.downcast::<CFString>()).map(|v| v.to_string());
+        f.selected = attr(&el, "AXSelectedText").and_then(|v| v.downcast::<CFString>()).map(|v| v.to_string());
+        f.sel = attr(&el, "AXSelectedTextRange").and_then(|v| ax_value::<CFRange>(&v, AX_CFRANGE)).map(|r| (r.location.max(0) as usize, r.length.max(0) as usize));
+        f.url = attr(&el, "AXURL").map(|v| url_text(&v)).filter(|u| !u.is_empty());
+        Some((f, el))
+    }
+
+    /// AXSelectedTextRange = (start, len), UTF-16 units. false = refused (the caller tries the next strategy).
+    pub fn set_selection(el: &CFType, start: usize, len: usize) -> bool {
+        let r = CFRange { location: start as isize, length: len as isize };
+        let v = unsafe { AXValueCreate(AX_CFRANGE, &r as *const _ as *const c_void) };
+        if v.is_null() {
+            return false;
+        }
+        let v = unsafe { CFType::wrap_under_create_rule(v) };
+        unsafe { AXUIElementSetAttributeValue(el.as_CFTypeRef(), CFString::new("AXSelectedTextRange").as_concrete_TypeRef(), v.as_CFTypeRef()) == 0 }
     }
 
     /// Keyboard focus on a field (AXFocused = true). false = refused.

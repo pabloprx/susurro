@@ -112,6 +112,60 @@ pub fn show_marks(app: &AppHandle, display: Option<PtRect>) {
     }
 }
 
+std::thread_local! {
+    /// The NSEvent global monitor of a live session (main thread only).
+    static MONITOR: std::cell::RefCell<Option<objc2::rc::Retained<objc2::runtime::AnyObject>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Pablo's own mouse and keys while a live command session runs (VOICE_CONTROL_V2 3): an NSEvent global monitor
+/// for MouseMoved | LeftMouseDown | RightMouseDown | ScrollWheel | KeyDown. Global key events need Accessibility,
+/// which voice control has already; no Input Monitoring prompt. Installed at the session start, removed at its end.
+/// Unverified on macOS 26 until Pablo runs it: the first hit logs "live: Pablo took over".
+pub fn watch_user_input(app: &AppHandle, on: bool) {
+    use objc2_app_kit::{NSEventMask, NSEventType};
+    let app2 = app.clone();
+    let bound: Vec<u16> = {
+        let s = app.state::<crate::AppState>().settings.read().unwrap().hotkeys.clone();
+        [s.command.as_str(), s.cancel.as_str(), s.ptt.as_str()].iter().filter_map(|b| b.rsplit('+').next().and_then(crate::paste::keycode)).collect()
+    };
+    let r = app.run_on_main_thread(move || {
+        MONITOR.with(|m| {
+            let mut m = m.borrow_mut();
+            if let Some(old) = m.take() {
+                // SAFETY: the object came from addGlobalMonitorForEventsMatchingMask on this thread.
+                unsafe { NSEvent::removeMonitor(&old) };
+            }
+            if !on {
+                return;
+            }
+            let moved = std::cell::Cell::new(0.0f64);
+            let block = block2::RcBlock::new(move |e: std::ptr::NonNull<NSEvent>| {
+                // SAFETY: AppKit hands the block a live event for the duration of the call.
+                let e = unsafe { e.as_ref() };
+                let ty = e.r#type();
+                let user_data = e.CGEvent().map(|c| objc2_core_graphics::CGEvent::integer_value_field(Some(&c), objc2_core_graphics::CGEventField(42))).unwrap_or(0);
+                let key = (ty == NSEventType::KeyDown).then(|| e.keyCode());
+                // susurro's own tagged moves (click_at jumps the cursor) must not count toward Pablo's 6 pt.
+                if ty == NSEventType::MouseMoved && user_data != crate::paste::SUSURRO_TAG {
+                    moved.set(moved.get() + e.deltaX().abs() + e.deltaY().abs());
+                }
+                if crate::live::is_users(user_data, key, &bound, if key.is_some() { 0.0 } else if ty == NSEventType::MouseMoved { moved.get() } else { 99.0 }) {
+                    moved.set(0.0);
+                    crate::live::user_input(&app2);
+                }
+            });
+            let mask = NSEventMask::MouseMoved | NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::ScrollWheel | NSEventMask::KeyDown;
+            *m = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+            if m.is_none() {
+                log::warn!("live: the user-input monitor did not install (Accessibility?)");
+            }
+        });
+    });
+    if let Err(e) = r {
+        log::warn!("watch_user_input: {e}");
+    }
+}
+
 /// Keeps the overlay frame (Cocoa coordinates) for the hit-test thread. Main thread only.
 fn store_frame(win: &NSWindow) {
     let f = win.frame();

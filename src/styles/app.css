@@ -2711,6 +2711,121 @@ mark {
 .vc-what {
   color: var(--text-2);
 }
+/* planner picker: the bench as a radio list */
+.vc-planner .row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 84px 176px 104px;
+  gap: var(--s-3);
+  min-height: 48px;
+  cursor: default;
+}
+.vc-planner .row.vc-pl-head {
+  min-height: 30px;
+  font: 500 9.5px/14px var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.vc-pl-head span:nth-child(n + 3),
+.vc-planner .num,
+.vc-pl-score {
+  text-align: right;
+}
+.vc-pl:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--tally);
+}
+.vc-radio {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--line-strong);
+  transition: box-shadow var(--d-fast) ease;
+}
+.vc-pl.sel .vc-radio {
+  box-shadow: inset 0 0 0 4.5px var(--tally);
+}
+.vc-pl-name {
+  display: grid;
+  min-width: 0;
+}
+.vc-pl-name .n {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vc-pl-name .tag {
+  margin: 0 0 0 8px;
+}
+.vc-pl.sel .tag {
+  color: var(--tally);
+  border-color: currentColor;
+}
+.vc-pl-score {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.vc-pl-score.miss {
+  color: var(--warn);
+}
+.vc-pl-lat {
+  display: grid;
+  grid-template-columns: 1fr 52px;
+  align-items: center;
+  gap: var(--s-2);
+}
+/* p50 solid, p90 a faint whisker behind it; all on one scale (the slowest p90) */
+.vc-pl-lat .bar {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+}
+.vc-pl-lat .bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 3px;
+}
+.vc-pl-lat .bar .p90 {
+  background: var(--line-strong);
+}
+.vc-pl-lat .bar .p50 {
+  background: var(--text-2);
+}
+.vc-pl.sel .vc-pl-lat .bar .p50 {
+  background: var(--tally);
+}
+.vc-planner .num {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.vc-bench-note {
+  margin: var(--s-2) 0 var(--s-6);
+  max-width: 640px;
+}
+.vc-mem .row {
+  display: grid;
+  grid-template-columns: 44px 72px minmax(0, 1fr) minmax(0, 200px);
+  gap: var(--s-3);
+}
+.vc-mem .mono {
+  font-size: 12px;
+}
+.vc-mem .dim {
+  color: var(--text-3);
+}
+.vc-mem .k-said .vc-mem-text {
+  font-family: var(--font-display);
+  color: var(--text-2);
+}
+.vc-mem .k-failed .vc-verb {
+  color: var(--danger);
+}
+.vc-mem .small {
+  text-align: right;
+}
 .h-item.cmd .tag {
   margin: 0 8px 0 0;
 }

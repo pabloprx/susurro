@@ -40,15 +40,19 @@ pub struct Settings {
     pub command: CommandSettings,
 }
 
-/// Voice control: hold the command key, say what to do, Jev picks the action and the target.
+/// Voice control: hold or double-tap the command key and talk; the planner LLM writes the actions while you speak,
+/// Jev grounds each click target on the screen (VOICE_CONTROL_V2).
 #[serde(default)]
 pub struct CommandSettings {
     /// Off = the command key is not registered.
     pub enabled: bool,
-    /// Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+    /// Ask for a yes (voice, or the command key) before a step that sends, deletes or buys. Return always asks.
     pub confirm_risky: bool,
-    /// Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+    /// Pinned: Jev answers can shift between releases. "typesafe/jev-1.14". Jev only grounds click targets now.
     pub model: String,
+    /// The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
+    /// spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
+    pub planner_model: String,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -59,14 +63,18 @@ pub struct Hotkeys {
     pub ptt: String,
     pub hands_free: Option<String>,
     pub double_tap: bool,
-    /// After a hold is released the recording goes on this long: a press in it locks hands-free (0-800, 0 = off).
+    /// After a hold is released, a press within this window continues hands-free (0-1500, 0 = off).
+    /// The release itself never waits: the text pastes at once. Also the double-tap window.
     pub hands_free_grace_ms: u32,
     pub cancel: String,
     pub paste_last: String,
     /// Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
     pub copy_last: String,
     /// Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+    /// Double-tap (or hold, release, press again in the grace) = a hands-free live command session.
     pub command: String,
+    /// Opens the recents list (the last 9 dictations; 1-9 pastes, Cmd+1-9 copies). Default "Ctrl+" + the ptt F-key.
+    pub recents: String,
 }
 
 #[serde(default)]
@@ -125,6 +133,8 @@ pub struct SttSettings {
     pub openrouter_model: String,
     /// Cloud STT fails -> whisper local, if a model is downloaded.
     pub local_fallback: bool,
+    /// MAI-Transcribe's own "clean" style (drops fillers). Independent of the LLM cleanup.
+    pub mai_clean: bool,
 }
 
 #[serde(default)]
@@ -489,10 +499,12 @@ pub struct Mark {
     pub region: String,
 }
 
-/// marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
-/// confirm = a risky step waits for the command key (Esc stops).
+/// marks = numbered marks are up, the target is being grounded. pick = "Which one?" (the top 3 in `choices`).
+/// confirm = a risky step or Return waits for a yes (voice, or the command key; Esc stops).
 #[serde(rename_all = "snake_case")]
 pub enum CmdStatus {
+    /// The action waits in the live session's queue.
+    Queued,
     Thinking,
     Marks,
     Aim,
@@ -511,14 +523,15 @@ pub enum CmdStatus {
 #[serde(default)]
 pub struct CommandStep {
     pub instruction: String,
-    /// 1-based; 0 = the fast path (no screen read).
+    /// 1-based action number in the live session.
     pub step: u32,
+    /// v1 step cap; 0 in a live session.
     pub max: u32,
     pub status: CmdStatus,
-    /// click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
-    /// copy_last | new_tab | close_tab | back | forward | reload | done
+    /// What the executor did: click | focus_and_type | scroll_up | scroll_down | press_key | open_app | copy | paste |
+    /// select_typed | delete_typed
     pub action: Option<String>,
-    /// open_app: the app; press_key: the key; focus_and_type: the text.
+    /// open_app: the app; press_key: the combo; focus_and_type: the text; select/delete_typed: the typed text.
     pub detail: Option<String>,
     /// The display the marks window covers, global points.
     pub display: PtRect,
@@ -532,6 +545,64 @@ pub struct CommandStep {
     pub cost_usd: f64,
     /// unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
     pub message: Option<String>,
+    /// Live session: the planner op (key | type | click | open_app | select_typed | delete_typed | copy | paste | scroll).
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Live session: the order (one planner reply) this action belongs to, 1-based. 0 = none.
+    pub order: u32,
+}
+
+/// Payload of `command_live` (overlay, marks, main): the live command session.
+#[derive(Default)]
+#[serde(default)]
+pub struct LiveState {
+    /// A live session runs (recording or draining its queue).
+    pub on: bool,
+    /// Words heard but not planned yet (the order is not complete).
+    pub buffer: String,
+    /// Short labels of the queued actions, next first: "⌘T", "type “ls”", "⏎".
+    pub queue: Vec<String>,
+    /// The question that waits for a voice answer: "Press Return? Say yes · F11 · Esc", "Which one? 4, 7 or 9".
+    pub pending: Option<String>,
+    /// Pablo moved the mouse or typed: the marks hide until the next order.
+    pub took_over: bool,
+    /// The last chunk of text heard.
+    pub last_said: String,
+}
+
+/// One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.
+pub struct MemoryEntry {
+    /// ms since the epoch.
+    pub at: i64,
+    pub kind: MemKind,
+    pub text: String,
+    pub app: String,
+    /// The field name or role it went into ("" = none).
+    pub field: String,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum MemKind {
+    Said,
+    Typed,
+    Deleted,
+    Copied,
+    Pasted,
+    Clicked,
+    Key,
+    Opened,
+    Failed,
+}
+
+/// Payload of `recents` (overlay): the recents list. Empty items = closed.
+#[derive(Default)]
+#[serde(default)]
+pub struct Recents {
+    /// Newest first, at most 9 dictation rows. Status copied / failed = it did not land in a field.
+    pub items: Vec<HistoryItem>,
+    /// 1-9: this row was just pasted or copied (the overlay flashes it, then the list closes).
+    pub picked: Option<u32>,
 }
 
 /// dBFS, throttled to 30 Hz.
@@ -551,12 +622,16 @@ pub struct Navigate {
 /// v2: the default ptt became F1; a stored "Fn" moves to it once, and the old 350 ms restore delay becomes 500.
 /// v3: voice control (hotkeys.command = "F2"), and an empty OpenRouter STT model becomes MAI-Transcribe 2.
 /// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
-pub const SETTINGS_VERSION: u32 = 4;
+/// v5: hotkeys.recents ("Ctrl+" + an F-key ptt), the old 400 ms grace becomes 1000, LLM cleanup off once for MAI STT.
+pub const SETTINGS_VERSION: u32 = 5;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
 /// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
 /// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
 pub const DEFAULT_OPENROUTER_CLEANUP: &str = "google/gemini-2.5-flash-lite";
 pub const JEV_MODEL: &str = "typesafe/jev-1.14";
+/// `.lo/planner-bench.md` (2026-10-17): fastest of the models with every plan right (0.78 s p50, 60/60 same effect),
+/// pinned to Cerebras with reasoning low (planner.rs `extra_for`).
+pub const DEFAULT_PLANNER: &str = "openai/gpt-oss-120b";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -587,11 +662,12 @@ impl Default for Hotkeys {
             ptt: "F1".into(),
             hands_free: None,
             double_tap: true,
-            hands_free_grace_ms: 400,
+            hands_free_grace_ms: 1000,
             cancel: "Escape".into(),
             paste_last: "Ctrl+Cmd+V".into(),
             copy_last: "Ctrl+Cmd+C".into(),
             command: "F2".into(),
+            recents: "Ctrl+F1".into(),
         }
     }
 }
@@ -617,6 +693,7 @@ impl Default for SttSettings {
             elevenlabs: ElevenOpts::default(),
             openrouter_model: DEFAULT_OPENROUTER_STT.into(),
             local_fallback: true,
+            mai_clean: true,
         }
     }
 }
@@ -690,7 +767,7 @@ impl Default for SessionState {
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into() }
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into() }
     }
 }
 

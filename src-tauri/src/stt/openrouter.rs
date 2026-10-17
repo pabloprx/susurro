@@ -15,7 +15,7 @@ pub struct OpenRouter {
     pub base: String,
     pub key: String,
     pub model: String,
-    /// Cleanup is on: MAI drops fillers itself (transcribeStyle "clean").
+    /// settings stt.mai_clean: MAI drops fillers itself (transcribeStyle "clean").
     pub clean: bool,
 }
 

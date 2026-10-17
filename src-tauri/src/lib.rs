@@ -12,10 +12,12 @@ pub mod history;
 pub mod hotkey;
 pub mod jev;
 pub mod learn;
+pub mod live;
 pub mod models;
 pub mod paste;
 pub mod permissions;
 pub mod pipeline;
+pub mod planner;
 pub mod secrets;
 pub mod session;
 pub mod settings;
@@ -174,6 +176,8 @@ pub fn run() {
             hotkey::hotkey_capture,
             platform::macos::set_pill_rect,
             command::command_log,
+            live::command_memory,
+            live::command_memory_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building susurro");

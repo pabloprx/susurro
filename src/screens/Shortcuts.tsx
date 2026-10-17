@@ -7,9 +7,9 @@ import { S } from "../lib/strings";
 import { Kbd, Label, Title, Toggle } from "../ui";
 import type { Nav } from "../App";
 
-export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last" | "command";
-const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last", command: "Voice control" };
-export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 400, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2" };
+export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last" | "command" | "recents";
+const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last", command: "Voice control", recents: "Recents" };
+export const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, hands_free_grace_ms: 1000, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C", command: "F2", recents: "Ctrl+F1" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
   ptt: ["F1", "Delete", "RightOption", "RightCommand"],
@@ -18,6 +18,7 @@ export const PICKS: Record<Slot, string[]> = {
   paste_last: ["Ctrl+Cmd+V", "Alt+Shift+V"],
   copy_last: ["Ctrl+Cmd+C", "Alt+Shift+C"],
   command: ["F2", "F3", "Ctrl+Alt+Space"],
+  recents: ["Ctrl+F1", "Ctrl+Cmd+R"],
 };
 const MODS: Record<string, string> = { Control: "Ctrl", Alt: "Alt", Meta: "Cmd", Shift: "Shift" };
 /** KeyboardEvent.code of a modifier -> its modifier-only binding (the contract names in format.ts MOD_ONLY). */
@@ -222,13 +223,13 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
         <div className="sc-row">
           <div>
             <div className="label">Hands-free grace</div>
-            <div className="sub">After you let go of {ptt}, tap it within this time to keep talking hands-free</div>
+            <div className="sub">After you let go of {ptt}, tap it within this time to keep talking hands-free. Also the double-tap window.</div>
           </div>
           <span className="inline">
             <input
               type="range"
               min={0}
-              max={800}
+              max={1500}
               step={50}
               value={hk.hands_free_grace_ms}
               onChange={(e) => save((x) => void (x.hotkeys.hands_free_grace_ms = +e.target.value))}
@@ -273,6 +274,18 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
           </span>
           <Reset slot="copy_last" />
           <Msg slot="copy_last" />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Recents</div>
+            <div className="sub">The last 9 dictations above the pill: 1-9 pastes, ⌘1-9 copies</div>
+          </div>
+          <span className="inline">
+            <Binding slot="recents" />
+            <Picks slot="recents" />
+          </span>
+          <Reset slot="recents" />
+          <Msg slot="recents" />
         </div>
       </div>
 

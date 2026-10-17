@@ -1,5 +1,5 @@
 // Typed IPC for every command and event in PLAN 1.5. Without Tauri (plain browser) it routes to mock.ts.
-import type { CommandStep, OrModel, Permissions, PermKind, PtRect, SessionState, Settings, Applied, AudioLevel, DictEntry, DictEntryInput, HistoryItem, HotkeyStatus, KeyName, KeyStatus, MicSelection, MicState, ModelInfo, ModelProgress, Navigate, ProviderTest, Stats, Toast } from "./contract.gen";
+import type { CommandStep, LiveState, MemoryEntry, OrModel, Permissions, PermKind, PtRect, Recents, SessionState, Settings, Applied, AudioLevel, DictEntry, DictEntryInput, HistoryItem, HotkeyStatus, KeyName, KeyStatus, MicSelection, MicState, ModelInfo, ModelProgress, Navigate, ProviderTest, Stats, Toast } from "./contract.gen";
 
 export type * from "./contract.gen";
 
@@ -56,6 +56,10 @@ export const api = {
   setPillRect: (rect: PtRect) => call<void>("set_pill_rect", { rect }),
   /** The last voice-control run (in memory, newest step last). */
   commandLog: () => call<CommandStep[]>("command_log"),
+  /** What susurro did in voice control (RAM ring, newest last). */
+  commandMemory: () => call<MemoryEntry[]>("command_memory"),
+  /** Empties the memory ring. Not in the design's command list: the Rust agent (WP-R2) must add it. */
+  commandMemoryClear: () => call<void>("command_memory_clear"),
 };
 
 export type Events = {
@@ -71,6 +75,10 @@ export type Events = {
   permissions_changed: Permissions;
   /** Voice control: one per state change of a command run (to the overlay, marks and main windows). */
   command_step: CommandStep;
+  /** Voice control v2: the live session (heard text, queue, pending question, took_over). */
+  command_live: LiveState;
+  /** The recents list (Ctrl+ptt) above the pill. */
+  recents: Recents;
 };
 
 /** Subscribe to a Rust event. Returns the unsubscribe function. */

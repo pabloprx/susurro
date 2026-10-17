@@ -12,13 +12,14 @@ export type CleanupLevel = "none" | "light" | "medium";
 export type CleanupSettings = { level: CleanupLevel, provider: LlmProvider, openrouter_model: string, local_base_url: string, local_model: string, timeout_ms: number, };
 
 /**
- * marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
- * confirm = a risky step waits for the command key (Esc stops).
+ * marks = numbered marks are up, the target is being grounded. pick = "Which one?" (the top 3 in `choices`).
+ * confirm = a risky step or Return waits for a yes (voice, or the command key; Esc stops).
  */
-export type CmdStatus = "thinking" | "marks" | "aim" | "pick" | "confirm" | "done" | "stopped" | "unsure" | "blocked" | "setup" | "error";
+export type CmdStatus = "queued" | "thinking" | "marks" | "aim" | "pick" | "confirm" | "done" | "stopped" | "unsure" | "blocked" | "setup" | "error";
 
 /**
- * Voice control: hold the command key, say what to do, Jev picks the action and the target.
+ * Voice control: hold or double-tap the command key and talk; the planner LLM writes the actions while you speak,
+ * Jev grounds each click target on the screen (VOICE_CONTROL_V2).
  */
 export type CommandSettings = { 
 /**
@@ -26,29 +27,38 @@ export type CommandSettings = {
  */
 enabled: boolean, 
 /**
- * Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+ * Ask for a yes (voice, or the command key) before a step that sends, deletes or buys. Return always asks.
  */
 confirm_risky: boolean, 
 /**
- * Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+ * Pinned: Jev answers can shift between releases. "typesafe/jev-1.14". Jev only grounds click targets now.
  */
-model: string, };
+model: string, 
+/**
+ * The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
+ * spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
+ */
+planner_model: string, };
 
 /**
  * Payload of `command_step` (all windows) and a row of `command_log`.
  */
 export type CommandStep = { instruction: string, 
 /**
- * 1-based; 0 = the fast path (no screen read).
+ * 1-based action number in the live session.
  */
-step: number, max: number, status: CmdStatus, 
+step: number, 
 /**
- * click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
- * copy_last | new_tab | close_tab | back | forward | reload | done
+ * v1 step cap; 0 in a live session.
+ */
+max: number, status: CmdStatus, 
+/**
+ * What the executor did: click | focus_and_type | scroll_up | scroll_down | press_key | open_app | copy | paste |
+ * select_typed | delete_typed
  */
 action: string | null, 
 /**
- * open_app: the app; press_key: the key; focus_and_type: the text.
+ * open_app: the app; press_key: the combo; focus_and_type: the text; select/delete_typed: the typed text.
  */
 detail: string | null, 
 /**
@@ -70,7 +80,15 @@ choices: Array<[number, number]>, latency_ms: number, cost_usd: number,
 /**
  * unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
  */
-message: string | null, };
+message: string | null, 
+/**
+ * Live session: the planner op (key | type | click | open_app | select_typed | delete_typed | copy | paste | scroll).
+ */
+op?: string, 
+/**
+ * Live session: the order (one planner reply) this action belongs to, 1-based. 0 = none.
+ */
+order: number, };
 
 export type DayStat = { 
 /**
@@ -120,7 +138,8 @@ export type HotkeyStatus = { binding: string, active: boolean, error?: string, }
  */
 export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, 
 /**
- * After a hold is released the recording goes on this long: a press in it locks hands-free (0-800, 0 = off).
+ * After a hold is released, a press within this window continues hands-free (0-1500, 0 = off).
+ * The release itself never waits: the text pastes at once. Also the double-tap window.
  */
 hands_free_grace_ms: number, cancel: string, paste_last: string, 
 /**
@@ -129,14 +148,48 @@ hands_free_grace_ms: number, cancel: string, paste_last: string,
 copy_last: string, 
 /**
  * Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+ * Double-tap (or hold, release, press again in the grace) = a hands-free live command session.
  */
-command: string, };
+command: string, 
+/**
+ * Opens the recents list (the last 9 dictations; 1-9 pastes, Cmd+1-9 copies). Default "Ctrl+" + the ptt F-key.
+ */
+recents: string, };
 
 export type KeyName = "elevenlabs" | "openrouter" | "local_stt" | "local_llm";
 
 export type KeyStatus = { elevenlabs: boolean, openrouter: boolean, local_stt: boolean, local_llm: boolean, };
 
 export type KnownDevice = { id: string, name: string, kind: DeviceKind, last_seen: number, };
+
+/**
+ * Payload of `command_live` (overlay, marks, main): the live command session.
+ */
+export type LiveState = { 
+/**
+ * A live session runs (recording or draining its queue).
+ */
+on: boolean, 
+/**
+ * Words heard but not planned yet (the order is not complete).
+ */
+buffer: string, 
+/**
+ * Short labels of the queued actions, next first: "⌘T", "type “ls”", "⏎".
+ */
+queue: Array<string>, 
+/**
+ * The question that waits for a voice answer: "Press Return? Say yes · F11 · Esc", "Which one? 4, 7 or 9".
+ */
+pending: string | null, 
+/**
+ * Pablo moved the mouse or typed: the marks hide until the next order.
+ */
+took_over: boolean, 
+/**
+ * The last chunk of text heard.
+ */
+last_said: string, };
 
 export type LlmProvider = "openrouter" | "local";
 
@@ -159,6 +212,21 @@ region: string, };
 export type Match = { start: number, end: number, entry_id: number, how: MatchHow, };
 
 export type MatchHow = "exact" | "squashed" | "fuzzy" | "snippet";
+
+export type MemKind = "said" | "typed" | "deleted" | "copied" | "pasted" | "clicked" | "key" | "opened" | "failed";
+
+/**
+ * One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.
+ */
+export type MemoryEntry = { 
+/**
+ * ms since the epoch.
+ */
+at: number, kind: MemKind, text: string, app: string, 
+/**
+ * The field name or role it went into ("" = none).
+ */
+field: string, };
 
 export type MicSelection = "auto" | { "device": { id: string, } };
 
@@ -237,6 +305,19 @@ export type ProviderTest = { ok: boolean, latency_ms: number, text: string, erro
  */
 export type PtRect = { x: number, y: number, w: number, h: number, };
 
+/**
+ * Payload of `recents` (overlay): the recents list. Empty items = closed.
+ */
+export type Recents = { 
+/**
+ * Newest first, at most 9 dictation rows. Status copied / failed = it did not land in a field.
+ */
+items: Array<HistoryItem>, 
+/**
+ * 1-9: this row was just pasted or copied (the overlay flashes it, then the list closes).
+ */
+picked: number | null, };
+
 export type RecordingOpts = { 
 /**
  * 600 s = 19.2 MB as s16 WAV, under the 25 MB multipart cap.
@@ -278,7 +359,11 @@ export type SttSettings = { provider: SttProvider, whisper_model: string, openai
 /**
  * Cloud STT fails -> whisper local, if a model is downloaded.
  */
-local_fallback: boolean, };
+local_fallback: boolean, 
+/**
+ * MAI-Transcribe's own "clean" style (drops fillers). Independent of the LLM cleanup.
+ */
+mai_clean: boolean, };
 
 export type Style = "formal" | "casual" | "very_casual" | "excited";
 

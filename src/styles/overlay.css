@@ -14,8 +14,9 @@ body,
 .pill-root {
   height: 100%;
   display: flex;
-  align-items: flex-end;
-  justify-content: center;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
   padding-bottom: 18px;
   box-sizing: border-box;
   font: 12px/16px var(--font-ui);
@@ -365,6 +366,141 @@ body,
   opacity: 0.35;
 }
 
+/* ---- live command session (VOICE_CONTROL_V2 1): what it heard, and one dot per queued action ---- */
+/* rtl box + an ltr span: short text sits left, long text keeps its newest words and the ellipsis eats the oldest */
+.heard {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.pill.v-cmd-live {
+  box-shadow:
+    var(--shadow-pill),
+    0 0 0 1px rgb(255 106 61 / 0.22),
+    0 0 18px -2px rgb(255 106 61 / 0.18);
+}
+.pill.v-cmd-live .content {
+  width: 244px;
+}
+.pill.v-cmd-paused {
+  background: rgb(18 17 16 / 0.72);
+}
+.pill.v-cmd-paused .content {
+  opacity: 0.8;
+}
+.queue {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  margin-left: 2px;
+}
+.queue i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.25px var(--pill-text);
+  opacity: 0.75;
+}
+.queue i:first-child {
+  background: var(--pill-text); /* next up */
+  opacity: 1;
+}
+.queue b {
+  font: 500 10px/14px var(--font-mono);
+  color: var(--pill-dim);
+}
+
+/* ---- recents (Ctrl+ptt): the last 9 dictations above the pill. Keys only, Rust owns them. ---- */
+.recents {
+  width: 340px;
+  margin-bottom: 8px;
+  padding: 6px;
+  box-sizing: border-box;
+  background: var(--pill-bg);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pill);
+  animation: rc-in 180ms var(--ease-out) both;
+}
+@keyframes rc-in {
+  from { opacity: 0; translate: 0 6px; }
+}
+.rc-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px 0 6px;
+  border-radius: 7px;
+}
+.rc-row + .rc-row {
+  box-shadow: 0 -1px 0 rgb(255 255 255 / 0.05);
+}
+.rc-n,
+.rc-foot kbd {
+  font: 500 10px/14px var(--font-mono);
+  color: var(--pill-text);
+  background: rgb(255 255 255 / 0.08);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  text-align: center;
+}
+.rc-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+.rc-app {
+  font: 10.5px/14px var(--font-mono);
+  color: var(--pill-dim);
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rc-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--warn);
+}
+.rc-flag.failed {
+  color: var(--danger);
+}
+/* the row Rust just pasted or copied flashes for 300 ms, then the list closes */
+.rc-row.picked {
+  animation: rc-pick 300ms var(--ease-out) both;
+}
+@keyframes rc-pick {
+  0% { background: rgb(255 255 255 / 0.22); }
+  100% { background: rgb(255 255 255 / 0.08); }
+}
+.rc-foot {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  padding: 6px 0 2px;
+  margin-top: 2px;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+  font-size: 11px;
+  color: var(--pill-dim);
+}
+.rc-foot kbd {
+  padding: 0 3px;
+  margin: 0 1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .recents { animation-duration: 120ms; }
+}
+
 /* Browser-only preview: a fake desktop and the 360x64 window outline (mock mode, not in Tauri). */
 body.mock-desk {
   background:
@@ -377,8 +513,13 @@ body.mock-desk {
 body.mock-desk #root {
   width: 360px;
   height: 64px;
+  transition: height 180ms ease;
   outline: 1px dashed rgb(255 255 255 / 0.12);
   outline-offset: 0;
+}
+
+body.mock-desk #root:has(.recents) {
+  height: 420px; /* Rust grows the real window for the list (platform/macos.rs setup_overlay) */
 }
 
 /* a notice with a fix button gets the full window width (360 px window, 348 px pill) */

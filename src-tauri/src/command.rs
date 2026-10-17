@@ -1,39 +1,35 @@
-//! Voice control runner (`.lo/VOICE_CONTROL.md`, measured approach: `.lo/som-experiment/RESULTS.md`).
-//! F2 hold -> STT (session.rs) -> `run`:
-//! 1. fast path: one text-only Jev call over a fixed intent list (open_app, paste_last, new_tab, none);
-//! 2. else up to 6 steps: read the AX tree -> numbered marks -> Jev choice over the mark ids, text only; the marked
-//!    screenshot only for spatial words or a confidence < 0.8 -> gates (pick / confirm) -> 300 ms aim -> act -> re-read.
-//!    An app with < 5 AX elements gets the box fallback: full-resolution tiles, Jev box, a visible noul, snap.
+//! Voice control executor (`.lo/VOICE_CONTROL_V2.md` section 2). The planner (planner.rs) writes the actions; the
+//! live session (live.rs) queues them; `exec` runs one: re-read the screen -> ground the target words on fresh marks
+//! (exact name first, else the measured Jev path: text first, the marked screenshot when spatial or unsure,
+//! `.lo/som-experiment/RESULTS.md`) -> gates (pick / confirm / secure) -> act -> read the field again -> memory.
 //! Side effects go through `Desk` (one real impl, one test fake), so every gate and the abort checks are unit-tested.
-//! ABORT (Esc, F2 while acting) is checked between steps, after every Jev call and right before every action.
+//! ABORT (Esc) is checked right before every event susurro posts.
 
-use crate::ax::{self, El};
-use crate::contract::{CmdStatus, CommandStep, Mark, PtRect};
+use crate::ax::{self, El, Field};
+use crate::contract::{CmdStatus, CommandStep, Mark, MemKind, MemoryEntry, PtRect};
 use crate::jev::{self, Bbox, Choice, Reply};
+use crate::paste::{CMD, OPT, SHIFT};
+use crate::planner::Action;
 use serde_json::{Map, Value, json};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-pub const MAX_STEPS: u32 = 6;
 /// Below this target confidence: retry with the screenshot, then ask (pick). RESULTS.md: every miss was < 0.8.
 pub const CONF_MIN: f32 = 0.8;
 /// Below this nothing is worth a pick list: "Not sure where".
 pub const UNSURE_MIN: f32 = 0.2;
-/// risky noul at or above this + confirm_risky = wait for the command key. VOICE_CONTROL.md: low on purpose,
-/// a false alarm costs one key press. Not measured yet.
+/// risky noul at or above this + confirm_risky = wait for a yes. VOICE_CONTROL.md: low on purpose,
+/// a false alarm costs one "yes". Not measured yet.
 pub const RISKY_MIN: f32 = 0.3;
-pub const INTENT_MIN: f32 = 0.6;
-/// A non-target action (scroll, key, done) weaker than this stops as unsure.
-pub const ACTION_MIN: f32 = 0.5;
 pub const VISIBLE_MIN: f32 = 0.5;
-pub const DONE_MIN: f32 = 0.6;
 /// Fewer AX elements than this = the box fallback.
 pub const MIN_AX: usize = 5;
-pub const AIM_MS: u64 = 300;
-/// ponytail: fixed settle time after an action, not measured; an AX-change wait would be faster.
-pub const SETTLE_MS: u64 = 400;
+/// ponytail: fixed wait after a click / key / app switch so the next action reads the new screen; not measured,
+/// an AX-change wait would be faster.
+pub const SETTLE_MS: u64 = 250;
 /// The marks window draws before the screenshot is taken.
 const MARKS_DRAW_MS: u64 = 250;
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,38 +38,51 @@ pub const PICK_TIMEOUT: Duration = Duration::from_secs(20);
 const IMG_MAX: f64 = 1568.0;
 /// A box center this close to an AX element snaps to it.
 const SNAP_PT: f64 = 24.0;
+/// Between the focus and the paste of a type step.
+const FOCUS_MS: u64 = 150;
+/// Cmd+C needs the app to write the pasteboard.
+const COPY_WAIT_MS: u64 = 150;
+/// Memory entries kept (RAM only).
+pub const MEMORY_MAX: usize = 50;
 
 // ---------- the log + the command_step event ----------
 
 static LOG: Mutex<Vec<CommandStep>> = Mutex::new(Vec::new());
+const LOG_MAX: usize = 200;
 
-/// Sends one step to every window and keeps it in the in-memory log. step 1 / fast path (0) starts a new run.
+/// Sends one step to every window and keeps it in the in-memory log (one row per step number).
 pub fn publish(app: &AppHandle, s: CommandStep) {
     record(&mut LOG.lock().unwrap(), s.clone());
     let _ = app.emit("command_step", s);
 }
 
-/// Step 0 (fast path) or 1 starts a new run: the log holds one run, even when the same instruction repeats.
-/// One row per step: a later status of the same step replaces the earlier one.
-fn record(log: &mut Vec<CommandStep>, s: CommandStep) {
-    if s.step <= 1 {
-        log.clear();
-    } else if log.last().is_some_and(|l| l.step == s.step) {
-        log.pop();
-    }
-    log.push(s);
+/// A new live session starts a new log.
+pub fn clear_log() {
+    LOG.lock().unwrap().clear();
 }
 
-/// The last voice-control run, oldest step first.
+/// One row per step: a later status of the same step replaces the earlier one.
+fn record(log: &mut Vec<CommandStep>, s: CommandStep) {
+    match log.iter().position(|l| l.step == s.step && l.order == s.order) {
+        Some(i) => log[i] = s,
+        None => log.push(s),
+    }
+    if log.len() > LOG_MAX {
+        log.remove(0);
+    }
+}
+
+/// The voice-control steps of the current (or last) live session, oldest first.
 #[tauri::command]
 pub fn command_log() -> Vec<CommandStep> {
     LOG.lock().unwrap().clone()
 }
 
-// ---------- abort / confirm / pick (session.rs sets these) ----------
+// ---------- abort / confirm / pick (session.rs and live.rs set these) ----------
 
 static ABORT: AtomicBool = AtomicBool::new(false);
 static CONFIRMED: AtomicBool = AtomicBool::new(false);
+static DENIED: AtomicBool = AtomicBool::new(false);
 /// 0 = not waiting, 1 = confirm, 2 = pick.
 static WAITING: AtomicU8 = AtomicU8::new(0);
 static ANSWER: Mutex<Option<String>> = Mutex::new(None);
@@ -84,7 +93,7 @@ pub enum Wait {
     Pick,
 }
 
-/// What the runner waits for right now (the command key means "confirm" or "speak the number").
+/// What the executor waits for right now (a voice answer, or the command key = yes).
 pub fn waiting() -> Option<Wait> {
     match WAITING.load(Ordering::SeqCst) {
         1 => Some(Wait::Confirm),
@@ -97,8 +106,25 @@ pub fn abort() {
     ABORT.store(true, Ordering::SeqCst);
 }
 
+pub fn aborted() -> bool {
+    ABORT.load(Ordering::SeqCst)
+}
+
+/// A new live session: no abort, no answer pending.
+pub fn reset() {
+    for f in [&ABORT, &CONFIRMED, &DENIED] {
+        f.store(false, Ordering::SeqCst);
+    }
+    WAITING.store(0, Ordering::SeqCst);
+}
+
 pub fn confirm() {
     CONFIRMED.store(true, Ordering::SeqCst);
+}
+
+/// A spoken "no" to a confirm: skip this action (the rest of its order goes too).
+pub fn deny() {
+    DENIED.store(true, Ordering::SeqCst);
 }
 
 /// The spoken answer to "Which one?".
@@ -110,8 +136,23 @@ pub fn answer(text: String) {
 pub enum Answer {
     Yes,
     Text(String),
-    /// Esc, F2 abort, or the timeout.
+    /// Esc, a spoken no, or the timeout.
     No,
+}
+
+/// The local yes / no words (VOICE_CONTROL_V2 2.2): 0 ms, $0. None = not a plain answer (ask the planner).
+pub fn yes_no(text: &str) -> Option<bool> {
+    const YES: [&str; 12] = ["sí", "si", "yes", "yeah", "yep", "confirm", "dale", "ok", "okay", "hazlo", "do it", "go"];
+    const NO: [&str; 7] = ["no", "cancel", "stop", "para", "nope", "don't", "cancela"];
+    let t = text.trim().trim_end_matches(['.', '!', ',', '?']).trim().to_lowercase();
+    let t = t.trim_start_matches(['¡', '¿']);
+    if YES.contains(&t) {
+        Some(true)
+    } else if NO.contains(&t) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 // ---------- pure decisions ----------
@@ -181,27 +222,6 @@ pub fn parse_pick(text: &str, choices: &[(u32, f32)], ids: &[u32]) -> Option<u32
 
 /// The text of "type hello in the search field", "write 'meet in the lobby'", "busca gatos".
 /// ponytail: verb + cut at "in the / into / en el"; an LLM would read odd phrasings (quotes always work).
-pub fn type_text(instr: &str) -> Option<String> {
-    let t = instr.trim();
-    // No ASCII ' pair: "type I'm at Bob's" would type "m at Bob".
-    for (o, c) in [('"', '"'), ('“', '”'), ('‘', '’'), ('«', '»')] {
-        if let (Some(a), Some(b)) = (t.find(o), t.rfind(c)) {
-            let a = a + o.len_utf8();
-            if a < b {
-                return Some(t[a..b].to_string()).filter(|s| !s.trim().is_empty());
-            }
-        }
-    }
-    // ASCII lowercase keeps the byte offsets of `t` (to_lowercase can change them: "İ", "ẞ" -> slice panic).
-    let l = t.to_ascii_lowercase();
-    const VERBS: [&str; 9] = ["type ", "write ", "enter ", "search for ", "escribe ", "escribir ", "busca ", "buscar ", "pon "];
-    let (i, v) = VERBS.iter().filter_map(|v| l.find(v).map(|i| (i, v))).min_by_key(|p| p.0)?;
-    let rest = &t[i + v.len()..];
-    let lr = rest.to_ascii_lowercase();
-    let cut = [" in the ", " into the ", " into ", " in my ", " on the ", " en el ", " en la ", " en mi "].iter().filter_map(|c| lr.rfind(c)).max();
-    let s = cut.map_or(rest, |c| &rest[..c]).trim().trim_end_matches(['.', ',']);
-    (!s.is_empty()).then(|| s.to_string())
-}
 
 /// Tiles of `d` (global points) that are each at most 1568 px a side at native resolution, row by row.
 pub fn tiles(d: PtRect, scale: f64) -> Vec<PtRect> {
@@ -249,76 +269,28 @@ pub fn center(r: PtRect) -> (f64, f64) {
     ((r.x + r.w / 2.0).round(), (r.y + r.h / 2.0).round())
 }
 
-// ---------- Jev requests (the production builders; the real-API test uses them too) ----------
 
-const ACTIONS: [(&str, &str); 6] = [
-    ("click", "click, open, select or toggle one element on screen"),
-    ("focus_and_type", "type text into a field on screen"),
-    ("scroll_down", "scroll down"),
-    ("scroll_up", "scroll up"),
-    ("press_key", "press one keyboard key such as Return, Escape or Tab"),
-    ("done", "nothing is left to do: the steps done already finish the instruction"),
-];
-
-/// (name, macOS virtual keycode, with Cmd).
-pub const KEYS: [(&str, u16, bool); 13] = [
-    ("return", 36, false), ("escape", 53, false), ("tab", 48, false), ("space", 49, false), ("delete", 51, false),
-    ("up", 126, false), ("down", 125, false), ("left", 123, false), ("right", 124, false), ("page_down", 121, false),
-    ("page_up", 116, false), ("cmd_f", 3, true), ("cmd_l", 37, true),
-];
-
-fn criteria<'a>(it: impl IntoIterator<Item = (&'a str, &'a str)>) -> Value {
-    Value::Object(it.into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect())
-}
+// ---------- Jev grounding requests (the production builders; the real-API test uses them too) ----------
 
 fn risky_q(instr: &str) -> Value {
     json!({ "type": "noul", "instructions": format!("The user said: \"{instr}\". Would the next step itself send a message, email or post to another person, delete data, or spend money?") })
 }
 
-/// Fast path, text only: intent + app + "more than one thing?".
-pub fn fast_request(instr: &str, apps: &[String]) -> (Value, Value) {
-    let intents = criteria([
-        ("open_app", "open, launch or switch to an application by its name"),
-        ("paste_last", "paste the last dictation"),
-        ("new_tab", "open a new tab"),
-        ("none", "anything else: it needs to look at the screen (click or type something, or open a channel, chat, file, tab or page inside an app)"),
-    ]);
-    let mut q = json!({
-        "intent": { "type": "choice", "instructions": format!("Which command is \"{instr}\"?"), "criteria": intents },
-        "multi": { "type": "noul", "instructions": format!("Does \"{instr}\" ask for more than one thing?") },
-    });
-    if !apps.is_empty() {
-        let mut c: Map<String, Value> = apps.iter().map(|a| (a.clone(), json!(a))).collect();
-        c.insert("none".into(), json!("no application is named"));
-        q["app"] = json!({ "type": "choice", "instructions": format!("Which application does \"{instr}\" name?"), "criteria": c });
-    }
-    (json!([format!("The user said this voice command on a Mac: \"{instr}\"")]), q)
-}
-
-/// One marks step: the target over the mark ids, the action, the key, risky, and (after step 1) done.
-/// `image` = the marked screenshot (the marks window is up when it is taken).
-pub fn marks_request(instr: &str, app: &str, done: &[String], els: &[El], image: Option<&Value>) -> (Value, Value) {
+/// One grounding call: the target over the mark ids + risky. `image` = the marked screenshot (the marks window is up).
+pub fn marks_request(instr: &str, app: &str, els: &[El], image: Option<&Value>) -> (Value, Value) {
     let mut state = vec![json!(match image {
         None => format!("Frontmost app: {app}. The options are the clickable elements on screen, from the accessibility tree."),
         Some(_) => format!(
             "Screenshot of the frontmost app ({app}). Every clickable element has an outline and a numbered mark at its top-left corner. The mark numbers are the option ids."
         ),
     })];
-    if !done.is_empty() {
-        state.push(json!(format!("Steps done so far: {}", done.join("; "))));
-    }
     state.extend(image.cloned());
     let mut targets: Map<String, Value> = els.iter().map(|e| (e.mark.id.to_string(), json!(ax::describe(e)))).collect();
     targets.insert("none".into(), json!("no element on screen fits"));
-    let mut q = json!({
+    let q = json!({
         "target": { "type": "choice", "instructions": format!("Which element must the user click or type into to do this: \"{instr}\""), "criteria": targets },
-        "action": { "type": "choice", "instructions": format!("Which single next step does \"{instr}\" need now?"), "criteria": criteria(ACTIONS) },
-        "key": { "type": "choice", "instructions": format!("If the next step for \"{instr}\" is a key press, which key?"), "criteria": criteria(KEYS.iter().map(|k| (k.0, k.0))) },
         "risky": risky_q(instr),
     });
-    if !done.is_empty() {
-        q["done"] = json!({ "type": "noul", "instructions": format!("Do the steps done so far already finish \"{instr}\"?") });
-    }
     (Value::Array(state), q)
 }
 
@@ -327,11 +299,7 @@ pub fn box_request(instr: &str, app: &str, imgs: &[Value]) -> (Value, Value) {
     let mut state = Map::new();
     state.insert("app".into(), json!(app));
     let mut tile_c = Map::new();
-    let mut q = json!({
-        "action": { "type": "choice", "instructions": format!("Which single next step does \"{instr}\" need now?"), "criteria": criteria(ACTIONS) },
-        "key": { "type": "choice", "instructions": format!("If the next step for \"{instr}\" is a key press, which key?"), "criteria": criteria(KEYS.iter().map(|k| (k.0, k.0))) },
-        "risky": risky_q(instr),
-    });
+    let mut q = json!({ "risky": risky_q(instr) });
     for (i, img) in imgs.iter().enumerate() {
         let t = format!("tile_{i}");
         state.insert(t.clone(), img.clone());
@@ -343,14 +311,11 @@ pub fn box_request(instr: &str, app: &str, imgs: &[Value]) -> (Value, Value) {
     (Value::Object(state), q)
 }
 
-/// The answers of one marks step.
+/// The answers of one grounding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub target: Choice,
-    pub action: Choice,
-    pub key: Option<String>,
     pub risky: f32,
-    pub done: f32,
     pub cost: f64,
     pub latency_ms: u32,
     pub used_image: bool,
@@ -358,38 +323,30 @@ pub struct Decision {
     pub need_screen: bool,
 }
 
-fn parse(r: &Reply) -> anyhow::Result<Decision> {
+fn parse(r: &Reply) -> Decision {
     let a = &r.answers;
-    let none = || Choice { choice: "none".into(), confidence: 0.0, ranked: vec![] };
-    Ok(Decision {
-        target: jev::choice(a, "target").unwrap_or_else(none),
-        action: jev::choice(a, "action").ok_or_else(|| anyhow::anyhow!("Jev: no action in the answer"))?,
-        key: jev::choice(a, "key").map(|c| c.choice),
+    Decision {
+        target: jev::choice(a, "target").unwrap_or(Choice { choice: "none".into(), confidence: 0.0, ranked: vec![] }),
         risky: jev::noul(a, "risky").unwrap_or(1.0), // missing = treat as risky
-        done: jev::noul(a, "done").unwrap_or(0.0),
         cost: r.cost,
         latency_ms: r.latency_ms,
         used_image: false,
         need_screen: false,
-    })
+    }
 }
 
 pub type Ask<'a> = dyn FnMut(&Value, &Value) -> anyhow::Result<Reply> + 'a;
 
-fn needs_target(action: &str) -> bool {
-    matches!(action, "click" | "focus_and_type")
-}
-
 /// Text first; the marked screenshot for spatial words or a weak target; the more confident answer wins.
 /// `shot` = the marked screenshot as a Jev image part, None = not available.
-pub fn decide(instr: &str, app: &str, done: &[String], els: &[El], ask: &mut Ask, shot: &mut dyn FnMut() -> Option<Value>) -> anyhow::Result<Decision> {
-    let (s, q) = marks_request(instr, app, done, els, None);
-    let mut d = parse(&ask(&s, &q)?)?;
-    if needs_target(&d.action.choice) && (spatial(instr) || d.target.confidence < CONF_MIN) {
+pub fn decide(instr: &str, app: &str, els: &[El], ask: &mut Ask, shot: &mut dyn FnMut() -> Option<Value>) -> anyhow::Result<Decision> {
+    let (s, q) = marks_request(instr, app, els, None);
+    let mut d = parse(&ask(&s, &q)?);
+    if spatial(instr) || d.target.confidence < CONF_MIN {
         match shot() {
             Some(img) => {
-                let (s, q) = marks_request(instr, app, done, els, Some(&img));
-                let mut d2 = parse(&ask(&s, &q)?)?;
+                let (s, q) = marks_request(instr, app, els, Some(&img));
+                let mut d2 = parse(&ask(&s, &q)?);
                 d2.cost += d.cost;
                 d2.latency_ms += d.latency_ms;
                 d2.risky = d2.risky.max(d.risky);
@@ -406,7 +363,32 @@ pub fn decide(instr: &str, app: &str, done: &[String], els: &[El], ask: &mut Ask
     Ok(d)
 }
 
-// ---------- the runner ----------
+/// The planner's target words name one mark exactly (it copies "Share (button, toolbar)" from the marks it saw):
+/// no Jev call. Tried in order: the full label, "name (role)", the name. Two matches = ambiguous = None.
+pub fn local_match<'a>(words: &str, els: &'a [El]) -> Option<&'a El> {
+    let norm = |s: &str| s.trim().trim_matches(['"', '“', '”', '\'']).trim().to_lowercase();
+    let w = norm(words);
+    if w.is_empty() {
+        return None;
+    }
+    let forms: [&dyn Fn(&El) -> String; 3] = [&|e| ax::describe(e), &|e| format!("{} ({})", e.mark.name, e.mark.role), &|e| e.mark.name.clone()];
+    forms.iter().find_map(|f| {
+        let mut m = els.iter().filter(|e| norm(&f(e)) == w);
+        match (m.next(), m.next()) {
+            (Some(e), None) => Some(e),
+            _ => None,
+        }
+    })
+}
+
+/// A name that sends, deletes or pays: a local exact match skips Jev's risky noul, so this stands in for it.
+pub fn risky_name(name: &str) -> bool {
+    const W: [&str; 14] = ["send", "post", "delete", "remove", "buy", "pay", "purchase", "publish", "submit", "enviar", "eliminar", "borrar", "comprar", "pagar"];
+    let l = name.to_lowercase();
+    l.split(|c: char| !c.is_alphanumeric()).any(|w| W.contains(&w))
+}
+
+// ---------- the executor ----------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
@@ -415,21 +397,26 @@ pub enum Target {
     Point(f64, f64),
 }
 
+/// Every event the executor sends. Typing goes through `Desk::type_text` (it returns what went in).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Act {
     Click(Target),
-    /// The plan; the runner does it as Focus, the secure input check, then Paste.
-    Type(Target, String),
     Focus(Target),
-    Paste(String),
+    /// keycode + CGEventFlags bits (paste::parse_combo).
+    Combo(u16, u64),
+    /// The same combo n times, 4 ms apart (no settle, no Jev call between them).
+    Burst(u16, u64, u32),
     Scroll { down: bool, at: Option<Target> },
-    Key(String),
     OpenApp(String),
-    PasteLast,
-    NewTab,
 }
 
-/// What the runner sees: the frontmost app, its window's display, the marks.
+const DELETE: u16 = 51;
+const KEY_C: u16 = 8;
+const KEY_V: u16 = 9;
+const KEY_Z: u16 = 6;
+const LEFT: u16 = 123;
+
+/// What the executor sees: the frontmost app, its window's display, the marks.
 #[derive(Debug, Clone, Default)]
 pub struct Screen {
     pub app: String,
@@ -438,12 +425,20 @@ pub struct Screen {
     pub els: Vec<El>,
 }
 
-/// The runner's side effects. Real: `mac::Real` (AX, CGEvent, screencapture). Tests: a fake.
+/// The executor's side effects. Real: `mac::Real` (AX, CGEvent, screencapture). Tests: a fake desk.
 pub trait Desk {
-    /// Installed app names (the fast path's app choice).
-    fn apps(&mut self) -> Vec<String>;
     /// Err("accessibility") = no AX access; any other Err = nothing to act on.
     fn read(&mut self) -> Result<Screen, String>;
+    /// The focused element right now (re-read before every action).
+    fn focused(&mut self) -> Field;
+    /// AXSelectedTextRange on the focused element (UTF-16 units). false = refused.
+    fn set_selection(&mut self, start: usize, len: usize) -> bool;
+    /// Clipboard text and the pasteboard change count.
+    fn clipboard(&mut self) -> (Option<String>, isize);
+    /// Leave `s` on the clipboard (no restore).
+    fn set_clipboard(&mut self, s: &str);
+    /// Paste `s` into the focused field (the clipboard is restored after); returns what went in (smart spacing).
+    fn type_text(&mut self, s: &str) -> anyhow::Result<String>;
     fn screen_ok(&mut self) -> bool;
     /// JPEG of `r` (global points). `native` = full resolution (tiles), else at most 1568 px a side.
     fn capture(&mut self, r: PtRect, native: bool) -> anyhow::Result<Vec<u8>>;
@@ -460,13 +455,12 @@ pub trait Desk {
 
 pub struct Cfg {
     pub confirm_risky: bool,
-    pub max_steps: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct End {
     pub status: CmdStatus,
-    /// What susurro did, for the History row ("clicked “Send”; typed “hi”").
+    /// What susurro did, for the History row ("typed “ls”").
     pub summary: String,
     pub message: Option<String>,
     pub steps: u32,
@@ -474,159 +468,67 @@ pub struct End {
 
 const NOT_SURE: &str = "Not sure where. Say it again.";
 const BLOCKED: &str = "Password field. susurro won't touch it.";
-/// Between the focus and the paste of a type step.
-const FOCUS_MS: u64 = 150;
+pub const GONE: &str = "The text I typed is not there any more.";
 
-struct Run<'a> {
-    instr: &'a str,
-    cfg: &'a Cfg,
-    done: Vec<String>,
+/// Terminals have no text selection: delete by backspace burst (VOICE_CONTROL_V2 2.3).
+/// ponytail: a fixed list; add AX role checks if an unknown terminal shows up.
+const TERMINALS: [&str; 14] = [
+    "Ghostty", "Terminal", "iTerm2", "Warp", "WezTerm", "kitty", "Alacritty", "com.mitchellh.ghostty", "com.apple.Terminal",
+    "com.googlecode.iterm2", "dev.warp.Warp-Stable", "com.github.wez.wezterm", "net.kovidgoyal.kitty", "org.alacritty",
+];
+
+pub fn terminal(f: &Field) -> bool {
+    TERMINALS.iter().any(|t| t.eq_ignore_ascii_case(&f.app) || t.eq_ignore_ascii_case(&f.bundle))
 }
 
-impl Run<'_> {
-    fn step(&self, n: u32, status: CmdStatus) -> CommandStep {
-        CommandStep { instruction: self.instr.into(), step: n, max: self.cfg.max_steps, status, ..Default::default() }
+/// How many Opt+Left presses cover `text` from its end: one per run of letters/digits (punctuation and spaces are
+/// skipped by the word jump). At least 1.
+pub fn words(text: &str) -> u32 {
+    let mut n = 0;
+    let mut in_word = false;
+    for c in text.chars() {
+        let w = c.is_alphanumeric() || c == '_';
+        if w && !in_word {
+            n += 1;
+        }
+        in_word = w;
     }
-
-    fn end(&self, desk: &mut dyn Desk, mut s: CommandStep, message: Option<&str>) -> End {
-        s.message = message.map(String::from);
-        desk.emit(&s);
-        End { status: s.status, summary: self.done.join("; "), message: s.message, steps: s.step }
-    }
+    n.max(1)
 }
 
-/// One planned action, after the decision and before the gates.
-struct Plan {
-    act: Act,
-    action: String,
-    detail: Option<String>,
-    mark: Option<Mark>,
-    /// Box fallback: the box as a mark, so the marks window can draw it.
-    marks: Vec<Mark>,
-    risky: f32,
-    /// "clicked “Send”" for the next request and the History row.
-    summary: String,
-}
-
-pub fn run(instr: &str, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk) -> End {
-    let mut r = Run { instr, cfg, done: vec![] };
-    if desk.aborted() {
-        return r.end(desk, r.step(0, CmdStatus::Stopped), None);
-    }
-    // 1. fast path
-    let apps = desk.apps();
-    let (s, q) = fast_request(instr, &apps);
-    let fast = match ask(&s, &q) {
-        Ok(rep) => rep,
-        Err(e) => return r.end(desk, r.step(0, CmdStatus::Error), Some(&format!("{e:#}"))),
-    };
-    if let Some((act, action, detail)) = fast_intent(&fast.answers, &apps) {
-        let mut st = CommandStep { action: Some(action.into()), detail: detail.clone(), latency_ms: fast.latency_ms, cost_usd: fast.cost, ..r.step(0, CmdStatus::Done) };
-        if desk.aborted() {
-            st.status = CmdStatus::Stopped;
-            return r.end(desk, st, None);
-        }
-        if let Err(e) = desk.act(&act) {
-            st.status = CmdStatus::Error;
-            return r.end(desk, st, Some(&format!("{e:#}")));
-        }
-        r.done.push(match detail {
-            Some(d) => format!("opened {d}"),
-            None => action.replace('_', " "),
-        });
-        return r.end(desk, st, None);
-    }
-    // 2. the marks loop
-    let mut last: Option<(String, String)> = None;
-    for n in 1..=cfg.max_steps {
-        if desk.aborted() {
-            return r.end(desk, r.step(n, CmdStatus::Stopped), None);
-        }
-        let mut st = r.step(n, CmdStatus::Thinking);
-        desk.emit(&st);
-        let scr = match desk.read() {
-            Ok(s) => s,
-            Err(e) if e == "accessibility" => return r.end(desk, r.step(n, CmdStatus::Setup), Some("accessibility")),
-            Err(e) => return r.end(desk, r.step(n, CmdStatus::Unsure), Some(&e)),
-        };
-        st.display = scr.display;
-        let plan = if scr.els.len() < MIN_AX { box_step(&r, &scr, ask, desk, &mut st) } else { marks_step(&r, &scr, ask, desk, &mut st) };
-        let plan = match plan {
-            Ok(Some(p)) => p,
-            Ok(None) => return r.end(desk, CommandStep { status: CmdStatus::Done, action: Some("done".into()), ..st }, None),
-            Err(end) => return end,
-        };
-        if desk.aborted() {
-            return r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st }, None);
-        }
-        // Clicking or typing into the same element twice in a row means the first one did it (never send twice).
-        // An unnamed element (an icon, a box point) is told apart by its rect, else two different icons = "done".
-        let key = (plan.action.clone(), plan.mark.as_ref().map(|m| if m.name.is_empty() { format!("{:?}", m.rect) } else { m.name.clone() }).unwrap_or_default());
-        if needs_target(&plan.action) && last.as_ref() == Some(&key) {
-            return r.end(desk, CommandStep { status: CmdStatus::Done, action: Some("done".into()), ..st }, None);
-        }
-        st.action = Some(plan.action.clone());
-        st.detail = plan.detail.clone();
-        st.target = plan.mark.as_ref().map(|m| m.id);
-        if !plan.marks.is_empty() {
-            st.marks = plan.marks.clone();
-        }
-        // confirm gate (risky)
-        if gate(1.0, plan.risky, cfg.confirm_risky) == Gate::Confirm {
-            st.status = CmdStatus::Confirm;
-            desk.emit(&st);
-            if desk.wait(Wait::Confirm, CONFIRM_TIMEOUT) != Answer::Yes {
-                return r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st }, None);
-            }
-        }
-        // aim, then the last abort check before the event
-        st.status = CmdStatus::Aim;
-        desk.emit(&st);
-        desk.sleep(AIM_MS);
-        if desk.aborted() {
-            return r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st }, None);
-        }
-        let at_point = match &plan.act {
-            Act::Click(Target::Point(x, y)) | Act::Type(Target::Point(x, y), _) => Some((*x, *y)),
-            _ => None,
-        };
-        if (matches!(plan.act, Act::Type(..) | Act::Key(_)) && desk.secure_input()) || at_point.is_some_and(|p| desk.secure_at(p)) {
-            return r.end(desk, CommandStep { status: CmdStatus::Blocked, ..st }, Some(BLOCKED));
-        }
-        let done = match &plan.act {
-            // Focus first, then check again: the click itself can land in a password field.
-            Act::Type(t, text) => desk.act(&Act::Focus(t.clone())).map(|_| desk.sleep(FOCUS_MS)).and_then(|_| {
-                if desk.secure_input() { Ok(false) } else { desk.act(&Act::Paste(text.clone())).map(|_| true) }
-            }),
-            a => desk.act(a).map(|_| true),
-        };
-        match done {
-            Ok(true) => {}
-            Ok(false) => return r.end(desk, CommandStep { status: CmdStatus::Blocked, ..st }, Some(BLOCKED)),
-            Err(e) => return r.end(desk, CommandStep { status: CmdStatus::Error, ..st }, Some(&format!("{e:#}"))),
-        }
-        r.done.push(format!("{n}. {}", plan.summary));
-        last = Some(key);
-        desk.sleep(SETTLE_MS);
-    }
-    let n = cfg.max_steps;
-    r.end(desk, r.step(n, CmdStatus::Stopped), Some(&format!("Stopped after {n} steps")))
-}
-
-/// The fast path's answer -> an action, or None (go to the marks loop).
-fn fast_intent(a: &Value, apps: &[String]) -> Option<(Act, &'static str, Option<String>)> {
-    let intent = jev::choice(a, "intent")?;
-    if intent.confidence < INTENT_MIN || jev::noul(a, "multi").unwrap_or(1.0) >= 0.5 {
+/// UTF-16 (start, len) of `needle` in `value`: the last match that ends at or before the caret, else the last one.
+pub fn find_range(value: &str, needle: &str, caret: Option<usize>) -> Option<(usize, usize)> {
+    if needle.is_empty() {
         return None;
     }
-    match intent.choice.as_str() {
-        "open_app" => {
-            let app = jev::choice(a, "app").filter(|c| c.confidence >= INTENT_MIN && apps.contains(&c.choice))?;
-            Some((Act::OpenApp(app.choice.clone()), "open_app", Some(app.choice)))
-        }
-        "paste_last" => Some((Act::PasteLast, "paste_last", None)),
-        "new_tab" => Some((Act::NewTab, "new_tab", None)),
-        _ => None,
+    let len = needle.encode_utf16().count();
+    let starts: Vec<usize> = value.match_indices(needle).map(|(i, _)| value[..i].encode_utf16().count()).collect();
+    let before = caret.and_then(|c| starts.iter().rev().find(|s| *s + len <= c));
+    before.or(starts.last()).map(|s| (*s, len))
+}
+
+/// One memory entry plus what the delete / select strategies need.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub e: MemoryEntry,
+    pub pid: i32,
+    pub role: String,
+    /// The field value right after susurro's paste (the undo strategy checks nothing changed since).
+    pub value_after: Option<String>,
+}
+
+pub type Memory = VecDeque<Entry>;
+
+pub fn remember(mem: &mut Memory, kind: MemKind, text: &str, f: &Field, value_after: Option<String>) {
+    let field = if f.name.is_empty() { f.role.trim_start_matches("AX").to_string() } else { f.name.clone() };
+    mem.push_back(Entry {
+        e: MemoryEntry { at: crate::history::now_ms(), kind, text: text.into(), app: f.app.clone(), field },
+        pid: f.pid,
+        role: f.role.clone(),
+        value_after,
+    });
+    while mem.len() > MEMORY_MAX {
+        mem.pop_front();
     }
 }
 
@@ -634,134 +536,133 @@ fn quote(s: &str) -> String {
     format!("“{}”", if s.is_empty() { "(no name)" } else { s })
 }
 
-/// The non-target actions of a decision (scroll, key, done) or None.
-fn simple(r: &Run, action: &Choice, key: Option<&str>, risky: f32) -> Result<Option<Option<Plan>>, &'static str> {
-    let plan = |act, summary: String, detail: Option<String>| Some(Some(Plan { act, action: action.choice.clone(), detail, mark: None, marks: vec![], risky, summary }));
-    if needs_target(&action.choice) {
-        return Ok(None);
-    }
-    if action.confidence < ACTION_MIN {
-        return Err(NOT_SURE);
-    }
-    Ok(match action.choice.as_str() {
-        "done" if !r.done.is_empty() => Some(None),
-        "done" => return Err("Nothing to do on this screen. Say it again."),
-        "scroll_down" | "scroll_up" => {
-            let down = action.choice == "scroll_down";
-            plan(Act::Scroll { down, at: None }, format!("scrolled {}", if down { "down" } else { "up" }), None)
-        }
-        _ => {
-            let k = key.filter(|k| KEYS.iter().any(|x| x.0 == *k)).ok_or(NOT_SURE)?.to_string();
-            // Return sends in every chat app, whatever the risky noul says (VOICE_CONTROL.md, Confirm).
-            let risky = if k == "return" { 1.0 } else { risky };
-            Some(Some(Plan { act: Act::Key(k.clone()), action: action.choice.clone(), detail: Some(k.clone()), mark: None, marks: vec![], risky, summary: format!("pressed {k}") }))
-        }
-    })
+/// One action in flight: its step row and the end helpers.
+struct Run {
+    st: CommandStep,
 }
 
-/// A marks step: emit the marks, decide, gate the target (unsure / pick), build the plan. Ok(None) = done.
-fn marks_step(r: &Run, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk, st: &mut CommandStep) -> Result<Option<Plan>, End> {
-    st.marks = scr.els.iter().map(|e| e.mark.clone()).collect();
-    st.status = CmdStatus::Marks;
-    desk.emit(st);
+impl Run {
+    fn end(&mut self, desk: &mut dyn Desk, status: CmdStatus, message: Option<&str>, summary: String) -> End {
+        self.st.status = status.clone();
+        self.st.message = message.map(String::from);
+        desk.emit(&self.st);
+        End { status, summary, message: self.st.message.clone(), steps: self.st.step }
+    }
+
+    fn done(&mut self, desk: &mut dyn Desk, summary: String) -> End {
+        self.end(desk, CmdStatus::Done, None, summary)
+    }
+
+    fn fail(&mut self, desk: &mut dyn Desk, status: CmdStatus, message: &str) -> End {
+        self.end(desk, status, Some(message), String::new())
+    }
+
+    /// Wait for a yes. false = no / timeout / Esc (the run ends Stopped).
+    fn confirm(&mut self, desk: &mut dyn Desk, question: &str) -> bool {
+        self.st.status = CmdStatus::Confirm;
+        self.st.message = Some(question.into());
+        desk.emit(&self.st);
+        let ok = desk.wait(Wait::Confirm, CONFIRM_TIMEOUT) == Answer::Yes;
+        self.st.message = None;
+        ok
+    }
+}
+
+/// A grounded target.
+struct Hit {
+    target: Target,
+    mark: Mark,
+    url: Option<String>,
+    value: Option<String>,
+    risky: f32,
+}
+
+/// Read the screen and find `words` on it. Err = the run ended (unsure, setup, pick refused...).
+fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
+    let scr = match desk.read() {
+        Ok(s) => s,
+        Err(e) if e == "accessibility" => return Err(r.fail(desk, CmdStatus::Setup, "accessibility")),
+        Err(e) => return Err(r.fail(desk, CmdStatus::Unsure, &e)),
+    };
+    r.st.display = scr.display;
+    r.st.marks = scr.els.iter().map(|e| e.mark.clone()).collect();
+    r.st.status = CmdStatus::Marks;
+    desk.emit(&r.st);
+    if let Some(e) = local_match(words, &scr.els) {
+        let risky = if risky_name(&e.mark.name) { 1.0 } else { 0.0 };
+        return Ok(Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky });
+    }
+    let instr = format!("{verb} {words}");
+    if scr.els.len() < MIN_AX {
+        return box_ground(r, &instr, &scr, ask, desk);
+    }
     let display = scr.display;
     let d = {
         let mut shot = || {
-            // Esc during the text call: no screenshot, no 2nd call (the abort check after decide stops the run).
             if desk.aborted() || !desk.screen_ok() {
                 return None;
             }
             desk.sleep(MARKS_DRAW_MS);
             desk.capture(display, false).map_err(|e| log::warn!("screenshot: {e:#}")).ok().map(|b| jev::image(&b, "image/jpeg"))
         };
-        decide(r.instr, &scr.app, &r.done, &scr.els, ask, &mut shot)
+        decide(&instr, &scr.app, &scr.els, ask, &mut shot)
     };
-    let d = match d {
-        Ok(d) => d,
-        Err(e) => return Err(r.end(desk, CommandStep { status: CmdStatus::Error, ..st.clone() }, Some(&format!("{e:#}")))),
-    };
-    (st.latency_ms, st.cost_usd) = (d.latency_ms, d.cost);
+    let d = d.map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + d.latency_ms, r.st.cost_usd + d.cost);
     if desk.aborted() {
-        return Err(r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st.clone() }, None));
-    }
-    if !r.done.is_empty() && d.done >= DONE_MIN {
-        return Ok(None);
-    }
-    match simple(r, &d.action, d.key.as_deref(), d.risky) {
-        Ok(Some(p)) => return Ok(p),
-        Ok(None) => {}
-        Err(msg) => return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some(msg))),
-    }
-    if d.need_screen {
-        return Err(r.end(desk, CommandStep { status: CmdStatus::Setup, ..st.clone() }, Some("screen_recording")));
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
     }
     let conf = if d.target.choice == "none" { 0.0 } else { d.target.confidence };
+    if d.need_screen && conf < CONF_MIN {
+        return Err(r.fail(desk, CmdStatus::Setup, "screen_recording"));
+    }
     let mut id = d.target.choice.parse::<u32>().ok();
     match gate(conf, 0.0, false) {
-        Gate::Unsure => return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some(NOT_SURE))),
+        Gate::Unsure => return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
         Gate::Pick => {
-            st.choices = d.target.ranked.iter().filter_map(|(k, p)| k.parse::<u32>().ok().map(|k| (k, *p))).take(3).collect();
-            st.action = Some(d.action.choice.clone());
-            st.status = CmdStatus::Pick;
-            desk.emit(st);
+            r.st.choices = d.target.ranked.iter().filter_map(|(k, p)| k.parse::<u32>().ok().map(|k| (k, *p))).take(3).collect();
+            r.st.status = CmdStatus::Pick;
+            let names: Vec<String> = r.st.choices.iter().filter_map(|(id, _)| scr.els.iter().find(|e| e.mark.id == *id).map(|e| format!("{id} {}", e.mark.name))).collect();
+            r.st.message = Some(format!("Which one? {}", names.join(" · ")));
+            desk.emit(&r.st);
             let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
             id = match desk.wait(Wait::Pick, PICK_TIMEOUT) {
-                Answer::Text(t) => match parse_pick(&t, &st.choices, &ids) {
+                Answer::Text(t) => match parse_pick(&t, &r.st.choices, &ids) {
                     Some(id) => Some(id),
-                    None => return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some("Didn't catch a number. Say it again."))),
+                    None => return Err(r.fail(desk, CmdStatus::Unsure, "Didn't catch a number. Say it again.")),
                 },
-                _ => return Err(r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st.clone() }, None)),
+                _ => return Err(r.end(desk, CmdStatus::Stopped, None, String::new())),
             };
-            st.choices.clear();
+            r.st.choices.clear();
+            r.st.message = None;
         }
         _ => {}
     }
-    let el = id.and_then(|id| scr.els.iter().find(|e| e.mark.id == id));
-    let Some(el) = el else { return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some(NOT_SURE))) };
-    let m = el.mark.clone();
-    let (act, summary, detail) = if d.action.choice == "focus_and_type" {
-        let Some(text) = type_text(r.instr) else {
-            return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some("Say the text in quotes: type \"hello\" in the search field")));
-        };
-        (Act::Type(Target::Mark(m.id), text.clone()), format!("typed {} into {}", quote(&text), quote(&m.name)), Some(text))
-    } else {
-        (Act::Click(Target::Mark(m.id)), format!("clicked {} ({})", quote(&m.name), m.role), None)
-    };
-    Ok(Some(Plan { act, action: d.action.choice, detail, mark: Some(m), marks: vec![], risky: d.risky, summary }))
+    let Some(e) = id.and_then(|id| scr.els.iter().find(|e| e.mark.id == id)) else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
+    Ok(Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky: d.risky })
 }
 
 /// The box fallback (an app with < 5 AX elements): full-resolution tiles, Jev box per tile, the visible noul.
-fn box_step(r: &Run, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk, st: &mut CommandStep) -> Result<Option<Plan>, End> {
+fn box_ground(r: &mut Run, instr: &str, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
     if !desk.screen_ok() {
-        return Err(r.end(desk, CommandStep { status: CmdStatus::Setup, ..st.clone() }, Some("screen_recording")));
+        return Err(r.fail(desk, CmdStatus::Setup, "screen_recording"));
     }
     let ts = tiles(scr.display, scr.scale.max(1.0));
     let mut imgs = vec![];
     for t in &ts {
         match desk.capture(*t, true) {
             Ok(b) => imgs.push(jev::image(&b, "image/jpeg")),
-            Err(e) => return Err(r.end(desk, CommandStep { status: CmdStatus::Error, ..st.clone() }, Some(&format!("screenshot: {e:#}")))),
+            Err(e) => return Err(r.fail(desk, CmdStatus::Error, &format!("screenshot: {e:#}"))),
         }
     }
-    let (s, q) = box_request(r.instr, &scr.app, &imgs);
-    let rep = match ask(&s, &q) {
-        Ok(rep) => rep,
-        Err(e) => return Err(r.end(desk, CommandStep { status: CmdStatus::Error, ..st.clone() }, Some(&format!("{e:#}")))),
-    };
-    (st.latency_ms, st.cost_usd) = (rep.latency_ms, rep.cost);
+    let (s, q) = box_request(instr, &scr.app, &imgs);
+    let rep = ask(&s, &q).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + rep.latency_ms, r.st.cost_usd + rep.cost);
     if desk.aborted() {
-        return Err(r.end(desk, CommandStep { status: CmdStatus::Stopped, ..st.clone() }, None));
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
     }
     let a = &rep.answers;
     let risky = jev::noul(a, "risky").unwrap_or(1.0);
-    let Some(action) = jev::choice(a, "action") else {
-        return Err(r.end(desk, CommandStep { status: CmdStatus::Error, ..st.clone() }, Some("Jev: no action in the answer")));
-    };
-    match simple(r, &action, jev::choice(a, "key").map(|c| c.choice).as_deref(), risky) {
-        Ok(Some(p)) => return Ok(p),
-        Ok(None) => {}
-        Err(msg) => return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some(msg))),
-    }
     // The tile, its box, and the visible gate: never click on a weak or broken box.
     let found = (|| {
         let i: usize = jev::choice(a, "tile")?.choice.strip_prefix("tile_")?.parse().ok()?;
@@ -769,71 +670,372 @@ fn box_step(r: &Run, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk, st: &mut 
         (jev::noul(a, &format!("visible_{i}")).unwrap_or(0.0) >= VISIBLE_MIN).then_some(())?;
         Some((b, *ts.get(i)?))
     })();
-    let Some((b, tile)) = found else { return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some(NOT_SURE))) };
+    let Some((b, tile)) = found else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
     let p = box_point(b, tile);
     let rect = PtRect { x: tile.x + b.left * tile.w, y: tile.y + b.top * tile.h, w: (b.right - b.left) * tile.w, h: (b.bottom - b.top) * tile.h };
-    let (target, mark) = match snap(p, &scr.els) {
-        Some(e) => (Target::Mark(e.mark.id), e.mark.clone()),
-        None => (Target::Point(p.0.round(), p.1.round()), Mark { id: 1, rect, name: String::new(), role: "box".into(), region: "screen".into() }),
-    };
-    let (act, summary, detail) = if action.choice == "focus_and_type" {
-        let Some(text) = type_text(r.instr) else {
-            return Err(r.end(desk, CommandStep { status: CmdStatus::Unsure, ..st.clone() }, Some("Say the text in quotes: type \"hello\" in the search field")));
-        };
-        (Act::Type(target, text.clone()), format!("typed {} at ({:.0}, {:.0})", quote(&text), p.0, p.1), Some(text))
-    } else {
-        (Act::Click(target), format!("clicked at ({:.0}, {:.0})", p.0, p.1), None)
-    };
-    Ok(Some(Plan { act, action: action.choice, detail, marks: vec![mark.clone()], mark: Some(mark), risky, summary }))
+    Ok(match snap(p, &scr.els) {
+        Some(e) => Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky },
+        None => {
+            let mark = Mark { id: 1, rect, name: String::new(), role: "box".into(), region: "screen".into() };
+            r.st.marks = vec![mark.clone()];
+            Hit { target: Target::Point(p.0.round(), p.1.round()), mark, url: None, value: None, risky }
+        }
+    })
 }
 
-// ---------- the command thread ----------
-
-/// The end of a run, for session.rs (overlay idle + the History row).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Ended {
-    pub instruction: String,
-    pub end: End,
-    pub latency_ms: u32,
+/// Shows the target (marks window brackets) right before the event.
+fn aim(r: &mut Run, desk: &mut dyn Desk, h: &Hit) {
+    r.st.target = Some(h.mark.id);
+    r.st.status = CmdStatus::Aim;
+    desk.emit(&r.st);
 }
 
-/// Runs one instruction on its own thread; sends `SessionCmd::CommandEnded` at the end.
-pub fn spawn(app: AppHandle, instr: String, settings: crate::contract::CommandSettings, key: String) {
-    ABORT.store(false, Ordering::SeqCst);
-    CONFIRMED.store(false, Ordering::SeqCst);
-    WAITING.store(0, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .name("command".into())
-        .spawn(move || {
-            use tauri::Manager;
-            let t = std::time::Instant::now();
-            let cfg = Cfg { confirm_risky: settings.confirm_risky, max_steps: MAX_STEPS };
-            let mut ask = |s: &Value, q: &Value| jev::ask(jev::DECISIONS_URL, &key, &settings.model, s, q);
-            #[cfg(target_os = "macos")]
-            let end = run(&instr, &cfg, &mut ask, &mut mac::Real::new(app.clone()));
-            #[cfg(not(target_os = "macos"))]
-            let end = {
-                let _ = (&cfg, &mut ask);
-                End { status: CmdStatus::Error, summary: String::new(), message: Some("macOS only".into()), steps: 0 }
+/// Ground + aim + secure checks + focus, for type / paste with a target. Err = the run ended.
+fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Option<Hit>, End> {
+    let h = ground(r, "type into", words, ask, desk)?;
+    aim(r, desk, &h);
+    if let Target::Point(x, y) = h.target {
+        if desk.secure_at((x, y)) {
+            return Err(r.fail(desk, CmdStatus::Blocked, BLOCKED));
+        }
+    }
+    if desk.aborted() {
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
+    }
+    desk.act(&Act::Focus(h.target.clone())).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    desk.sleep(FOCUS_MS);
+    Ok(Some(h))
+}
+
+/// Runs one planner action. `step` numbers the action in the session, `order` the planner reply it came from.
+pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
+    let st = CommandStep { instruction: crate::planner::label(a), step, max: 0, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
+    let mut r = Run { st };
+    if desk.aborted() {
+        return r.end(desk, CmdStatus::Stopped, None, String::new());
+    }
+    desk.emit(&r.st);
+    let target = a.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    // A trailing newline in a paste runs a terminal command: Return must go through the key op and its confirm.
+    let text = a.text.as_deref().unwrap_or_default().trim_end_matches(['\n', '\r']).to_string();
+    match a.op.as_str() {
+        "key" => {
+            let keys = a.keys.as_deref().unwrap_or("");
+            let (code, flags) = match crate::paste::parse_combo(keys) {
+                Ok(k) => k,
+                Err(e) => return r.fail(desk, CmdStatus::Unsure, &e),
             };
-            log::info!("command {instr:?}: {:?} after {} steps ({}), {:?}", end.status, end.steps, end.summary, end.message);
-            #[cfg(target_os = "macos")]
-            crate::platform::macos::show_marks(&app, None);
-            WAITING.store(0, Ordering::SeqCst);
-            let ended = Ended { instruction: instr, end, latency_ms: t.elapsed().as_millis() as u32 };
-            let _ = app.state::<crate::AppState>().session_tx.send(crate::session::SessionCmd::CommandEnded(Box::new(ended)));
-        })
-        .expect("spawn command thread");
+            r.st.action = Some("press_key".into());
+            r.st.detail = Some(keys.into());
+            if crate::paste::blocked_combo(code, flags) {
+                return r.fail(desk, CmdStatus::Blocked, &format!("{keys} is blocked for voice control"));
+            }
+            // Return sends in every chat app, whatever the planner says (v1 rule, any app).
+            let enter = code == 36 || code == 76;
+            if enter || (a.risky && cfg.confirm_risky) {
+                let q = if enter { "Press Return? Say yes · F11 · Esc" } else { "Do it? Say yes · F11 · Esc" };
+                if !r.confirm(desk, q) {
+                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                }
+            }
+            if desk.secure_input() {
+                return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+            }
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            let f = desk.focused();
+            if let Err(e) = desk.act(&Act::Combo(code, flags)) {
+                return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+            }
+            remember(mem, MemKind::Key, keys, &f, None);
+            desk.sleep(SETTLE_MS);
+            r.done(desk, format!("pressed {keys}"))
+        }
+        "type" => {
+            if text.is_empty() {
+                return r.fail(desk, CmdStatus::Unsure, "Nothing to type. Say it again.");
+            }
+            r.st.action = Some("focus_and_type".into());
+            r.st.detail = Some(text.clone());
+            let hit = match target {
+                Some(t) => match focus_target(&mut r, t, ask, desk) {
+                    Ok(h) => h,
+                    Err(end) => return end,
+                },
+                None => None,
+            };
+            // Check after the focus: the focus itself can land in a password field.
+            if desk.secure_input() || desk.focused().secure {
+                return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+            }
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            let typed = match desk.type_text(&text) {
+                Ok(t) => t,
+                Err(e) => return r.fail(desk, CmdStatus::Error, &format!("{e:#}")),
+            };
+            let after = desk.focused();
+            remember(mem, MemKind::Typed, &typed, &after, after.value.clone());
+            let into = hit.map(|h| format!(" into {}", quote(&h.mark.name))).unwrap_or_default();
+            r.done(desk, format!("typed {}{into}", quote(&text)))
+        }
+        "click" => {
+            let Some(t) = target else { return r.fail(desk, CmdStatus::Unsure, NOT_SURE) };
+            r.st.action = Some("click".into());
+            let h = match ground(&mut r, "click", t, ask, desk) {
+                Ok(h) => h,
+                Err(end) => return end,
+            };
+            let risky = a.risky || h.risky >= RISKY_MIN;
+            if gate(1.0, if risky { 1.0 } else { 0.0 }, cfg.confirm_risky) == Gate::Confirm {
+                r.st.target = Some(h.mark.id);
+                if !r.confirm(desk, &format!("Click {}? Say yes · F11 · Esc", quote(&h.mark.name))) {
+                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                }
+            }
+            aim(&mut r, desk, &h);
+            if let Target::Point(x, y) = h.target {
+                if desk.secure_at((x, y)) {
+                    return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+                }
+            }
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            let f = desk.focused();
+            if let Err(e) = desk.act(&Act::Click(h.target.clone())) {
+                return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+            }
+            remember(mem, MemKind::Clicked, &h.mark.name, &f, None);
+            desk.sleep(SETTLE_MS);
+            r.done(desk, format!("clicked {} ({})", quote(&h.mark.name), h.mark.role))
+        }
+        "open_app" => {
+            let app = a.app.clone().unwrap_or_default();
+            if app.trim().is_empty() {
+                return r.fail(desk, CmdStatus::Unsure, "Which app? Say it again.");
+            }
+            r.st.action = Some("open_app".into());
+            r.st.detail = Some(app.clone());
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            if let Err(e) = desk.act(&Act::OpenApp(app.clone())) {
+                return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+            }
+            remember(mem, MemKind::Opened, &app, &Field { app: app.clone(), ..Default::default() }, None);
+            r.done(desk, format!("opened {app}"))
+        }
+        "select_typed" | "delete_typed" => typed_span(&mut r, a.op == "delete_typed", desk, mem),
+        "copy" => copy(&mut r, target, ask, desk, mem),
+        "paste" => {
+            r.st.action = Some("paste".into());
+            if let Some(t) = target {
+                if let Err(end) = focus_target(&mut r, t, ask, desk) {
+                    return end;
+                }
+            }
+            let f = desk.focused();
+            if desk.secure_input() || f.secure {
+                return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+            }
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            let clip = desk.clipboard().0.unwrap_or_default();
+            if let Err(e) = desk.act(&Act::Combo(KEY_V, CMD)) {
+                return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+            }
+            desk.sleep(FOCUS_MS);
+            let after = desk.focused();
+            remember(mem, MemKind::Pasted, &clip, &after, after.value.clone());
+            r.done(desk, format!("pasted {}", quote(&clip.chars().take(40).collect::<String>())))
+        }
+        "scroll" => {
+            let down = a.dir.as_deref() != Some("up");
+            r.st.action = Some(if down { "scroll_down" } else { "scroll_up" }.into());
+            let at = match target {
+                Some(t) => match ground(&mut r, "scroll", t, ask, desk) {
+                    Ok(h) => Some(h.target),
+                    Err(end) => return end,
+                },
+                None => None,
+            };
+            if desk.aborted() {
+                return r.end(desk, CmdStatus::Stopped, None, String::new());
+            }
+            if let Err(e) = desk.act(&Act::Scroll { down, at }) {
+                return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+            }
+            r.done(desk, format!("scrolled {}", if down { "down" } else { "up" }))
+        }
+        op => r.fail(desk, CmdStatus::Unsure, &format!("Unknown action {op}")),
+    }
 }
 
-/// Polls the flags (50 ms): the command key (confirm), the spoken answer (pick), Esc / F2 abort, the timeout.
-fn wait_flags(w: Wait, timeout: Duration) -> Answer {
+/// select_typed / delete_typed (VOICE_CONTROL_V2 2.3): the first strategy that holds wins.
+/// 1. AX range: the field shows the typed text -> select exactly it (+ one Delete).
+/// 2. Undo: the range was refused and nothing changed since susurro's paste -> one Cmd+Z.
+/// 3. Word select: the value is not readable -> Opt+Shift+Left per word (+ one Delete).
+/// 4. Terminal: one burst of backspaces, one per char.
+///    The value is readable and the text is gone (Pablo changed it by hand) = do nothing (case 8).
+fn typed_span(r: &mut Run, delete: bool, desk: &mut dyn Desk, mem: &mut Memory) -> End {
+    r.st.action = Some(if delete { "delete_typed" } else { "select_typed" }.into());
+    let Some(i) = mem.iter().rposition(|e| e.e.kind == MemKind::Typed) else {
+        return r.fail(desk, CmdStatus::Unsure, "I have not typed anything yet.");
+    };
+    let typed = mem[i].e.text.clone();
+    r.st.detail = Some(typed.clone());
+    let f = desk.focused();
+    if f.secure || desk.secure_input() {
+        return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+    }
+    if desk.aborted() {
+        return r.end(desk, CmdStatus::Stopped, None, String::new());
+    }
+    let what = if delete { "deleted" } else { "selected" };
+    let ok = |r: &mut Run, desk: &mut dyn Desk, mem: &mut Memory, how: &str| {
+        log::info!("live: {} {typed:?} by {how}", r.st.action.as_deref().unwrap_or(""));
+        if delete {
+            mem[i].e.kind = MemKind::Deleted;
+        }
+        r.done(desk, format!("{what} {}", quote(&typed)))
+    };
+    let act = |r: &mut Run, desk: &mut dyn Desk, a: Act| desk.act(&a).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")));
+    let value = f.value.clone().filter(|_| !f.role.is_empty());
+    // Another app has the focus now: the same words there are Pablo's, not susurro's.
+    if f.pid != 0 && mem[i].pid != 0 && f.pid != mem[i].pid {
+        return r.fail(desk, CmdStatus::Unsure, GONE);
+    }
+    // The blind strategies (backspaces, word select) cannot see the text: they are safe only while the caret is still
+    // right after it. A key, click, paste or app switch since then (Return ran the command, a new tab, another
+    // field) means the caret moved: they would delete Pablo's text.
+    let field = if f.name.is_empty() { f.role.trim_start_matches("AX").to_string() } else { f.name.clone() };
+    let moved = field != mem[i].e.field || mem.iter().skip(i + 1).any(|e| matches!(e.e.kind, MemKind::Key | MemKind::Clicked | MemKind::Pasted | MemKind::Opened));
+    if terminal(&f) {
+        if !delete {
+            return r.fail(desk, CmdStatus::Unsure, "Terminals have no selection.");
+        }
+        if moved || value.as_ref().is_some_and(|v| !v.contains(typed.trim())) {
+            return r.fail(desk, CmdStatus::Unsure, GONE);
+        }
+        if let Err(end) = act(r, desk, Act::Burst(DELETE, 0, typed.chars().count() as u32)) {
+            return end;
+        }
+        return ok(r, desk, mem, "terminal backspaces");
+    }
+    match value {
+        Some(v) => {
+            let needle = if v.contains(&typed) { typed.as_str() } else { typed.trim() };
+            let Some((start, len)) = find_range(&v, needle, f.sel.map(|s| s.0 + s.1)) else {
+                return r.fail(desk, CmdStatus::Unsure, GONE);
+            };
+            if desk.set_selection(start, len) {
+                if delete {
+                    if let Err(end) = act(r, desk, Act::Combo(DELETE, 0)) {
+                        return end;
+                    }
+                }
+                return ok(r, desk, mem, "AX range");
+            }
+            if delete && mem[i].value_after.as_deref() == Some(v.as_str()) {
+                if let Err(end) = act(r, desk, Act::Combo(KEY_Z, CMD)) {
+                    return end;
+                }
+                return ok(r, desk, mem, "undo");
+            }
+            // The range was refused: select by words, but only when the caret sits right after the text.
+            if f.sel.is_some_and(|(c, l)| c + l != start + len) {
+                return r.fail(desk, CmdStatus::Unsure, "I can't select that text here.");
+            }
+        }
+        None if moved => return r.fail(desk, CmdStatus::Unsure, GONE),
+        None => {}
+    }
+    if let Err(end) = act(r, desk, Act::Burst(LEFT, OPT | SHIFT, words(&typed))) {
+        return end;
+    }
+    if delete {
+        if let Err(end) = act(r, desk, Act::Combo(DELETE, 0)) {
+            return end;
+        }
+    }
+    ok(r, desk, mem, "word select")
+}
+
+/// copy (VOICE_CONTROL_V2 2.4): a target's AXURL, else its AXValue, else a "Copy link" button click checked by the
+/// pasteboard change count; no target = the selection (AXSelectedText, else Cmd+C).
+fn copy(r: &mut Run, target: Option<&str>, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
+    r.st.action = Some("copy".into());
+    let f = desk.focused();
+    if f.secure {
+        return r.fail(desk, CmdStatus::Blocked, BLOCKED);
+    }
+    let got = match target {
+        Some(t) => {
+            let h = match ground(r, "copy", t, ask, desk) {
+                Ok(h) => h,
+                Err(end) => return end,
+            };
+            aim(r, desk, &h);
+            if let Some(s) = h.url.clone().or(h.value.clone()).filter(|s| !s.trim().is_empty()) {
+                desk.set_clipboard(&s);
+                Some(s)
+            } else if h.mark.role == "button" || h.mark.name.to_lowercase().contains("cop") {
+                // "Copy link" buttons: click, then the clipboard must have changed.
+                let before = desk.clipboard().1;
+                if desk.aborted() {
+                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                }
+                if let Err(e) = desk.act(&Act::Click(h.target.clone())) {
+                    return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+                }
+                desk.sleep(SETTLE_MS);
+                let (t, n) = desk.clipboard();
+                t.filter(|_| n != before)
+            } else {
+                None
+            }
+        }
+        None => match f.selected.clone().filter(|s| !s.is_empty()).or(f.url.clone()) {
+            Some(s) => {
+                desk.set_clipboard(&s);
+                Some(s)
+            }
+            None => {
+                let before = desk.clipboard().1;
+                if desk.aborted() {
+                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                }
+                if let Err(e) = desk.act(&Act::Combo(KEY_C, CMD)) {
+                    return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+                }
+                desk.sleep(COPY_WAIT_MS);
+                let (t, n) = desk.clipboard();
+                t.filter(|_| n != before)
+            }
+        },
+    };
+    match got {
+        Some(s) => {
+            remember(mem, MemKind::Copied, &s, &f, None);
+            r.done(desk, format!("copied {}", quote(&s.chars().take(40).collect::<String>())))
+        }
+        None => r.fail(desk, CmdStatus::Unsure, "Nothing to copy there."),
+    }
+}
+
+/// Polls the flags (50 ms): the command key or a spoken yes / no (confirm), the spoken answer (pick), Esc, the timeout.
+pub fn wait_flags(w: Wait, timeout: Duration) -> Answer {
     CONFIRMED.store(false, Ordering::SeqCst);
+    DENIED.store(false, Ordering::SeqCst);
     *ANSWER.lock().unwrap() = None;
     WAITING.store(if w == Wait::Confirm { 1 } else { 2 }, Ordering::SeqCst);
     let until = std::time::Instant::now() + timeout;
     let out = loop {
-        if ABORT.load(Ordering::SeqCst) {
+        if ABORT.load(Ordering::SeqCst) || DENIED.swap(false, Ordering::SeqCst) {
             break Answer::No;
         }
         if w == Wait::Confirm && CONFIRMED.swap(false, Ordering::SeqCst) {
@@ -851,8 +1053,17 @@ fn wait_flags(w: Wait, timeout: Duration) -> Answer {
     out
 }
 
+/// The end of a live session, for session.rs (overlay idle + the History row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ended {
+    /// Everything heard, joined.
+    pub instruction: String,
+    pub end: End,
+    pub latency_ms: u32,
+}
+
 #[cfg(target_os = "macos")]
-mod mac {
+pub mod mac {
     use super::*;
     use core_foundation::base::CFType;
     use core_graphics::display::CGDisplay;
@@ -866,18 +1077,17 @@ mod mac {
         fn IsSecureEventInputEnabled() -> u8;
     }
 
-    /// Statuses that show the marks window (Marks.tsx SHOWN).
-    const SHOWN: [CmdStatus; 4] = [CmdStatus::Marks, CmdStatus::Aim, CmdStatus::Pick, CmdStatus::Confirm];
-
     pub struct Real {
         app: AppHandle,
         handles: Vec<CFType>,
         els: Vec<El>,
+        /// The focused element of the last `focused()` (set_selection acts on it).
+        focus: Option<CFType>,
     }
 
     impl Real {
         pub fn new(app: AppHandle) -> Self {
-            Self { app, handles: vec![], els: vec![] }
+            Self { app, handles: vec![], els: vec![], focus: None }
         }
 
         fn point(&self, t: &Target) -> Option<(f64, f64)> {
@@ -914,6 +1124,7 @@ mod mac {
             if click {
                 e.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
             }
+            e.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, crate::paste::SUSURRO_TAG);
             e.post(CGEventTapLocation::HID);
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -928,27 +1139,12 @@ mod mac {
         if let Some(p) = at {
             e.set_location(CGPoint::new(p.0, p.1));
         }
+        e.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, crate::paste::SUSURRO_TAG);
         e.post(CGEventTapLocation::HID);
         Ok(())
     }
 
     impl Desk for Real {
-        fn apps(&mut self) -> Vec<String> {
-            let home = std::env::var("HOME").map(|h| format!("{h}/Applications")).unwrap_or_default();
-            let mut out: Vec<String> = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities", home.as_str()]
-                .iter()
-                .filter_map(|d| std::fs::read_dir(d).ok())
-                .flatten()
-                .flatten()
-                .filter_map(|e| e.file_name().to_str()?.strip_suffix(".app").map(String::from))
-                .collect();
-            out.sort();
-            out.dedup();
-            // ponytail: Jev's choice accuracy over ~200 options is not measured; capped.
-            out.truncate(200);
-            out
-        }
-
         fn read(&mut self) -> Result<Screen, String> {
             if !crate::permissions::accessibility_trusted() {
                 return Err("accessibility".into());
@@ -960,6 +1156,39 @@ mod mac {
             self.handles = tree.handles;
             self.els = els.clone();
             Ok(Screen { app: front.name.unwrap_or_default(), display, scale, els })
+        }
+
+        fn focused(&mut self) -> Field {
+            let front = crate::paste::target_app();
+            let (mut f, h) = ax::mac::focused().map_or((Field::default(), None), |(f, h)| (f, Some(h)));
+            self.focus = h;
+            if let Some(a) = front {
+                (f.app, f.bundle) = (a.name.unwrap_or_default(), a.bundle_id.unwrap_or_default());
+                if f.pid == 0 {
+                    f.pid = a.pid;
+                }
+            }
+            f
+        }
+
+        fn set_selection(&mut self, start: usize, len: usize) -> bool {
+            self.focus.as_ref().is_some_and(|h| ax::mac::set_selection(h, start, len))
+        }
+
+        fn clipboard(&mut self) -> (Option<String>, isize) {
+            crate::paste::clipboard()
+        }
+
+        fn set_clipboard(&mut self, s: &str) {
+            crate::paste::copy(s);
+        }
+
+        fn type_text(&mut self, s: &str) -> anyhow::Result<String> {
+            let opts = self.app.state::<crate::AppState>().settings.read().unwrap().paste.clone();
+            match crate::paste::paste_ex(s, &opts, None) {
+                (crate::paste::PasteOutcome::Pasted, typed) => Ok(typed),
+                (o, _) => anyhow::bail!("could not type: {o:?}"),
+            }
         }
 
         fn screen_ok(&mut self) -> bool {
@@ -984,38 +1213,32 @@ mod mac {
             if let Some(why) = crate::test_hooks::paste_blocked() {
                 anyhow::bail!("test guard: {why}");
             }
+            crate::live::own_input();
             match a {
                 Act::Click(t) => {
                     if !self.handle(t).is_some_and(ax::mac::press) {
                         click_at(self.point(t).ok_or_else(|| anyhow::anyhow!("the element is gone"))?)?;
                     }
                 }
-                Act::Type(..) => anyhow::bail!("Type runs as Focus + Paste"),
                 Act::Focus(t) => {
                     if !self.handle(t).is_some_and(ax::mac::focus) {
                         click_at(self.point(t).ok_or_else(|| anyhow::anyhow!("the element is gone"))?)?;
                     }
                 }
-                Act::Paste(text) => {
-                    let opts = self.app.state::<crate::AppState>().settings.read().unwrap().paste.clone();
-                    match crate::paste::paste(text, &opts, None) {
-                        crate::paste::PasteOutcome::Pasted => {}
-                        o => anyhow::bail!("could not type: {o:?}"),
-                    }
-                }
+                Act::Combo(code, flags) => crate::paste::combo(*code, *flags),
+                Act::Burst(code, flags, n) => crate::paste::burst(*code, *flags, *n),
                 Act::Scroll { down, at } => scroll(*down, at.as_ref().and_then(|t| self.point(t)))?,
-                Act::Key(k) => {
-                    let (_, code, cmd) = KEYS.iter().find(|x| x.0 == k).ok_or_else(|| anyhow::anyhow!("unknown key {k}"))?;
-                    crate::paste::key_press(*code, *cmd);
-                }
                 Act::OpenApp(name) => {
                     let ok = std::process::Command::new("/usr/bin/open").args(["-a", name]).status()?.success();
                     anyhow::ensure!(ok, "could not open {name}");
+                    // Wait up to 2 s for it to come to the front, so the next action reads its window.
+                    for _ in 0..40 {
+                        if crate::paste::frontmost_app().and_then(|f| f.name).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                Act::PasteLast => {
-                    let _ = self.app.state::<crate::AppState>().session_tx.send(crate::session::SessionCmd::PasteLast);
-                }
-                Act::NewTab => crate::paste::key_press(17, true), // kVK_ANSI_T
             }
             Ok(())
         }
@@ -1028,9 +1251,12 @@ mod mac {
             ax::mac::secure_at(p)
         }
 
+        /// Rust owns the marks window: it shows on every step with marks; live.rs hides it (session end, took over).
         fn emit(&mut self, s: &CommandStep) {
-            let show = SHOWN.contains(&s.status) && !s.marks.is_empty();
-            crate::platform::macos::show_marks(&self.app, show.then_some(s.display));
+            if !s.marks.is_empty() && !crate::live::took_over() {
+                crate::platform::macos::show_marks(&self.app, Some(s.display));
+            }
+            crate::live::step_seen(&self.app, s);
             publish(&self.app, s.clone());
         }
 
@@ -1053,24 +1279,6 @@ mod tests {
     use super::*;
     use crate::ax::tests::n;
     use std::sync::{Arc, Mutex as M};
-
-    #[test]
-    fn a_repeated_instruction_starts_a_new_run() {
-        let st = |step, i: &str| CommandStep { step, instruction: i.into(), ..Default::default() };
-        let mut log = vec![];
-        for s in [st(1, "scroll down"), st(2, "scroll down"), st(1, "scroll down")] {
-            record(&mut log, s);
-        }
-        assert_eq!(log.len(), 1, "the second 'scroll down' run is merged into the first");
-        record(&mut log, st(0, "open Slack"));
-        assert_eq!(log, vec![st(0, "open Slack")]);
-        // one row per step: thinking -> marks -> aim of step 2 keep only the aim
-        let mut log = vec![st(1, "x")];
-        for s in [CmdStatus::Thinking, CmdStatus::Marks, CmdStatus::Aim] {
-            record(&mut log, CommandStep { status: s, ..st(2, "x") });
-        }
-        assert_eq!(log.iter().map(|s| (s.step, s.status.clone())).collect::<Vec<_>>(), [(1, CmdStatus::Thinking), (2, CmdStatus::Aim)]);
-    }
 
     #[test]
     fn gate_table() {
@@ -1117,25 +1325,6 @@ mod tests {
         assert_eq!(parse_pick("never mind", &choices, &ids), None);
     }
 
-    #[test]
-    fn text_to_type() {
-        assert_eq!(type_text("type hello in the search field").as_deref(), Some("hello"));
-        assert_eq!(type_text("Type \"meet in the lobby\" in the message box").as_deref(), Some("meet in the lobby"));
-        assert_eq!(type_text("search for rust tauri").as_deref(), Some("rust tauri"));
-        assert_eq!(type_text("escribe hola mundo en el buscador").as_deref(), Some("hola mundo"));
-        assert_eq!(type_text("click send"), None);
-    }
-
-    #[test]
-    fn type_text_contractions_and_unicode() {
-        // an apostrophe is not a quote
-        assert_eq!(type_text("type I'm at Bob's place in the message box").as_deref(), Some("I'm at Bob's place"));
-        assert_eq!(type_text("type ‘hi there’ in the box").as_deref(), Some("hi there"));
-        // to_lowercase changes byte lengths ("İ" 2 -> 3 bytes): slicing the original must not panic
-        assert_eq!(type_text("İtype éa").as_deref(), Some("éa"));
-        assert_eq!(type_text("ẞ write café in the search field").as_deref(), Some("café"));
-    }
-
     const RETINA: PtRect = PtRect { x: 0.0, y: 0.0, w: 1512.0, h: 982.0 };
 
     #[test]
@@ -1180,7 +1369,7 @@ mod tests {
     }
 
     fn el(id: u32, name: &str, role: &str, r: (f64, f64, f64, f64)) -> El {
-        El { mark: Mark { id, rect: PtRect { x: r.0, y: r.1, w: r.2, h: r.3 }, name: name.into(), role: role.into(), region: "main".into() }, state: None, h: id as usize }
+        El { mark: Mark { id, rect: PtRect { x: r.0, y: r.1, w: r.2, h: r.3 }, name: name.into(), role: role.into(), region: "main".into() }, state: None, h: id as usize, url: None, value: None }
     }
 
     #[test]
@@ -1191,95 +1380,651 @@ mod tests {
         assert!(snap((160.0, 110.0), &els).is_none(), "40 pt from both");
     }
 
-    // ---------- the runner with a fake desk ----------
+
+    // ---------- the executor on a fake desk (every vc-feedback.md case, VOICE_CONTROL_V2 section 8) ----------
+
+    /// One text field of the fake desk. ASCII in the tests, so UTF-16 units = bytes.
+    #[derive(Clone, Default)]
+    struct FField {
+        role: String,
+        name: String,
+        value: String,
+        caret: usize,
+        sel: usize,
+        /// AXSelectedTextRange is settable.
+        range_ok: bool,
+        /// AXValue is readable (Electron: no).
+        readable: bool,
+        secure: bool,
+        undo: Vec<String>,
+        /// The mark that focuses this field.
+        mark: Option<u32>,
+    }
+
+    impl FField {
+        fn new(role: &str, name: &str, value: &str, mark: Option<u32>) -> Self {
+            Self { role: role.into(), name: name.into(), value: value.into(), caret: value.len(), range_ok: true, readable: true, mark, ..Default::default() }
+        }
+
+        fn insert(&mut self, s: &str) {
+            self.undo.push(self.value.clone());
+            self.value.replace_range(self.caret..self.caret + self.sel, s);
+            (self.caret, self.sel) = (self.caret + s.len(), 0);
+        }
+
+        fn backspace(&mut self, n: usize) {
+            if self.sel > 0 {
+                self.value.replace_range(self.caret..self.caret + self.sel, "");
+                self.sel = 0;
+            } else {
+                let from = self.caret.saturating_sub(n);
+                self.value.replace_range(from..self.caret, "");
+                self.caret = from;
+            }
+        }
+    }
 
     #[derive(Default)]
-    struct Fake {
+    struct FakeDesk {
+        app: String,
+        fields: Vec<FField>,
+        focus: usize,
+        clip: (Option<String>, isize),
+        /// Clicking this mark copies this text (a "Copy link" button).
+        copy_button: Option<(u32, String)>,
         screens: Vec<Screen>,
         reads: usize,
         acts: Vec<Act>,
+        typed: Vec<String>,
+        selections: Vec<(usize, usize)>,
+        sleeps: Vec<u64>,
+        tabs: u32,
         steps: Vec<CommandStep>,
-        screen_ok: bool,
-        captures: usize,
         answers: Vec<Answer>,
         waits: Vec<Wait>,
-        /// abort after this many emitted steps / actions
-        abort_after: Option<usize>,
+        screen_ok: bool,
         abort_after_acts: Option<usize>,
-        secure: bool,
-        /// secure input turns on after this many actions (a click that lands in a password field)
-        secure_after_acts: Option<usize>,
-        /// every point is a password field
-        secure_points: bool,
     }
 
-    impl Desk for Fake {
-        fn apps(&mut self) -> Vec<String> {
-            vec!["Slack".into(), "Notes".into()]
+    impl FakeDesk {
+        fn f(&mut self) -> &mut FField {
+            &mut self.fields[self.focus]
         }
+
+        fn value(&self, i: usize) -> &str {
+            &self.fields[i].value
+        }
+
+        fn focus_mark(&mut self, id: u32) {
+            if let Some(i) = self.fields.iter().position(|f| f.mark == Some(id)) {
+                self.focus = i;
+            }
+        }
+    }
+
+    impl Desk for FakeDesk {
         fn read(&mut self) -> Result<Screen, String> {
             self.reads += 1;
             let i = (self.reads - 1).min(self.screens.len().saturating_sub(1));
             self.screens.get(i).cloned().ok_or_else(|| "no window".into())
         }
+        fn focused(&mut self) -> Field {
+            let app = self.app.clone();
+            let f = &self.fields[self.focus];
+            let sel = f.value.get(f.caret..f.caret + f.sel).map(String::from).filter(|s| !s.is_empty());
+            Field {
+                app,
+                pid: 1,
+                role: f.role.clone(),
+                name: f.name.clone(),
+                value: (f.readable && !f.secure).then(|| f.value.clone()),
+                sel: f.readable.then_some((f.caret, f.sel)),
+                selected: sel.filter(|_| f.readable),
+                secure: f.secure,
+                ..Default::default()
+            }
+        }
+        fn set_selection(&mut self, start: usize, len: usize) -> bool {
+            self.selections.push((start, len));
+            let f = self.f();
+            if f.range_ok {
+                (f.caret, f.sel) = (start, len);
+            }
+            f.range_ok
+        }
+        fn clipboard(&mut self) -> (Option<String>, isize) {
+            self.clip.clone()
+        }
+        fn set_clipboard(&mut self, s: &str) {
+            self.clip = (Some(s.into()), self.clip.1 + 1);
+        }
+        fn type_text(&mut self, s: &str) -> anyhow::Result<String> {
+            assert!(!self.aborted(), "typed after the abort");
+            self.typed.push(s.into());
+            self.f().insert(s);
+            Ok(s.into())
+        }
         fn screen_ok(&mut self) -> bool {
             self.screen_ok
         }
         fn capture(&mut self, _: PtRect, _: bool) -> anyhow::Result<Vec<u8>> {
-            self.captures += 1;
             Ok(b"\xff\xd8jpeg".to_vec())
         }
         fn act(&mut self, a: &Act) -> anyhow::Result<()> {
             assert!(!self.aborted(), "an action ran after the abort");
             self.acts.push(a.clone());
+            match a.clone() {
+                Act::Focus(Target::Mark(id)) => self.focus_mark(id),
+                Act::Click(Target::Mark(id)) => {
+                    self.focus_mark(id);
+                    if let Some((_, t)) = self.copy_button.clone().filter(|b| b.0 == id) {
+                        self.set_clipboard(&t);
+                    }
+                }
+                Act::Combo(DELETE, 0) => self.f().backspace(1),
+                Act::Burst(DELETE, 0, n) => self.f().backspace(n as usize),
+                Act::Combo(KEY_Z, CMD) => {
+                    let f = self.f();
+                    if let Some(v) = f.undo.pop() {
+                        (f.caret, f.sel) = (v.len(), 0);
+                        f.value = v;
+                    }
+                }
+                Act::Combo(0, CMD) => {
+                    let f = self.f();
+                    (f.caret, f.sel) = (0, f.value.len());
+                }
+                Act::Combo(KEY_C, CMD) => {
+                    let f = &self.fields[self.focus];
+                    if f.sel > 0 {
+                        let t = f.value[f.caret..f.caret + f.sel].to_string();
+                        self.set_clipboard(&t);
+                    }
+                }
+                Act::Combo(KEY_V, CMD) => {
+                    let t = self.clip.0.clone().unwrap_or_default();
+                    self.f().insert(&t);
+                }
+                Act::Combo(17, CMD) => self.tabs += 1,
+                Act::Burst(LEFT, f, n) if f == OPT | SHIFT => {
+                    // select n words left of the caret
+                    let fl = self.f();
+                    let mut start = fl.caret;
+                    for _ in 0..n {
+                        let b = fl.value.as_bytes();
+                        while start > 0 && !b[start - 1].is_ascii_alphanumeric() {
+                            start -= 1;
+                        }
+                        while start > 0 && b[start - 1].is_ascii_alphanumeric() {
+                            start -= 1;
+                        }
+                    }
+                    (fl.sel, fl.caret) = (fl.caret - start, start);
+                }
+                Act::OpenApp(a) => self.app = a,
+                _ => {}
+            }
             Ok(())
         }
         fn secure_input(&mut self) -> bool {
-            self.secure || self.secure_after_acts.is_some_and(|n| self.acts.len() >= n)
+            self.fields[self.focus].secure
         }
         fn secure_at(&mut self, _: (f64, f64)) -> bool {
-            self.secure_points
+            false
         }
         fn emit(&mut self, s: &CommandStep) {
             self.steps.push(s.clone());
         }
-        fn sleep(&mut self, _: u64) {}
+        fn sleep(&mut self, ms: u64) {
+            self.sleeps.push(ms);
+        }
         fn wait(&mut self, w: Wait, _: Duration) -> Answer {
             self.waits.push(w);
             if self.answers.is_empty() { Answer::No } else { self.answers.remove(0) }
         }
         fn aborted(&self) -> bool {
-            self.abort_after.is_some_and(|n| self.steps.len() >= n) || self.abort_after_acts.is_some_and(|n| self.acts.len() >= n)
+            self.abort_after_acts.is_some_and(|n| self.acts.len() >= n)
         }
     }
 
-    fn slack() -> Screen {
+    fn mk(id: u32, name: &str, role: &str, region: &str, url: Option<&str>, value: Option<&str>) -> El {
+        let r = PtRect { x: 100.0 * id as f64, y: 50.0, w: 80.0, h: 24.0 };
+        El { mark: Mark { id, rect: r, name: name.into(), role: role.into(), region: region.into() }, state: None, h: id as usize, url: url.map(Into::into), value: value.map(Into::into) }
+    }
+
+    const LINK: &str = "https://chatgpt.com/share/6a1f";
+
+    /// The bench's Chrome screen (`.lo/planner-bench/planner_bench.py`): two Share buttons, a link field.
+    fn chrome() -> Screen {
         let els = vec![
-            el(1, "# general", "link", (64.0, 120.0, 260.0, 26.0)),
-            el(2, "# design", "link", (64.0, 146.0, 260.0, 26.0)),
-            el(3, "Search", "text field", (500.0, 10.0, 300.0, 28.0)),
-            el(4, "Message #general", "text field", (400.0, 840.0, 900.0, 44.0)),
-            el(5, "Send now", "button", (1380.0, 850.0, 32.0, 32.0)),
+            mk(1, "Back", "button", "toolbar", None, None),
+            mk(2, "Share", "button", "toolbar", None, None),
+            mk(3, "Search", "search field", "toolbar", None, None),
+            mk(4, LINK, "text field", "main", None, Some(LINK)),
+            mk(5, "Copy link", "button", "main", None, None),
+            mk(6, "Public", "radio button", "main", None, None),
+            mk(7, "Message", "text area", "bottom", None, None),
+            mk(8, "Share", "button", "main", None, None),
+            mk(9, "Send", "button", "bottom", None, None),
         ];
-        Screen { app: "Slack".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els }
+        Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els }
     }
 
-    fn reply(answers: Value) -> Reply {
-        Reply { answers, cost: 0.0001, latency_ms: 700 }
+    fn chrome_desk() -> FakeDesk {
+        FakeDesk {
+            app: "Google Chrome".into(),
+            fields: vec![FField::new("AXTextArea", "Notes", "meet at 5", None), FField::new("AXSearchField", "Search", "", Some(3)), FField::new("AXTextArea", "Message", "", Some(7))],
+            screens: vec![chrome()],
+            ..Default::default()
+        }
     }
 
-    fn fast_none() -> Value {
-        json!({ "intent": { "choice": "none", "probabilities": { "none": 0.9 }, "confidence": 0.9 }, "multi": { "noul": 0.1 } })
+    fn ghostty() -> FakeDesk {
+        let mut f = FField::new("AXTextArea", "", "pablo@mac ~ % ", None);
+        f.range_ok = false; // shells have no selection
+        FakeDesk { app: "Ghostty".into(), fields: vec![f], ..Default::default() }
     }
 
-    fn step(target: &str, conf: f32, action: &str, risky: f32, done: f32) -> Value {
-        json!({
-            "target": { "choice": target, "probabilities": { target: conf, "2": 0.1, "1": 0.05 }, "confidence": conf },
-            "action": { "choice": action, "probabilities": { action: 0.9 }, "confidence": 0.9 },
-            "key": { "choice": "return", "probabilities": { "return": 0.9 }, "confidence": 0.9 },
-            "risky": { "noul": risky },
-            "done": { "noul": done },
-        })
+    fn act(op: &str) -> Action {
+        Action { op: op.into(), ..Default::default() }
+    }
+    fn key(k: &str) -> Action {
+        Action { op: "key".into(), keys: Some(k.into()), ..Default::default() }
+    }
+    fn typ(t: &str, target: Option<&str>) -> Action {
+        Action { op: "type".into(), text: Some(t.into()), target: target.map(Into::into), ..Default::default() }
+    }
+    fn on(op: &str, target: &str) -> Action {
+        Action { op: op.into(), target: Some(target.into()), ..Default::default() }
+    }
+
+    const CFG: Cfg = Cfg { confirm_risky: true };
+
+    /// No Jev call expected (local matches only).
+    fn no_jev(_: &Value, _: &Value) -> anyhow::Result<Reply> {
+        panic!("Jev was called")
+    }
+
+    /// Runs the actions in order like the live executor: a stopped action drops the rest.
+    fn run_all(acts: &[Action], d: &mut FakeDesk, mem: &mut Memory) -> Vec<End> {
+        let mut out = vec![];
+        for (i, a) in acts.iter().enumerate() {
+            let e = exec(a, i as u32 + 1, 1, &CFG, &mut no_jev, d, mem);
+            let stop = e.status != CmdStatus::Done;
+            out.push(e);
+            if stop {
+                break;
+            }
+        }
+        out
+    }
+
+    fn statuses(e: &[End]) -> Vec<CmdStatus> {
+        e.iter().map(|e| e.status.clone()).collect()
+    }
+
+    #[test]
+    fn type_pastes_planner_text_verbatim() {
+        // case 1: the executor never re-cases; the planner wrote "ls"
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[typ("ls", None)], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.typed, ["ls"]);
+        assert_eq!(d.value(0), "pablo@mac ~ % ls");
+        assert!(d.acts.is_empty(), "no key events for a plain type");
+        assert_eq!(mem.back().unwrap().e.kind, MemKind::Typed);
+    }
+
+    #[test]
+    fn return_waits_for_confirm_then_voice_si_resolves() {
+        // case 2: "run ls" = type + return, Return always confirms
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        d.answers = vec![Answer::Yes];
+        let e = run_all(&[typ("ls", None), key("return")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Done]);
+        assert_eq!(d.waits, [Wait::Confirm]);
+        assert_eq!(d.acts, [Act::Combo(36, 0)]);
+        assert!(d.steps.iter().any(|s| s.status == CmdStatus::Confirm && s.message.as_deref().is_some_and(|m| m.contains("Return"))));
+        assert_eq!(yes_no("Sí."), Some(true));
+        assert_eq!(yes_no("dale"), Some(true));
+        assert_eq!(yes_no("No."), Some(false));
+        assert_eq!(yes_no("open slack"), None);
+    }
+
+    #[test]
+    fn a_typed_newline_never_bypasses_the_return_confirm() {
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[typ("ls\n", None), typ("pwd\r\n", None)], &mut d, &mut mem);
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 2]);
+        assert_eq!(d.typed, ["ls", "pwd"]);
+        assert!(d.waits.is_empty() && d.acts.is_empty());
+    }
+
+    #[test]
+    fn return_no_answer_in_10s_stops() {
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[key("enter")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Stopped]);
+        assert!(d.acts.is_empty(), "nothing pressed without a yes");
+    }
+
+    #[test]
+    fn one_order_runs_its_actions_in_order() {
+        // case 3: "create a new tab and run the command ls"
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        d.answers = vec![Answer::Yes];
+        let e = run_all(&[key("cmd+t"), typ("ls", None), key("return")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 3]);
+        assert_eq!(d.acts, [Act::Combo(17, CMD), Act::Combo(36, 0)]);
+        assert_eq!((d.tabs, d.typed.as_slice()), (1, &["ls".to_string()][..]));
+        let orders: Vec<(u32, Option<String>)> = d.steps.iter().filter(|s| s.status == CmdStatus::Done).map(|s| (s.step, s.op.clone())).collect();
+        assert_eq!(orders, [(1, Some("key".into())), (2, Some("type".into())), (3, Some("key".into()))]);
+    }
+
+    #[test]
+    fn delete_typed_uses_memory_ax_range() {
+        // case 4: field "hi ", susurro typed "ls -" -> "hi ls -"; delete_typed selects exactly it, one Delete
+        let mut d = FakeDesk { app: "TextEdit".into(), fields: vec![FField::new("AXTextArea", "", "hi ", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        run_all(&[typ("ls -", None)], &mut d, &mut mem);
+        assert_eq!(d.value(0), "hi ls -");
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.value(0), "hi ");
+        assert_eq!(d.selections, [(3, 4)]);
+        assert_eq!(d.acts, [Act::Combo(DELETE, 0)], "one AX call + one key, never N deletes");
+        assert_eq!(mem.back().unwrap().e.kind, MemKind::Deleted);
+    }
+
+    #[test]
+    fn second_delete_takes_the_entry_before() {
+        let mut d = FakeDesk { app: "Notes".into(), fields: vec![FField::new("AXTextArea", "", "", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        run_all(&[typ("hello", None), typ(" world", None)], &mut d, &mut mem);
+        assert_eq!(d.value(0), "hello world");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(d.value(0), "hello");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(d.value(0), "");
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Unsure], "nothing typed is left");
+    }
+
+    #[test]
+    fn correct_ls_deletes_then_types() {
+        // log 20:59: "type ls minus, remove what you inputted and write ls"
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[typ("LS", None), act("delete_typed"), typ("ls", None)], &mut d, &mut mem);
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 3]);
+        assert_eq!(d.value(0), "pablo@mac ~ % ls");
+        assert_eq!(d.acts, [Act::Burst(DELETE, 0, 2)]);
+    }
+
+    #[test]
+    fn type_with_target_focuses_target_then_types_content_only() {
+        // case 5: "type hello onto the search input": text "hello", target the search field
+        let (mut d, mut mem) = (chrome_desk(), Memory::new());
+        let e = run_all(&[typ("hello", Some("Search (search field, toolbar)"))], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.acts, [Act::Focus(Target::Mark(3))]);
+        assert_eq!((d.value(1), d.value(0)), ("hello", "meet at 5"));
+        assert!(e[0].summary.contains("into “Search”"), "{}", e[0].summary);
+        // "name (role)" and the bare name match too
+        for t in ["Search (search field)", "search", "“Search”"] {
+            assert_eq!(local_match(t, &chrome().els).map(|e| e.mark.id), Some(3), "{t}");
+        }
+        assert_eq!(local_match("Share", &chrome().els), None, "two Share buttons: Jev decides");
+        assert_eq!(local_match("Share (button, toolbar)", &chrome().els).map(|e| e.mark.id), Some(2));
+    }
+
+    #[test]
+    fn cmd_a_then_delete_empties_the_field() {
+        // case 6
+        let mut d = FakeDesk { app: "Google Chrome".into(), fields: vec![FField::new("AXSearchField", "Search", "math coding hello", None)], ..Default::default() };
+        let e = run_all(&[key("cmd+a"), key("delete")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 2]);
+        assert_eq!(d.value(0), "");
+        assert_eq!(d.acts, [Act::Combo(0, CMD), Act::Combo(DELETE, 0)]);
+    }
+
+    #[test]
+    fn select_copy_focus_paste_moves_the_text() {
+        // case 7: "select the text that is there and paste it in the search box"
+        let (mut d, mut mem) = (chrome_desk(), Memory::new());
+        let e = run_all(&[key("cmd+a"), act("copy"), on("paste", "Search (search field, toolbar)")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 3]);
+        assert_eq!(d.clip.0.as_deref(), Some("meet at 5"));
+        assert_eq!(d.value(1), "meet at 5");
+        assert_eq!(d.acts, [Act::Combo(0, CMD), Act::Focus(Target::Mark(3)), Act::Combo(KEY_V, CMD)], "AXSelectedText: no Cmd+C needed");
+        let kinds: Vec<MemKind> = mem.iter().map(|e| e.e.kind.clone()).collect();
+        assert_eq!(kinds, [MemKind::Key, MemKind::Copied, MemKind::Pasted]);
+    }
+
+    #[test]
+    fn copy_without_ax_selection_uses_cmd_c_and_checks_the_change_count() {
+        let mut d = chrome_desk();
+        d.fields[0].readable = false; // Electron: no AXSelectedText
+        d.fields[0].sel = 9;
+        d.fields[0].caret = 0;
+        let e = run_all(&[act("copy")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.acts, [Act::Combo(KEY_C, CMD)]);
+        assert_eq!(d.clip.0.as_deref(), Some("meet at 5"));
+        // nothing selected: the count does not move = unsure, the old clipboard is not reported as copied
+        let mut d = chrome_desk();
+        d.fields[0].readable = false;
+        d.clip = (Some("old".into()), 7);
+        let e = run_all(&[act("copy")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+    }
+
+    #[test]
+    fn reread_before_every_action() {
+        // case 8: susurro typed "hello", Pablo cleared the field by hand -> delete_typed does nothing
+        let mut d = FakeDesk { app: "WhatsApp".into(), fields: vec![FField::new("AXTextArea", "Type a message", "", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        run_all(&[typ("hello", None)], &mut d, &mut mem);
+        d.fields[0].value.clear();
+        d.fields[0].caret = 0;
+        let before = d.acts.len();
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+        assert_eq!(e[0].message.as_deref(), Some(GONE));
+        assert_eq!(d.acts.len(), before, "zero events");
+        assert!(d.selections.is_empty());
+    }
+
+    #[test]
+    fn marks_ids_never_cross_actions() {
+        // "click Share, then Public": Public exists only after the Share click, with an id from that later read
+        let mut after = chrome();
+        after.els.insert(0, mk(10, "Dialog title", "button", "main", None, None));
+        for (i, e) in after.els.iter_mut().enumerate() {
+            e.mark.id = i as u32 + 1;
+        }
+        let mut d = chrome_desk();
+        d.screens = vec![chrome(), after];
+        let e = run_all(&[on("click", "Share (button, toolbar)"), on("click", "Public (radio button, main)")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 2]);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(2)), Act::Click(Target::Mark(7))], "Public is 7 on the 2nd read");
+        assert_eq!(d.reads, 2, "one read per action");
+    }
+
+    #[test]
+    fn copy_link_reads_axurl_without_keys() {
+        // case 14
+        let mut s = chrome();
+        s.els[0].url = Some("https://example.com/back".into());
+        let mut d = chrome_desk();
+        d.screens = vec![s];
+        let e = run_all(&[on("copy", "Back (button, toolbar)")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.clip.0.as_deref(), Some("https://example.com/back"));
+        assert!(d.acts.is_empty(), "0 key or click events");
+        // a link field: its value
+        let mut d = chrome_desk();
+        run_all(&[on("copy", &format!("{LINK} (text field, main)"))], &mut d, &mut Memory::new());
+        assert_eq!(d.clip.0.as_deref(), Some(LINK));
+    }
+
+    #[test]
+    fn copy_link_button_click_checks_change_count() {
+        let mut d = chrome_desk();
+        d.copy_button = Some((5, LINK.into()));
+        let e = run_all(&[on("copy", "Copy link (button, main)")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
+        assert_eq!(d.clip.0.as_deref(), Some(LINK));
+        // the button did nothing: unsure
+        let mut d = chrome_desk();
+        let e = run_all(&[on("copy", "Copy link (button, main)")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+    }
+
+    #[test]
+    fn type_between_copy_and_paste_keeps_the_link() {
+        let (mut d, mut mem) = (chrome_desk(), Memory::new());
+        d.answers = vec![];
+        let e = run_all(
+            &[on("copy", &format!("{LINK} (text field, main)")), typ("hi", Some("Search (search field, toolbar)")), on("paste", "Message (text area, bottom)")],
+            &mut d,
+            &mut mem,
+        );
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 3]);
+        assert_eq!((d.value(1), d.value(2)), ("hi", LINK));
+        assert_eq!(mem.back().unwrap().e.text, LINK);
+    }
+
+    #[test]
+    fn delete_typed_strategy_table() {
+        // case 15: (desk setup, typed, expected events, expected value after)
+        let typed = |d: &mut FakeDesk, mem: &mut Memory, t: &str| {
+            run_all(&[typ(t, None)], d, mem);
+            (d.acts.clear(), d.selections.clear(), d.sleeps.clear());
+        };
+        // 1. AX range: 2 events (the selection + one Delete)
+        let mut d = FakeDesk { app: "TextEdit".into(), fields: vec![FField::new("AXTextArea", "", "a ", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        typed(&mut d, &mut mem, "hola mundo");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!((d.selections.len(), d.acts.as_slice(), d.value(0)), (1, &[Act::Combo(DELETE, 0)][..], "a "));
+        // 2. undo: the range is refused, nothing changed since the paste -> one Cmd+Z
+        let mut d = FakeDesk { app: "TextEdit".into(), fields: vec![FField { range_ok: false, ..FField::new("AXTextArea", "", "a ", None) }], ..Default::default() };
+        let mut mem = Memory::new();
+        typed(&mut d, &mut mem, "hola mundo");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!((d.acts.as_slice(), d.value(0)), (&[Act::Combo(KEY_Z, CMD)][..], "a "));
+        // 3. word select: the value is not readable -> Opt+Shift+Left per word, one Delete
+        let mut d = FakeDesk { app: "Slack".into(), fields: vec![FField { readable: false, ..FField::new("AXTextArea", "", "a ", None) }], ..Default::default() };
+        let mut mem = Memory::new();
+        typed(&mut d, &mut mem, "hola mundo");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(d.acts, [Act::Burst(LEFT, OPT | SHIFT, 2), Act::Combo(DELETE, 0)]);
+        assert_eq!(d.fields[0].value, "a ");
+        // 4. terminal: one burst of backspaces, no settle sleep around it
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        typed(&mut d, &mut mem, "ls -la");
+        run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(d.acts, [Act::Burst(DELETE, 0, 6)]);
+        assert!(d.sleeps.iter().all(|ms| *ms <= 5), "{:?}", d.sleeps);
+        assert_eq!(d.value(0), "pablo@mac ~ % ");
+        // select_typed in a terminal: unsure, no events
+        typed(&mut d, &mut mem, "ls");
+        let e = run_all(&[act("select_typed")], &mut d, &mut mem);
+        assert_eq!((statuses(&e), d.acts.len()), (vec![CmdStatus::Unsure], 0));
+        // select_typed in a field: the selection, no Delete
+        let mut d = FakeDesk { app: "TextEdit".into(), fields: vec![FField::new("AXTextArea", "", "x ", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        typed(&mut d, &mut mem, "abc");
+        run_all(&[act("select_typed")], &mut d, &mut mem);
+        assert_eq!((d.selections.as_slice(), d.acts.len(), d.fields[0].sel), (&[(2, 3)][..], 0, 3));
+    }
+
+    #[test]
+    fn delete_typed_never_backspaces_past_what_susurro_typed() {
+        // "run ls" then "remove what you typed": Return ran the command, the new prompt holds Pablo's "git"
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        d.answers = vec![Answer::Yes];
+        run_all(&[typ("ls", None), key("return")], &mut d, &mut mem);
+        d.fields[0].insert("\npablo@mac ~ % git");
+        let n = d.acts.len();
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!((statuses(&e), e[0].message.as_deref()), (vec![CmdStatus::Unsure], Some(GONE)));
+        assert_eq!(d.acts.len(), n, "no backspace");
+        assert!(d.value(0).ends_with("% git"));
+        // Slack (no readable value), then a click on another chat: the word select would eat Pablo's words
+        let mut d = chrome_desk();
+        d.fields[2].readable = false;
+        d.focus = 2;
+        let mut mem = Memory::new();
+        run_all(&[typ("hola mundo", None), on("click", "Search (search field, toolbar)")], &mut d, &mut mem);
+        d.focus = 2;
+        let n = d.acts.len();
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+        assert_eq!(d.acts.len(), n);
+        // another app in front with the same words: not susurro's
+        let mut d = FakeDesk { app: "TextEdit".into(), fields: vec![FField::new("AXTextArea", "", "", None)], ..Default::default() };
+        let mut mem = Memory::new();
+        run_all(&[typ("hello", None)], &mut d, &mut mem);
+        mem.back_mut().unwrap().pid = 2;
+        let e = run_all(&[act("delete_typed")], &mut d, &mut mem);
+        assert_eq!((statuses(&e), d.value(0)), (vec![CmdStatus::Unsure], "hello"));
+    }
+
+    #[test]
+    fn words_count_table() {
+        for (t, n) in [("ls", 1), ("ls -la", 2), ("hola mundo", 2), ("https://chatgpt.com/share/6a1f", 5), ("", 1), ("  hi.", 1), ("a_b c", 2), ("über straße", 2)] {
+            assert_eq!(words(t), n, "{t:?}");
+        }
+        assert_eq!(find_range("ls ls", "ls", Some(2)), Some((0, 2)), "the match before the caret");
+        assert_eq!(find_range("ls ls", "ls", None), Some((3, 2)), "else the last");
+        assert_eq!(find_range("é ls", "ls", None), Some((2, 2)), "UTF-16 units, not bytes");
+        assert_eq!(find_range("abc", "x", None), None);
+    }
+
+    #[test]
+    fn blocked_combos_and_secure_fields_never_act() {
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[key("cmd+shift+q")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Blocked]);
+        let e = run_all(&[key("hyper+x")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Unsure]);
+        let mut d = chrome_desk();
+        d.fields[1].secure = true;
+        let e = run_all(&[typ("hunter2", Some("Search (search field, toolbar)"))], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Blocked]);
+        assert!(d.typed.is_empty());
+        assert_eq!(d.acts, [Act::Focus(Target::Mark(3))], "the focus ran, the text did not");
+    }
+
+    #[test]
+    fn abort_is_checked_before_every_event() {
+        let (mut d, mut mem) = (chrome_desk(), Memory::new());
+        d.abort_after_acts = Some(1);
+        let e = run_all(&[key("cmd+a"), key("delete"), typ("x", None)], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Stopped]);
+        assert_eq!(d.acts.len(), 1);
+    }
+
+    #[test]
+    fn risky_click_waits_for_a_yes() {
+        let (mut d, mut mem) = (chrome_desk(), Memory::new());
+        let e = run_all(&[on("click", "Send (button, bottom)")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Stopped], "Send = risky by name, no answer = no click");
+        assert!(d.acts.is_empty());
+        let mut d = chrome_desk();
+        d.answers = vec![Answer::Yes];
+        let e = run_all(&[on("click", "Send (button, bottom)")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(9))]);
+        let mut d = chrome_desk();
+        let e = run_all(&[Action { risky: true, ..key("cmd+backspace") }], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Stopped], "the planner's risky flag confirms too");
+    }
+
+    fn jev_target(choice: &str, conf: f32, risky: f32) -> Value {
+        json!({ "target": { "choice": choice, "probabilities": { choice: conf, "6": 0.2, "1": 0.05 }, "confidence": conf }, "risky": { "noul": risky } })
     }
 
     /// An `ask` that plays the replies in order and records each request.
@@ -1290,314 +2035,41 @@ mod tests {
         (
             move |s: &Value, q: &Value| {
                 s2.lock().unwrap().push((s.clone(), q.clone()));
-                it.next().map(reply).ok_or_else(|| anyhow::anyhow!("no more scripted replies"))
+                it.next().map(|a| Reply { answers: a, cost: 0.0001, latency_ms: 700 }).ok_or_else(|| anyhow::anyhow!("no more scripted replies"))
             },
             seen,
         )
     }
 
-    const CFG: Cfg = Cfg { confirm_risky: true, max_steps: MAX_STEPS };
-
     #[test]
-    fn click_then_done_text_only() {
-        let (mut ask, seen) = script(vec![fast_none(), step("2", 0.95, "click", 0.02, 0.0), step("none", 0.1, "done", 0.0, 0.95)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let end = run("open the design channel", &CFG, &mut ask, &mut d);
-        assert_eq!(end.status, CmdStatus::Done);
+    fn words_off_screen_go_to_jev_and_a_weak_answer_asks_which_one() {
+        // "the share button in the top header": not an exact label -> Jev, text only
+        let (mut ask, seen) = script(vec![jev_target("2", 0.93, 0.05)]);
+        let mut d = chrome_desk();
+        let e = exec(&on("click", "share button in the top header"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
         assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
-        assert_eq!(d.captures, 0, "a confident text answer needs no screenshot");
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
-        assert!(seen[2].0.to_string().contains("1. clicked “# design” (link)"), "the next request says what was done");
-        let statuses: Vec<_> = d.steps.iter().map(|s| (s.step, s.status.clone())).collect();
-        use CmdStatus::*;
-        assert_eq!(statuses, [(1, Thinking), (1, Marks), (1, Aim), (2, Thinking), (2, Marks), (2, Done)]);
-        assert_eq!(d.steps[2].target, Some(2));
-    }
-
-    #[test]
-    fn fast_path_opens_the_app_without_reading_the_screen() {
-        let fast = json!({ "intent": { "choice": "open_app", "confidence": 0.93 }, "app": { "choice": "Slack", "confidence": 0.9 }, "multi": { "noul": 0.05 } });
-        let (mut ask, seen) = script(vec![fast]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let end = run("open slack", &CFG, &mut ask, &mut d);
-        assert_eq!(end.status, CmdStatus::Done);
-        assert_eq!(d.acts, [Act::OpenApp("Slack".into())]);
-        assert_eq!((d.reads, seen.lock().unwrap().len()), (0, 1));
-        assert_eq!((d.steps[0].step, d.steps[0].detail.as_deref()), (0, Some("Slack")));
-        // "open slack and send hi": more than one thing -> the loop runs
-        let fast = json!({ "intent": { "choice": "open_app", "confidence": 0.93 }, "app": { "choice": "Slack", "confidence": 0.9 }, "multi": { "noul": 0.8 } });
-        let (mut ask, _) = script(vec![fast, step("none", 0.1, "done", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        run("open slack and send hi", &CFG, &mut ask, &mut d);
-        assert_eq!(d.reads, 1);
-    }
-
-    #[test]
-    fn spatial_word_retries_with_the_marked_screenshot() {
-        // text 0.95 on #general, image 0.97 on #design: the image wins
-        let (mut ask, seen) = script(vec![fast_none(), step("1", 0.95, "click", 0.0, 0.0), step("2", 0.97, "click", 0.0, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, ..Default::default() };
-        run("open the second channel", &CFG, &mut ask, &mut d);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
-        assert_eq!(d.captures, 1);
-        let seen = seen.lock().unwrap();
-        assert!(seen[2].0[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
-        assert!(seen[1].0.as_array().unwrap().iter().all(|v| v.is_string()), "the first marks call is text only");
-        assert_eq!(seen[1].1["target"]["criteria"]["5"], "Send now (button, main)");
-    }
-
-    #[test]
-    fn the_more_confident_answer_wins() {
-        // RESULTS.md "second channel": text right (0.9), image wrong (0.56) -> keep the text answer
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.9, "click", 0.0, 0.0), step("1", 0.56, "click", 0.0, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, ..Default::default() };
-        run("open the second channel", &CFG, &mut ask, &mut d);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
-    }
-
-    #[test]
-    fn low_confidence_asks_which_one() {
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.6, "click", 0.0, 0.0), step("2", 0.56, "click", 0.0, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, answers: vec![Answer::Text("the second one".into())], ..Default::default() };
-        let end = run("open the channel", &CFG, &mut ask, &mut d);
-        let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).expect("a pick step");
-        assert_eq!(pick.choices.iter().map(|c| c.0).collect::<Vec<_>>(), [2, 1], "top ids, no 'none'");
-        assert_eq!(d.acts, [Act::Click(Target::Mark(1))], "'the second one' = the 2nd in the list");
-        assert_eq!(end.status, CmdStatus::Done);
-        // no answer -> stopped, nothing clicked
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.6, "click", 0.0, 0.0), step("2", 0.56, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, ..Default::default() };
-        assert_eq!(run("open the channel", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert!(d.acts.is_empty());
-    }
-
-    #[test]
-    fn weak_text_answer_without_screen_recording_asks_for_it() {
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.6, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: false, ..Default::default() };
-        let end = run("click the blue thing", &CFG, &mut ask, &mut d);
-        assert_eq!((end.status, end.message.as_deref()), (CmdStatus::Setup, Some("screen_recording")));
-        assert!(d.acts.is_empty());
-    }
-
-    #[test]
-    fn unsure_never_acts() {
-        let (mut ask, _) = script(vec![fast_none(), step("none", 0.9, "click", 0.0, 0.0), step("none", 0.9, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, ..Default::default() };
-        let end = run("click the purple unicorn", &CFG, &mut ask, &mut d);
-        assert_eq!(end.status, CmdStatus::Unsure);
-        assert!(d.acts.is_empty());
-    }
-
-    #[test]
-    fn risky_waits_for_the_command_key() {
-        let mut d = Fake { screens: vec![slack()], answers: vec![Answer::Yes], ..Default::default() };
-        let (mut ask, _) = script(vec![fast_none(), step("5", 0.97, "click", 0.9, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        run("send the message", &CFG, &mut ask, &mut d);
-        assert_eq!(d.waits, [Wait::Confirm]);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
-        // timeout / Esc -> stopped, nothing sent
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let (mut ask, _) = script(vec![fast_none(), step("5", 0.97, "click", 0.9, 0.0)]);
-        assert_eq!(run("send the message", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert!(d.acts.is_empty());
-        // confirm_risky off: acts at once
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let (mut ask, _) = script(vec![fast_none(), step("5", 0.97, "click", 0.9, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        run("send the message", &Cfg { confirm_risky: false, max_steps: 6 }, &mut ask, &mut d);
-        assert!(d.waits.is_empty());
-        assert_eq!(d.acts.len(), 1);
-    }
-
-    #[test]
-    fn abort_is_checked_before_every_action() {
-        // abort lands with the aim step (emitted step 3): nothing is clicked
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.95, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], abort_after: Some(3), ..Default::default() };
-        assert_eq!(run("open the design channel", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert!(d.acts.is_empty());
-        // abort right after the Jev answer (marks emitted = 2 steps)
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.95, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], abort_after: Some(2), ..Default::default() };
-        assert_eq!(run("open the design channel", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert!(d.acts.is_empty());
-        // abort before anything: no Jev call at all
-        let (mut ask, seen) = script(vec![]);
-        let mut d = Fake { screens: vec![slack()], abort_after: Some(0), ..Default::default() };
-        assert_eq!(run("open slack", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert!(seen.lock().unwrap().is_empty());
-        // abort between steps: the 2nd step never reads the screen
-        let (mut ask, _) = script(vec![fast_none(), step("2", 0.95, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], abort_after_acts: Some(1), ..Default::default() };
-        assert_eq!(run("open the design channel", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert_eq!((d.acts.len(), d.reads), (1, 1));
-    }
-
-    #[test]
-    fn step_cap_and_no_double_send() {
-        // scroll forever: stops after 6 steps
-        let replies = std::iter::once(fast_none()).chain((0..6).map(|_| step("none", 0.0, "scroll_down", 0.0, 0.0))).collect();
-        let (mut ask, _) = script(replies);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let end = run("scroll down forever", &CFG, &mut ask, &mut d);
-        assert_eq!((end.status, d.acts.len()), (CmdStatus::Stopped, 6));
-        // the same click twice in a row = done after the first
-        let (mut ask, _) = script(vec![fast_none(), step("5", 0.97, "click", 0.0, 0.0), step("5", 0.97, "click", 0.0, 0.1)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        assert_eq!(run("click send", &Cfg { confirm_risky: false, max_steps: 6 }, &mut ask, &mut d).status, CmdStatus::Done);
-        assert_eq!(d.acts.len(), 1);
-    }
-
-    #[test]
-    fn return_always_confirms() {
-        // VOICE_CONTROL.md: Return sends in chat apps; risky 0.0 still waits for F2
-        let (mut ask, _) = script(vec![fast_none(), step("none", 0.0, "press_key", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        assert_eq!(run("press enter", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert_eq!((d.waits.as_slice(), d.acts.len()), ([Wait::Confirm].as_slice(), 0));
-    }
-
-    #[test]
-    fn a_click_into_a_password_field_never_gets_the_text() {
-        // the focus click turns secure input on: the paste never runs
-        let (mut ask, _) = script(vec![fast_none(), step("3", 0.95, "focus_and_type", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], secure_after_acts: Some(1), ..Default::default() };
-        assert_eq!(run("type hunter2 in the field", &CFG, &mut ask, &mut d).status, CmdStatus::Blocked);
-        assert_eq!(d.acts, [Act::Focus(Target::Mark(3))]);
-    }
-
-    #[test]
-    fn box_click_on_a_password_field_is_blocked() {
-        let bare = Screen { els: vec![], ..slack() };
-        let b = json!({ "top": 0.45, "bottom": 0.55, "left": 0.04, "right": 0.06 });
-        let ans = json!({ "tile": { "choice": "tile_3", "confidence": 0.9 }, "box_3": { "box": b, "confidence": 0.9 }, "visible_3": { "noul": 0.9 },
-                          "action": { "choice": "click", "confidence": 0.9 }, "risky": { "noul": 0.0 } });
-        let (mut ask, _) = script(vec![fast_none(), ans]);
-        let mut d = Fake { screens: vec![bare], screen_ok: true, secure_points: true, ..Default::default() };
-        assert_eq!(run("click the field", &CFG, &mut ask, &mut d).status, CmdStatus::Blocked);
-        assert!(d.acts.is_empty());
-    }
-
-    #[test]
-    fn two_different_unnamed_icons_are_two_steps() {
-        let mut scr = slack();
-        scr.els.push(el(6, "", "button", (10.0, 10.0, 20.0, 20.0)));
-        scr.els.push(el(7, "", "button", (40.0, 10.0, 20.0, 20.0)));
-        let (mut ask, _) = script(vec![fast_none(), step("6", 0.95, "click", 0.0, 0.0), step("7", 0.95, "click", 0.0, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![scr], ..Default::default() };
-        run("click the two icons", &CFG, &mut ask, &mut d);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(6)), Act::Click(Target::Mark(7))]);
-    }
-
-    #[test]
-    fn abort_during_the_text_call_skips_the_screenshot() {
-        // abort lands with the marks emit; the weak text answer must not trigger a capture + 2nd call
-        let (mut ask, seen) = script(vec![fast_none(), step("2", 0.6, "click", 0.0, 0.0), step("2", 0.9, "click", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], screen_ok: true, abort_after: Some(2), ..Default::default() };
-        assert_eq!(run("open the channel", &CFG, &mut ask, &mut d).status, CmdStatus::Stopped);
-        assert_eq!((d.captures, seen.lock().unwrap().len()), (0, 2));
-    }
-
-    #[test]
-    fn typing_and_secure_input() {
-        let (mut ask, _) = script(vec![fast_none(), step("3", 0.95, "focus_and_type", 0.0, 0.0), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        run("type hello in the search field", &CFG, &mut ask, &mut d);
-        assert_eq!(d.acts, [Act::Focus(Target::Mark(3)), Act::Paste("hello".into())]);
-        let (mut ask, _) = script(vec![fast_none(), step("3", 0.95, "focus_and_type", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], secure: true, ..Default::default() };
-        assert_eq!(run("type hunter2 in the field", &CFG, &mut ask, &mut d).status, CmdStatus::Blocked);
-        assert!(d.acts.is_empty());
-        // no text in the instruction: unsure, nothing typed
-        let (mut ask, _) = script(vec![fast_none(), step("3", 0.95, "focus_and_type", 0.0, 0.0)]);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        assert_eq!(run("fill in the search field", &CFG, &mut ask, &mut d).status, CmdStatus::Unsure);
-    }
-
-    #[test]
-    fn box_fallback_for_a_bare_ax_tree() {
-        let bare = Screen { els: vec![el(1, "OK", "button", (750.0, 720.0, 40.0, 20.0))], ..slack() };
-        // 1440x900 @2 = 2880x1800 px -> 2x2 tiles of 720x450 pt; tile 3 (bottom-right), box center (0.05, 0.5) -> (756, 675)
-        let ans = |vis: f32, b: Value| {
-            json!({ "tile": { "choice": "tile_3", "confidence": 0.9 }, "box_3": { "box": b, "confidence": 0.4 }, "visible_3": { "noul": vis },
-                    "action": { "choice": "click", "confidence": 0.9 }, "risky": { "noul": 0.0 } })
-        };
-        let good = json!({ "top": 0.45, "bottom": 0.55, "left": 0.04, "right": 0.06 });
-        let (mut ask, seen) = script(vec![fast_none(), ans(0.9, good.clone()), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![bare.clone(), slack()], screen_ok: true, ..Default::default() };
-        run("click the gear", &CFG, &mut ask, &mut d);
-        assert_eq!(d.captures, 4, "four native tiles");
-        assert_eq!(d.acts, [Act::Click(Target::Point(756.0, 675.0))], "no element within 24 pt");
-        assert_eq!(seen.lock().unwrap()[1].1["box_3"]["type"], "box");
-        // near the OK button (750..790 x 720..740): snaps to it
-        let near = json!({ "top": 0.58, "bottom": 0.62, "left": 0.06, "right": 0.08 }); // (770, 720)
-        let (mut ask, _) = script(vec![fast_none(), ans(0.9, near), step("none", 0.0, "done", 0.0, 0.9)]);
-        let mut d = Fake { screens: vec![bare.clone(), slack()], screen_ok: true, ..Default::default() };
-        run("click ok", &CFG, &mut ask, &mut d);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(1))]);
-        // not visible, or a broken box: never click
-        for (vis, b) in [(0.2, good.clone()), (0.9, json!({ "top": 0.03, "bottom": 0.97, "left": 0.1, "right": 0.2 }))] {
-            let (mut ask, _) = script(vec![fast_none(), ans(vis, b)]);
-            let mut d = Fake { screens: vec![bare.clone()], screen_ok: true, ..Default::default() };
-            assert_eq!(run("click the gear", &CFG, &mut ask, &mut d).status, CmdStatus::Unsure);
-            assert!(d.acts.is_empty());
-        }
-        // no Screen Recording: setup, no capture
-        let (mut ask, _) = script(vec![fast_none()]);
-        let mut d = Fake { screens: vec![bare], ..Default::default() };
-        assert_eq!(run("click the gear", &CFG, &mut ask, &mut d).message.as_deref(), Some("screen_recording"));
-        assert_eq!(d.captures, 0);
-    }
-
-    /// The full decision sequence over HTTP: the real jev::ask against a mock Decisions API.
-    #[test]
-    fn mock_http_decision_sequence() {
-        let mut srv = mockito::Server::new();
-        let bodies = Arc::new(M::new(Vec::<Value>::new()));
-        let b2 = bodies.clone();
-        let replies = [fast_none(), step("5", 0.97, "click", 0.9, 0.0), step("none", 0.0, "done", 0.0, 0.92)];
-        let m = srv
-            .mock("POST", "/api/alpha/decisions")
-            .match_header("authorization", "Bearer sk-or")
-            .with_body_from_request(move |r| {
-                let mut b = b2.lock().unwrap();
-                b.push(serde_json::from_slice(r.body().unwrap()).unwrap());
-                json!({ "answers": replies[b.len() - 1], "usage": { "cost": 0.0001 } }).to_string().into_bytes()
-            })
-            .expect(3)
-            .create();
-        let url = format!("{}/api/alpha/decisions", srv.url());
-        let mut ask = |s: &Value, q: &Value| jev::ask(&url, "sk-or", "typesafe/jev-1.14", s, q);
-        let mut d = Fake { screens: vec![slack()], answers: vec![Answer::Yes], ..Default::default() };
-        let end = run("send the message", &CFG, &mut ask, &mut d);
-        m.assert();
-        assert_eq!(end.status, CmdStatus::Done);
-        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
-        assert_eq!(d.waits, [Wait::Confirm]);
-        let b = bodies.lock().unwrap();
-        assert!(b.iter().all(|b| b["model"] == "typesafe/jev-1.14"));
-        assert_eq!(b[0]["questions"]["intent"]["type"], "choice");
-        assert_eq!(b[1]["questions"]["target"]["criteria"]["none"], "no element on screen fits");
-        assert!(b[1]["questions"].get("done").is_none() && b[2]["questions"]["done"]["type"] == "noul", "done is asked from step 2");
-        assert!(end.summary.contains("clicked “Send now” (button)"));
-        // a 401 ends the run as an error, nothing clicked
-        let m401 = srv.mock("POST", "/x").with_status(401).with_body("{}").create();
-        let url = format!("{}/x", srv.url());
-        let mut ask = |s: &Value, q: &Value| jev::ask(&url, "bad", "typesafe/jev-1.14", s, q);
-        let mut d = Fake { screens: vec![slack()], ..Default::default() };
-        let end = run("send it", &CFG, &mut ask, &mut d);
-        m401.assert();
-        assert_eq!(end.status, CmdStatus::Error);
-        assert!(end.message.unwrap().contains("invalid or missing API key"));
-        assert!(d.acts.is_empty());
+        let q = &seen.lock().unwrap()[0].1;
+        assert_eq!(q["target"]["criteria"]["8"], "Share (button, main)");
+        assert!(q.get("action").is_none(), "grounding asks only target + risky");
+        // weak: the screenshot retry (screen ok), still weak -> pick by voice "la dos" -> mark 2
+        let (mut ask, seen) = script(vec![jev_target("8", 0.5, 0.0), jev_target("8", 0.55, 0.0)]);
+        let mut d = chrome_desk();
+        d.screen_ok = true;
+        d.answers = vec![Answer::Text("el segundo".into())];
+        let e = exec(&on("click", "the share one"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(d.waits, [Wait::Pick]);
+        assert_eq!(e.status, CmdStatus::Done);
+        assert!(d.steps.iter().any(|s| s.status == CmdStatus::Pick && s.choices.len() == 3));
+        assert_eq!(d.acts, [Act::Click(Target::Mark(6))], "the 2nd of the ranked list (8, 6, 1)");
     }
 
     #[test]
     fn ax_tree_to_marks_request() {
         let tree = n("AXWindow", "", (0.0, 0.0, 1440.0, 900.0), (0..6).map(|i| n("AXButton", &format!("B{i}"), (100.0 * i as f64 + 400.0, 400.0, 50.0, 20.0), vec![])).collect());
         let els = ax::collect(&tree, PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 });
-        let (s, q) = marks_request("click B3", "Notes", &[], &els, None);
+        let (s, q) = marks_request("click B3", "Notes", &els, None);
         assert_eq!(q["target"]["criteria"]["4"], "B3 (button, main)");
         assert_eq!(s[0], "Frontmost app: Notes. The options are the clickable elements on screen, from the accessibility tree.");
     }
@@ -1626,6 +2098,8 @@ mod tests {
                     },
                     state: e["state"].as_str().map(String::from),
                     h: 0,
+                    url: None,
+                    value: None,
                 })
                 .collect();
             let png = std::fs::read(dir.join(format!("{page}-marks.png"))).unwrap();
@@ -1638,7 +2112,7 @@ mod tests {
                 };
                 // Over the cap the image retry is skipped (the text answer stands).
                 let mut shot = || (calls.get() < 30).then(|| jev::image(&png, "image/png"));
-                let d = decide(instr, page, &[], &els, &mut ask, &mut shot).unwrap();
+                let d = decide(instr, page, &els, &mut ask, &mut shot).unwrap();
                 let hit = d.target.choice == want.to_string();
                 (hits, total, cost) = (hits + hit as u32, total + 1, cost + d.cost);
                 println!("{page:9} {instr:50} want {want:3} got {:5} conf {:.2} image {} {}", d.target.choice, d.target.confidence, d.used_image, if hit { "HIT" } else { "MISS" });

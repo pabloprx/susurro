@@ -192,6 +192,7 @@ mod mac {
             if let Ok(e) = CGEvent::new_keyboard_event(src.clone(), code, down) {
                 // Explicit flags: drops a still-held fn (or any other modifier) from the event.
                 e.set_flags(flags);
+                e.set_integer_value_field(core_graphics::event::EventField::EVENT_SOURCE_USER_DATA, super::SUSURRO_TAG);
                 e.post(CGEventTapLocation::HID);
             }
         }
@@ -318,6 +319,18 @@ fn pick_target(front: Option<AppRef>, last: Option<AppRef>, me: i32) -> Option<A
     }
 }
 
+/// `pick_target`, but never susurro itself (nothing else seen yet): the recents list then copies instead.
+fn pick_external(front: Option<AppRef>, last: Option<AppRef>, me: i32) -> Option<AppRef> {
+    pick_target(front, last, me).filter(|t| t.pid != me)
+}
+
+/// `target_app`, but None when that would be susurro's own window.
+pub fn external_target() -> Option<AppRef> {
+    let front = frontmost_app();
+    note_front(front.clone());
+    pick_external(front, LAST_EXTERNAL.lock().unwrap().clone(), std::process::id() as i32)
+}
+
 /// Where a dictation or a "paste last" belongs: the app in front, never susurro if another app was
 /// in front before (a click on the overlay or a toast activates susurro).
 pub fn target_app() -> Option<AppRef> {
@@ -342,6 +355,11 @@ pub fn frontmost_app() -> Option<AppRef> {
 /// `target`: the app that was frontmost when the dictation started. If susurro's own window is in front
 /// now (a click in History or a toast), that app comes back to the front before the Cmd+V.
 pub fn paste(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> PasteOutcome {
+    paste_ex(text, o, target).0
+}
+
+/// `paste`, plus the text that went in (smart spacing can add a leading space): voice control remembers it.
+pub fn paste_ex(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> (PasteOutcome, String) {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::event::CGEventFlags;
@@ -349,14 +367,14 @@ pub fn paste(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> PasteOutcome
         if let Some(why) = crate::test_hooks::paste_blocked() {
             // Pablo uses this Mac during tests: no keys and no clipboard write outside the test target.
             log::warn!("test paste guard: {why}; not pasting {} chars", text.chars().count());
-            return PasteOutcome::CopiedOnly;
+            return (PasteOutcome::CopiedOnly, text.into());
         }
         mac::flush_restore();
         let pb = mac::general();
         if !crate::permissions::accessibility_trusted() {
             // CGEvent cannot post without Accessibility: leave the text on the clipboard, no restore.
             mac::write_text(&pb, text, false);
-            return PasteOutcome::CopiedOnly;
+            return (PasteOutcome::CopiedOnly, text.into());
         }
         let me = std::process::id() as i32;
         let mut front = mac::frontmost_app();
@@ -369,7 +387,7 @@ pub fn paste(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> PasteOutcome
         log::info!("paste: app {:?}, focus {role:?} settable={settable} -> {verdict:?}", front.as_ref().and_then(|f| f.bundle_id.as_deref()));
         if verdict == Field::NotEditable {
             mac::write_text(&pb, text, false);
-            return PasteOutcome::NoField;
+            return (PasteOutcome::NoField, text.into());
         }
         let text = smart_space(text, &before);
         let snap = if o.restore_clipboard { mac::snapshot(&pb) } else { None };
@@ -382,12 +400,12 @@ pub fn paste(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> PasteOutcome
             let bundle = front.as_ref().and_then(|f| f.bundle_id.as_deref());
             mac::restore_later(ours, snap, restore_delay(bundle, o.restore_delay_ms));
         }
-        PasteOutcome::Pasted
+        (PasteOutcome::Pasted, text)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (text, o, target);
-        PasteOutcome::CopiedOnly
+        let _ = (o, target);
+        (PasteOutcome::CopiedOnly, text.into())
     }
 }
 
@@ -400,19 +418,126 @@ pub fn press_enter() {
     mac::key(36, core_graphics::event::CGEventFlags::empty()); // kVK_Return
 }
 
-/// One key press (voice control): `cmd` adds Command. Same test guard as the paste.
-pub fn key_press(code: u16, cmd: bool) {
+/// `EventField::EVENT_SOURCE_USER_DATA` of every event susurro posts: the user-input monitor skips them.
+pub const SUSURRO_TAG: i64 = 0x5355_5355;
+
+pub const CMD: u64 = 0x0010_0000;
+pub const SHIFT: u64 = 0x0002_0000;
+pub const CTRL: u64 = 0x0004_0000;
+pub const OPT: u64 = 0x0008_0000;
+
+/// macOS virtual keycodes (HIToolbox Events.h, ANSI layout).
+const KEYCODES: [(&str, u16); 79] = [
+    ("a", 0), ("s", 1), ("d", 2), ("f", 3), ("h", 4), ("g", 5), ("z", 6), ("x", 7), ("c", 8), ("v", 9), ("b", 11),
+    ("q", 12), ("w", 13), ("e", 14), ("r", 15), ("y", 16), ("t", 17), ("1", 18), ("2", 19), ("3", 20), ("4", 21),
+    ("6", 22), ("5", 23), ("=", 24), ("9", 25), ("7", 26), ("-", 27), ("8", 28), ("0", 29), ("]", 30), ("o", 31),
+    ("u", 32), ("[", 33), ("i", 34), ("p", 35), ("return", 36), ("l", 37), ("j", 38), ("'", 39), ("k", 40), (";", 41),
+    ("\\", 42), (",", 43), ("/", 44), ("n", 45), ("m", 46), (".", 47), ("tab", 48), ("space", 49), ("`", 50),
+    ("delete", 51), ("escape", 53), ("forward_delete", 117), ("home", 115), ("end", 119), ("page_up", 116),
+    ("page_down", 121), ("left", 123), ("right", 124), ("down", 125), ("up", 126), ("f1", 122), ("f2", 120),
+    ("f3", 99), ("f4", 118), ("f5", 96), ("f6", 97), ("f7", 98), ("f8", 100), ("f9", 101), ("f10", 109), ("f11", 103),
+    ("f12", 111), ("f13", 105), ("f14", 107), ("f15", 113), ("f16", 106), ("f17", 64), ("f18", 79),
+];
+
+/// "return", "F12", "page_down", "a" -> the keycode. Aliases: enter, backspace, esc, pageup, arrow names, minus...
+pub fn keycode(name: &str) -> Option<u16> {
+    let n = name.trim().to_lowercase().replace([' ', '-'], "_");
+    let n = match n.as_str() {
+        "enter" | "ret" => "return",
+        "backspace" | "back_space" | "del" => "delete",
+        "fwd_delete" | "forwarddelete" | "delete_forward" => "forward_delete",
+        "esc" => "escape",
+        "pageup" | "pgup" => "page_up",
+        "pagedown" | "pgdn" => "page_down",
+        "arrowleft" | "arrow_left" | "leftarrow" => "left",
+        "arrowright" | "arrow_right" | "rightarrow" => "right",
+        "arrowup" | "arrow_up" | "uparrow" => "up",
+        "arrowdown" | "arrow_down" | "downarrow" => "down",
+        "minus" | "_" => "-",
+        "equal" | "equals" | "plus" => "=",
+        "comma" => ",",
+        "period" | "dot" => ".",
+        "slash" => "/",
+        "backslash" => "\\",
+        "semicolon" => ";",
+        "quote" | "apostrophe" => "'",
+        "backtick" | "grave" => "`",
+        "left_bracket" | "bracketleft" => "[",
+        "right_bracket" | "bracketright" => "]",
+        "spacebar" => "space",
+        other => other,
+    };
+    KEYCODES.iter().find(|k| k.0 == n).map(|k| k.1)
+}
+
+/// "cmd+shift+left", "Command+T", "opt+backspace", "return" -> (keycode, CGEventFlags bits).
+pub fn parse_combo(s: &str) -> Result<(u16, u64), String> {
+    let mut flags = 0;
+    let mut key = None;
+    // "cmd++" (zoom in) = cmd and the "+" on the "=" key.
+    let s2 = match s.trim().strip_suffix("++") {
+        Some(p) => format!("{p}+="),
+        None if s.trim() == "+" => "=".into(),
+        None => s.to_string(),
+    };
+    for p in s2.split('+').map(str::trim) {
+        let f = match p.to_lowercase().as_str() {
+            "cmd" | "command" | "meta" | "super" | "⌘" => CMD,
+            "opt" | "option" | "alt" | "⌥" => OPT,
+            "ctrl" | "control" | "⌃" => CTRL,
+            "shift" | "⇧" => SHIFT,
+            _ => 0,
+        };
+        if f != 0 {
+            flags |= f;
+            continue;
+        }
+        if key.is_some() {
+            return Err(format!("\"{s}\": one key only"));
+        }
+        key = Some(keycode(p).ok_or_else(|| format!("\"{s}\": unknown key \"{p}\""))?);
+    }
+    key.map(|k| (k, flags)).ok_or_else(|| format!("\"{s}\": no key"))
+}
+
+/// Combos voice control never sends: log out, lock screen, force quit.
+pub fn blocked_combo(code: u16, flags: u64) -> bool {
+    let q = keycode("q") == Some(code);
+    let esc = keycode("escape") == Some(code);
+    (q && flags & CMD != 0 && flags & (SHIFT | CTRL) != 0) || (esc && flags & CMD != 0 && flags & OPT != 0)
+}
+
+/// One key with modifiers (voice control). Same test guard as the paste.
+pub fn combo(code: u16, flags: u64) {
+    burst(code, flags, 1);
+}
+
+/// The same key `n` times, 4 ms apart (fast delete in a terminal).
+pub fn burst(code: u16, flags: u64, n: u32) {
     #[cfg(debug_assertions)]
     if let Some(why) = crate::test_hooks::paste_blocked() {
-        return log::warn!("test paste guard: {why}; not pressing key {code}");
+        return log::warn!("test paste guard: {why}; not pressing key {code} x{n}");
     }
     #[cfg(target_os = "macos")]
-    {
-        use core_graphics::event::CGEventFlags;
-        mac::key(code, if cmd { CGEventFlags::CGEventFlagCommand } else { CGEventFlags::empty() });
+    for i in 0..n {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        mac::key(code, core_graphics::event::CGEventFlags::from_bits_truncate(flags));
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (code, cmd);
+    let _ = (code, flags, n);
+}
+
+/// Clipboard text and the pasteboard change count (a copy moved it or not).
+pub fn clipboard() -> (Option<String>, isize) {
+    #[cfg(target_os = "macos")]
+    {
+        let pb = mac::general();
+        return (pb.stringForType(unsafe { objc2_app_kit::NSPasteboardTypeString }).map(|s| s.to_string()), pb.changeCount());
+    }
+    #[cfg(not(target_os = "macos"))]
+    (None, 0)
 }
 
 /// Put text on the clipboard and leave it there (copy last transcript).
@@ -436,6 +561,41 @@ pub fn clipboard_text() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_combo_table() {
+        assert_eq!(parse_combo("cmd+t"), Ok((17, CMD)));
+        assert_eq!(parse_combo("Command+Shift+Left"), Ok((123, CMD | SHIFT)));
+        assert_eq!(parse_combo("opt+backspace"), Ok((51, OPT)));
+        assert_eq!(parse_combo("enter"), Ok((36, 0)), "enter = return");
+        assert_eq!(parse_combo("ctrl+alt+f5"), Ok((96, CTRL | OPT)));
+        assert_eq!(parse_combo("cmd+1"), Ok((18, CMD)));
+        assert_eq!(parse_combo("cmd+a"), Ok((0, CMD)));
+        assert_eq!(parse_combo("F12"), Ok((111, 0)));
+        assert_eq!(parse_combo("cmd+shift+]"), Ok((30, CMD | SHIFT)));
+        assert_eq!(parse_combo("cmd++"), Ok((24, CMD)));
+        assert_eq!(parse_combo("page down"), Ok((121, 0)));
+        assert!(parse_combo("cmd+").is_err());
+        assert!(parse_combo("cmd").is_err(), "no key");
+        assert!(parse_combo("cmd+t+w").is_err(), "two keys");
+        assert!(parse_combo("hyper+x").is_err(), "unknown name");
+        assert_eq!(keycode("Escape"), Some(53));
+        assert_eq!(keycode("forward delete"), Some(117));
+    }
+
+    #[test]
+    fn blocked_combos() {
+        let b = |s: &str| {
+            let (k, f) = parse_combo(s).unwrap();
+            blocked_combo(k, f)
+        };
+        for s in ["cmd+shift+q", "ctrl+cmd+q", "cmd+opt+esc", "cmd+opt+shift+q"] {
+            assert!(b(s), "{s}");
+        }
+        for s in ["cmd+q", "cmd+w", "cmd+t", "escape", "opt+esc", "ctrl+q"] {
+            assert!(!b(s), "{s}");
+        }
+    }
 
     #[test]
     fn snapshot_skips_files_and_huge_clipboards() {
@@ -467,6 +627,10 @@ mod tests {
         assert_eq!(pick_target(app(9), app(2), 9), app(2), "a click on the overlay activated susurro");
         assert_eq!(pick_target(app(9), None, 9), app(9), "nothing else seen yet");
         assert_eq!(pick_target(None, app(2), 9), None);
+        // the recents list never pastes into susurro itself
+        assert_eq!(pick_external(app(9), None, 9), None);
+        assert_eq!(pick_external(app(9), app(2), 9), app(2));
+        assert_eq!(pick_external(app(1), app(2), 9), app(1));
     }
 
     #[test]

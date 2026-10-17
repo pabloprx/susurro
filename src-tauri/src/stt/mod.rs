@@ -68,12 +68,11 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
         }),
         SttProvider::OpenRouter => {
             anyhow::ensure!(!st.openrouter_model.is_empty(), "Pick an OpenRouter transcription model first");
-            let clean_key = secrets::get(crate::cleanup::key_name(s));
             Box::new(openrouter::OpenRouter {
                 base: OPENROUTER_BASE.into(),
                 model: st.openrouter_model.clone(),
                 key: secrets::get(KeyName::Openrouter).ok_or_else(|| anyhow::anyhow!("Add an OpenRouter API key first"))?,
-                clean: crate::cleanup::effective_level(s, clean_key.as_deref()) != crate::contract::CleanupLevel::None,
+                clean: st.mai_clean,
             })
         }
         SttProvider::ElevenLabs => Box::new(elevenlabs::ElevenLabs {
@@ -125,8 +124,38 @@ pub(crate) fn http() -> &'static reqwest::blocking::Client {
     C.get_or_init(reqwest::blocking::Client::new)
 }
 
+/// Waits before each retry of a 429 / 5xx (vc-feedback 16: never show the first rate limit). A Retry-After header wins.
+#[cfg(not(test))]
+const BACKOFF_MS: [u64; 3] = [300, 800, 2000];
+#[cfg(test)]
+const BACKOFF_MS: [u64; 3] = [1, 1, 1];
+/// The longest Retry-After we honor; a longer one fails now (the user would wait for nothing).
+const RETRY_AFTER_MAX_MS: u64 = 5000;
+
 /// Sends the request and returns the JSON body. Maps transport and HTTP errors to clear messages.
-pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> anyhow::Result<serde_json::Value> {
+/// A 429 or 5xx is retried silently (3 times, 300 ms / 800 ms / 2 s, or Retry-After). Streamed bodies (multipart)
+/// cannot be cloned and get no retry.
+pub(crate) fn send_json(mut rb: reqwest::blocking::RequestBuilder, what: &str) -> anyhow::Result<serde_json::Value> {
+    for (i, wait) in BACKOFF_MS.iter().enumerate() {
+        let Some(again) = rb.try_clone() else { break };
+        match send_once(rb, what) {
+            Err((e, Some(after))) => {
+                let ms = after.unwrap_or(*wait);
+                if ms > RETRY_AFTER_MAX_MS {
+                    return Err(e);
+                }
+                log::info!("{what}: {e:#}; retry {} in {ms} ms", i + 1);
+                std::thread::sleep(Duration::from_millis(ms));
+                rb = again;
+            }
+            r => return r.map_err(|e| e.0),
+        }
+    }
+    send_once(rb, what).map_err(|e| e.0)
+}
+
+/// Err.1 = Some(Retry-After ms) when the error is worth a retry (429, 5xx).
+fn send_once(rb: reqwest::blocking::RequestBuilder, what: &str) -> Result<serde_json::Value, (anyhow::Error, Option<Option<u64>>)> {
     let resp = rb.send().map_err(|e| {
         if e.is_timeout() {
             anyhow::anyhow!("{what} timed out")
@@ -135,9 +164,15 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
         } else {
             anyhow::anyhow!("{what} request failed: {e}")
         }
-    })?;
+    }).map_err(|e| (e, None))?;
     let code = resp.status().as_u16();
-    let body = resp.text().map_err(|e| anyhow::anyhow!("{what}: reading the response failed: {e}"))?;
+    let after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok()).map(|s| (s * 1000.0) as u64);
+    let retry = (code == 429 || code >= 500).then_some(after);
+    let body = resp.text().map_err(|e| (anyhow::anyhow!("{what}: reading the response failed: {e}"), retry))?;
+    http_result(code, &body, what).map_err(|e| (e, retry))
+}
+
+fn http_result(code: u16, body: &str, what: &str) -> anyhow::Result<serde_json::Value> {
     let snippet: String = body.chars().take(300).collect();
     // OpenRouter 402/403-budget and ElevenLabs 401-quota_exceeded: the key is fine, the account is not.
     let out_of_credits = code == 402 || {
@@ -145,9 +180,9 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
         ["quota", "budget", "credit"].iter().any(|w| l.contains(w))
     };
     match code {
-        200..=299 => serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
+        200..=299 => serde_json::from_str(body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
         401..=403 if out_of_credits => anyhow::bail!("{what}: out of credits or over quota (HTTP {code}): {snippet}"),
-        401 | 403 => match server_reason(&body) {
+        401 | 403 => match server_reason(body) {
             // "API key expired" vs a typo: pass the server's reason on.
             Some(r) => anyhow::bail!("{what}: invalid or missing API key (HTTP {code}): {r}"),
             None => anyhow::bail!("{what}: invalid or missing API key (HTTP {code})"),
@@ -359,6 +394,33 @@ mod tests {
         let e = send_json(http().get(format!("{}/x", srv.url())), "Prov").unwrap_err().to_string();
         assert_eq!(e, "Prov: invalid or missing API key (HTTP 401): API key expired");
         m.remove();
+    }
+
+    #[test]
+    fn rate_limits_and_5xx_retry_silently_then_fail() {
+        // vc-feedback 16: 429 / 5xx never reach the user on the first hit.
+        let mut srv = mockito::Server::new();
+        let busy = srv.mock("POST", "/x").with_status(429).with_header("retry-after", "0").expect(2).create();
+        let ok = srv.mock("POST", "/x").with_body(r#"{"ok":1}"#).expect(1).create();
+        let v = send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({"a": 1})), "Prov").unwrap();
+        assert_eq!(v["ok"], 1);
+        busy.assert();
+        ok.assert();
+        busy.remove();
+        ok.remove();
+        let down = srv.mock("POST", "/x").with_status(503).with_body("down").expect(4).create();
+        let e = send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").unwrap_err().to_string();
+        down.assert();
+        assert!(e.contains("server error (HTTP 503)"), "{e}");
+        down.remove();
+        // a 400 is the request's fault: no retry; a long Retry-After fails now
+        let bad = srv.mock("POST", "/x").with_status(400).expect(1).create();
+        assert!(send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").is_err());
+        bad.assert();
+        bad.remove();
+        let long = srv.mock("POST", "/x").with_status(429).with_header("retry-after", "60").expect(1).create();
+        assert!(send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").is_err());
+        long.assert();
     }
 
     #[test]
