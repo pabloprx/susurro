@@ -4,7 +4,8 @@
 use crate::AppState;
 use crate::audio::{self, Clip, Recorder};
 use crate::cleanup;
-use crate::contract::{CleanupLevel, HistoryItem, HistoryKind, HistoryStatus, Phase, SessionState, SttProvider, Toast, ToastActionDef, ToastKind};
+use crate::command;
+use crate::contract::{CleanupLevel, CmdStatus, CommandStep, HistoryItem, HistoryKind, HistoryStatus, KeyName, Phase, SessionState, SttProvider, Toast, ToastActionDef, ToastKind};
 use crate::dictionary::{self, Dictionary, Hints};
 use crate::history;
 use crate::paste::{self, AppRef, PasteOutcome};
@@ -31,6 +32,11 @@ pub enum SessionCmd {
     ToastAction { toast_id: String, action_id: String },
     /// history_paste: hide susurro, paste into the app behind it.
     PasteText(String),
+    /// Voice control key (hotkeys.command): hold = speak a command; while a step waits: confirm / answer.
+    CmdDown,
+    CmdUp,
+    /// The command thread finished (command.rs).
+    CommandEnded(Box<crate::command::Ended>),
     Shutdown,
 }
 
@@ -214,6 +220,25 @@ pub fn run_pipeline(state: &AppState, clip: &Clip, bundle: Option<&str>) -> Run 
     Run { outcome, provider: provider_label(&s, fell_back), level }
 }
 
+/// A voice command's text: the pipeline STT + dictionary corrections, no cleanup LLM, no spoken punctuation.
+fn command_text(state: &AppState, clip: &Clip) -> Outcome {
+    let s = state.settings.read().unwrap().clone();
+    let entries = dictionary::load(&state.db.lock().unwrap()).unwrap_or_default();
+    let d = Dictionary::new(entries, s.dictionary.clone());
+    let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);
+    let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false };
+    pipeline::run(clip, &opts, &d, &stt_fn, None)
+}
+
+/// History status of a finished command (contract: stopped / unsure / blocked = cancelled, setup / error = failed).
+fn command_status(s: &CmdStatus) -> HistoryStatus {
+    match s {
+        CmdStatus::Done => HistoryStatus::Done,
+        CmdStatus::Setup | CmdStatus::Error => HistoryStatus::Failed,
+        _ => HistoryStatus::Cancelled,
+    }
+}
+
 // ---------- actor ----------
 
 static CURRENT: LazyLock<Mutex<SessionState>> = LazyLock::new(Default::default);
@@ -257,6 +282,12 @@ struct Actor {
     last_sweep: Option<Instant>,
     /// The current recording / processing / acting belongs to a voice command.
     command: bool,
+    /// The command thread runs (Phase::Acting). The machine is idle meanwhile.
+    acting: bool,
+    /// This recording answers the runner's "Which one?".
+    answering: bool,
+    /// The app and start time of the running command (its History row).
+    cmd_ctx: Option<Ctx>,
 }
 
 /// Start the actor: std::thread with a recv_timeout(100ms) loop. lib.rs setup already calls this.
@@ -264,11 +295,16 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
     std::thread::Builder::new()
         .name("session".into())
         .spawn(move || {
-            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None, command: false };
+            let mut a = Actor { app, m: Machine::new(true, Duration::from_secs(600)), rec: None, ctx: None, kept: None, failed: None, idle_at: None, last_text: None, last_sweep: None, command: false, acting: false, answering: false, cmd_ctx: None };
             // Busy guard: hotkey input that queued up while the (blocking) pipeline ran is dropped.
+            // Exception: Esc / F2 pressed during a command's STT still stop the command it starts.
             let drain = |a: &mut Actor, rx: &mpsc::Receiver<SessionCmd>| {
-                for c in rx.try_iter().filter(|c| !is_hotkey_input(c)).collect::<Vec<_>>() {
-                    a.handle(c);
+                for c in rx.try_iter().collect::<Vec<_>>() {
+                    if !is_hotkey_input(&c) {
+                        a.handle(c);
+                    } else if stops_command(a.acting, &c) {
+                        command::abort();
+                    }
                 }
             };
             loop {
@@ -291,9 +327,14 @@ pub fn spawn(app: AppHandle, rx: mpsc::Receiver<SessionCmd>) {
         .expect("spawn session actor");
 }
 
+/// A dropped key that still stops the command the pipeline just started (ABORT is reset at its spawn, before the drain).
+fn stops_command(acting: bool, c: &SessionCmd) -> bool {
+    acting && matches!(c, SessionCmd::Cancel | SessionCmd::CmdDown)
+}
+
 /// Input the busy guard drops (pressed while the pipeline ran).
 fn is_hotkey_input(c: &SessionCmd) -> bool {
-    matches!(c, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle | SessionCmd::Stop | SessionCmd::Cancel | SessionCmd::DeviceLost)
+    matches!(c, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle | SessionCmd::Stop | SessionCmd::Cancel | SessionCmd::DeviceLost | SessionCmd::CmdDown | SessionCmd::CmdUp)
 }
 
 impl Actor {
@@ -351,7 +392,42 @@ impl Actor {
             (s.hotkeys.double_tap, Duration::from_secs(s.recording.max_seconds.max(1) as u64))
         };
         (self.m.double_tap, self.m.max) = (dt, max);
+        // A command (recording or acting) owns the session: the dictation keys wait.
+        if self.command && matches!(cmd, SessionCmd::PttDown | SessionCmd::PttUp | SessionCmd::Toggle) {
+            return false;
+        }
         let ev = match cmd {
+            SessionCmd::CmdDown => match (self.acting, command::waiting()) {
+                (true, Some(command::Wait::Confirm)) => {
+                    command::confirm();
+                    return false;
+                }
+                (true, Some(command::Wait::Pick)) if self.m.phase() == Phase::Idle => {
+                    self.answering = true;
+                    Ev::Down
+                }
+                (true, Some(command::Wait::Pick)) => return false,
+                // F2 while a command acts = stop it
+                (true, None) => {
+                    command::abort();
+                    return false;
+                }
+                (false, _) if self.m.phase() == Phase::Idle && self.state().settings.read().unwrap().command.enabled => {
+                    self.command = true;
+                    Ev::Down
+                }
+                _ => return false,
+            },
+            SessionCmd::CmdUp if self.command && (!self.acting || self.answering) => Ev::Up,
+            SessionCmd::CmdUp => return false,
+            SessionCmd::Cancel if self.acting && self.m.phase() == Phase::Idle => {
+                command::abort();
+                return false;
+            }
+            SessionCmd::CommandEnded(e) => {
+                self.command_ended(*e);
+                return false;
+            }
             SessionCmd::PttDown => Ev::Down,
             SessionCmd::PttUp => Ev::Up,
             SessionCmd::Toggle => Ev::Toggle,
@@ -420,6 +496,9 @@ impl Actor {
             }
             SessionCmd::Shutdown => return false,
         };
+        if self.command {
+            self.m.double_tap = false; // a command is hold-only
+        }
         self.act(ev, now)
     }
 
@@ -429,6 +508,7 @@ impl Actor {
             Act::Start { locked } => self.start(locked),
             Act::Lock => self.set(Phase::Locked, None),
             Act::Warn => toast(&self.app, None, "time-left", ToastKind::Warn, "1 minute left", &[], 4000),
+            Act::Discard | Act::CancelUndoable if self.command => self.drop_command_recording(),
             Act::Discard => {
                 self.rec = None;
                 self.ctx = None;
@@ -495,7 +575,111 @@ impl Actor {
         }
     }
 
+    /// Esc while speaking a command: no Undo toast (Undo would paste it as a dictation). During a pick it stops the run.
+    fn drop_command_recording(&mut self) {
+        self.rec = None;
+        self.ctx = None;
+        if self.acting {
+            self.answering = false;
+            command::abort();
+            self.set(Phase::Acting, None);
+        } else {
+            self.command = false;
+            self.set(Phase::Idle, None);
+        }
+    }
+
+    /// STT the spoken command, then run it on the command thread (Phase::Acting until CommandEnded).
+    fn process_command(&mut self, clip: Clip, ctx: Ctx) {
+        self.ping(Ping::Stop);
+        self.ctx = Some(ctx);
+        self.set(Phase::Processing, None);
+        let outcome = command_text(self.state(), &clip);
+        self.m.idle();
+        let ctx = self.ctx.take().unwrap();
+        let text = match outcome {
+            Outcome::Text(d) => Some(d.final_text),
+            Outcome::Skip(None) => None,
+            Outcome::Skip(Some(m)) | Outcome::Failed(m) if !self.answering => {
+                self.command = false;
+                return self.fail(short(&m));
+            }
+            Outcome::Skip(Some(_)) | Outcome::Failed(_) => None,
+        };
+        if self.answering {
+            self.answering = false;
+            command::answer(text.unwrap_or_default());
+            return self.set(Phase::Acting, None);
+        }
+        let Some(instr) = text.filter(|t| !t.trim().is_empty()) else {
+            self.command = false;
+            return self.set(Phase::Idle, None);
+        };
+        let cfg = self.state().settings.read().unwrap().command.clone();
+        let setup = |a: &AppHandle, what: &str| {
+            let st = CommandStep { instruction: instr.clone(), step: 1, max: command::MAX_STEPS, status: CmdStatus::Setup, message: Some(what.into()), ..Default::default() };
+            command::publish(a, st);
+        };
+        let Some(key) = secrets::get(KeyName::Openrouter) else {
+            setup(&self.app, "key");
+            self.command = false;
+            return self.set(Phase::Idle, None);
+        };
+        if !crate::permissions::accessibility_trusted() {
+            setup(&self.app, "accessibility");
+            self.command = false;
+            return self.set(Phase::Idle, None);
+        }
+        log::info!("command: {instr:?}");
+        self.cmd_ctx = Some(ctx);
+        self.acting = true;
+        self.set(Phase::Acting, None);
+        command::spawn(self.app.clone(), instr, cfg, key);
+    }
+
+    /// The command thread ended: back to Idle, and a History row (kind command) when history is on.
+    fn command_ended(&mut self, e: command::Ended) {
+        (self.acting, self.answering, self.command) = (false, false, false);
+        if self.rec.take().is_some() {
+            self.ctx = None;
+            self.m.idle();
+        }
+        let ctx = self.cmd_ctx.take();
+        let (s, data_dir) = (self.state().settings.read().unwrap().clone(), self.state().data_dir.clone());
+        if s.privacy.store_history {
+            let status = command_status(&e.end.status);
+            let item = HistoryItem {
+                id: 0,
+                created_at: ctx.as_ref().map_or_else(history::now_ms, |c| c.started_at),
+                kind: HistoryKind::Command,
+                app_bundle: ctx.as_ref().and_then(|c| c.app.as_ref().and_then(|a| a.bundle_id.clone())),
+                app_name: ctx.as_ref().and_then(|c| c.app.as_ref().and_then(|a| a.name.clone())),
+                words: history::words(&e.instruction),
+                raw: e.instruction,
+                final_text: e.end.summary,
+                provider: format!("jev:{}", s.command.model),
+                cleanup: None,
+                duration_ms: 0,
+                latency_ms: e.latency_ms,
+                error: e.end.message.filter(|_| status != HistoryStatus::Done),
+                status,
+                has_audio: false,
+            };
+            let db = self.state().db.lock().unwrap();
+            match history::insert(&db, &data_dir, &item, None) {
+                Ok(item) => {
+                    let _ = self.app.emit_to("main", "history_added", item);
+                }
+                Err(e) => log::error!("history insert (command): {e:#}"),
+            }
+        }
+        self.set(Phase::Idle, None);
+    }
+
     fn process(&mut self, clip: Clip, ctx: Ctx) {
+        if self.command {
+            return self.process_command(clip, ctx);
+        }
         self.ping(Ping::Stop);
         self.ctx = Some(ctx);
         self.set(Phase::Processing, None);
@@ -686,7 +870,7 @@ impl Actor {
         let busy = self.act(Ev::Tick, now);
         if self.idle_at.is_some_and(|t| now >= t) {
             self.idle_at = None;
-            if self.m.phase() == Phase::Idle {
+            if self.m.phase() == Phase::Idle && !self.acting {
                 self.set(Phase::Idle, None);
             }
         }
@@ -759,6 +943,13 @@ mod tests {
     use super::*;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn keys_dropped_during_the_command_stt_still_stop_it() {
+        assert!(stops_command(true, &SessionCmd::Cancel) && stops_command(true, &SessionCmd::CmdDown));
+        assert!(!stops_command(true, &SessionCmd::PttDown) && !stops_command(true, &SessionCmd::CmdUp));
+        assert!(!stops_command(false, &SessionCmd::Cancel), "a dictation: dropped as before");
+    }
 
     fn m() -> (Machine, Instant) {
         (Machine::new(true, Duration::from_secs(600)), Instant::now())

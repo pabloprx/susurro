@@ -397,6 +397,21 @@ pub fn press_enter() {
     mac::key(36, core_graphics::event::CGEventFlags::empty()); // kVK_Return
 }
 
+/// One key press (voice control): `cmd` adds Command. Same test guard as the paste.
+pub fn key_press(code: u16, cmd: bool) {
+    #[cfg(debug_assertions)]
+    if let Some(why) = crate::test_hooks::paste_blocked() {
+        return log::warn!("test paste guard: {why}; not pressing key {code}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::event::CGEventFlags;
+        mac::key(code, if cmd { CGEventFlags::CGEventFlagCommand } else { CGEventFlags::empty() });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (code, cmd);
+}
+
 /// Put text on the clipboard and leave it there (copy last transcript).
 pub fn copy(text: &str) {
     #[cfg(target_os = "macos")]

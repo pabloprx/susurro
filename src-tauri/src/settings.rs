@@ -85,7 +85,8 @@ fn whisper_changed(old: &Settings, new: &Settings) -> bool {
 }
 
 /// The bindings that are live: voice control off = its key is not registered, so it cannot clash.
-fn active_hotkeys(s: &Settings) -> Hotkeys {
+/// The bindings to register: the command key only while voice control is on.
+pub fn active_hotkeys(s: &Settings) -> Hotkeys {
     let mut h = s.hotkeys.clone();
     if !s.command.enabled {
         h.command.clear();
@@ -103,11 +104,12 @@ pub fn save_settings(
     use tauri::Manager;
     use tauri_plugin_autostart::ManagerExt;
 
-    crate::hotkey::validate(&active_hotkeys(&settings)).map_err(|e| e.join("; "))?;
+    let active = active_hotkeys(&settings);
+    crate::hotkey::validate(&active).map_err(|e| e.join("; "))?;
     let old = state.settings.read().unwrap().clone();
-    if old.hotkeys != settings.hotkeys {
+    if active_hotkeys(&old) != active {
         if let Some(h) = app.try_state::<crate::hotkey::HotkeyHandle>() {
-            h.update(&settings.hotkeys).map_err(|e| e.to_string())?;
+            h.update(&active).map_err(|e| e.to_string())?;
         }
     }
     // A test instance (isolated data dir) must not register itself as a login item.

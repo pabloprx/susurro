@@ -1,6 +1,6 @@
 //! WP4: binding parse + validation, modifier-only CGEventTap (Fn, Right Option, ...), global-shortcut registration (PLAN 4.1).
 //! This module turns keys into SessionCmds. The hold / double-tap timing lives in session.rs (PLAN 4.2).
-//! Esc (`cancel`) is registered only while session_state is Recording or Locked.
+//! Esc (`cancel`) is registered only while session_state is Recording, Locked, Acting or Processing a voice command.
 
 use crate::contract::{HotkeyStatus, Hotkeys, Phase, SessionState};
 use crate::session::SessionCmd;
@@ -288,9 +288,15 @@ impl ModMachine {
 
 // ---------- runtime ----------
 
+/// Esc is live while recording, while a command acts, and while a command's speech is transcribed (so Esc stops it
+/// instead of reaching the app in front).
+fn cancel_on(s: &SessionState) -> bool {
+    matches!(s.phase, Phase::Recording | Phase::Locked | Phase::Acting) || (s.phase == Phase::Processing && s.command)
+}
+
 /// Paused drops new input, but a release or cancel still ends a hold that started before the pause.
 fn passes(paused: bool, cmd: &SessionCmd) -> bool {
-    !paused || matches!(cmd, SessionCmd::PttUp | SessionCmd::Cancel)
+    !paused || matches!(cmd, SessionCmd::PttUp | SessionCmd::CmdUp | SessionCmd::Cancel)
 }
 
 const NO_KEY: usize = usize::MAX;
@@ -371,6 +377,13 @@ impl Inner {
             errs.push(format!("{}: {e}", b.ptt));
         } else {
             *self.ptt_error.lock().unwrap() = None;
+        }
+        // Voice control: hold to speak; a press while a step waits confirms it (session.rs). "" = off.
+        let command = b.command.trim();
+        if !command.is_empty() {
+            if let Err(e) = self.bind(command, Some(SessionCmd::CmdDown), Some(SessionCmd::CmdUp)) {
+                errs.push(format!("{command}: {e}"));
+            }
         }
         let mut rest = vec![(b.paste_last.clone(), SessionCmd::PasteLast), (b.copy_last.clone(), SessionCmd::CopyLast)];
         if let Some(h) = hands_free(&b) {
@@ -489,7 +502,7 @@ pub fn start(app: &AppHandle, b: &Hotkeys, tx: mpsc::Sender<SessionCmd>) -> anyh
     let me = inner.clone();
     app.listen("session_state", move |ev| {
         if let Ok(s) = serde_json::from_str::<SessionState>(ev.payload()) {
-            me.set_cancel(matches!(s.phase, Phase::Recording | Phase::Locked));
+            me.set_cancel(cancel_on(&s));
         }
     });
     Ok(HotkeyHandle { inner })
@@ -645,11 +658,20 @@ mod tests {
     use SessionCmd::*;
 
     #[test]
+    fn esc_is_live_while_a_command_is_transcribed() {
+        let st = |phase, command| SessionState { phase, command, ..Default::default() };
+        assert!(cancel_on(&st(Phase::Processing, true)), "Esc during the command's STT must stop it");
+        assert!(!cancel_on(&st(Phase::Processing, false)), "a dictation's processing keeps Esc for the app");
+        assert!(cancel_on(&st(Phase::Acting, true)) && cancel_on(&st(Phase::Recording, false)));
+        assert!(!cancel_on(&st(Phase::Idle, false)));
+    }
+
+    #[test]
     fn pause_still_ends_a_hold() {
-        for c in [PttDown, Toggle, PasteLast, CopyLast] {
+        for c in [PttDown, Toggle, PasteLast, CopyLast, CmdDown] {
             assert!(!passes(true, &c), "{c:?}");
         }
-        for c in [PttUp, Cancel] {
+        for c in [PttUp, Cancel, CmdUp] {
             assert!(passes(true, &c), "{c:?}");
         }
         assert!(passes(false, &PttDown));

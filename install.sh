@@ -3,6 +3,8 @@
 #   ./install.sh            build + install + open susurro (CLAUDE.local.md: one command, relaunch)
 #   ./install.sh --no-open  build + install, do not open it
 #   ./install.sh --check    build + signature check only (installs nothing)
+#   ./install.sh --fresh    uninstall first: delete settings, history, keys, models and permission grants,
+#                           then install and open it like a first run
 # The signing identity lives in src-tauri/tauri.conf.json (bundle.macOS.signingIdentity). A stable
 # identity keeps the macOS permission grants (Accessibility, Input Monitoring) across rebuilds.
 set -euo pipefail
@@ -11,12 +13,14 @@ BUNDLE_ID="app.susurro.desktop"
 DEST="/Applications/susurro.app"
 OPEN=1
 CHECK=0
+FRESH=0
 for a in "$@"; do
   case "$a" in
     --open) OPEN=1 ;;
     --no-open) OPEN=0 ;;
     --check) CHECK=1 ;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+    --fresh) FRESH=1 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "unknown flag: $a" >&2; exit 2 ;;
   esac
 done
@@ -68,6 +72,19 @@ if pgrep -f "^$RUNNING" >/dev/null; then
   pkill -9 -f "^$RUNNING" 2>/dev/null || true
 fi
 
+if [ "$FRESH" = 1 ]; then
+  echo "==> Fresh install: removing susurro data, keys and permission grants"
+  rm -rf "$HOME/Library/Application Support/$BUNDLE_ID" "$HOME/Library/Logs/$BUNDLE_ID" \
+    "$HOME/Library/Caches/$BUNDLE_ID" "$HOME/Library/WebKit/$BUNDLE_ID" "$HOME/Library/WebKit/susurro"
+  # Old builds kept keys in the Keychain; remove those items too.
+  for acct in openrouter elevenlabs local_stt local_llm; do
+    security delete-generic-password -s "$BUNDLE_ID" -a "$acct" >/dev/null 2>&1 || true
+  done
+  launchctl remove "$BUNDLE_ID" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/susurro.plist"
+  RESET=1
+fi
+
 echo "==> Installing to $DEST"
 rm -rf "$DEST"
 ditto "$APP" "$DEST"
@@ -78,6 +95,7 @@ if [ "$RESET" = 1 ]; then
   tccutil reset Accessibility "$BUNDLE_ID" || true
   tccutil reset ListenEvent "$BUNDLE_ID" || true
   tccutil reset Microphone "$BUNDLE_ID" || true
+  tccutil reset ScreenCapture "$BUNDLE_ID" || true
 fi
 
 echo

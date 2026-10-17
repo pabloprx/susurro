@@ -120,7 +120,7 @@ export default function Providers() {
       <Label>Cleanup (LLM)</Label>
       <Cleanup s={s} hasKey={keys.openrouter} />
 
-      <Label right={<span className="small">stored in macOS Keychain</span>}>Keys</Label>
+      <Label right={<span className="small">stored in keys.json, only readable by you</span>}>Keys</Label>
       <div className="card rows keys">
         <KeyRow name="openrouter" title="OpenRouter" s={s} saved={keys.openrouter} />
         <KeyRow name="elevenlabs" title="ElevenLabs" s={s} saved={keys.elevenlabs} />
@@ -183,7 +183,7 @@ export default function Providers() {
               </span>
             </div>
             <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
-              <span className="small">{keys!.elevenlabs ? "Key saved in Keychain." : "Add your ElevenLabs key below."}</span>
+              <span className="small">{keys!.elevenlabs ? "Key saved." : "Add your ElevenLabs key below."}</span>
               <TestButton which="stt" onResult={onTest} disabled={!keys!.elevenlabs} />
             </div>
           </>
@@ -603,7 +603,7 @@ function KeyRow({ name, title, sub, s, saved }: { name: KeyName; title: string; 
           className="input mono"
           type={show ? "text" : "password"}
           value={v}
-          placeholder={saved ? (mask ?? "saved in Keychain") : "Paste key…"}
+          placeholder={saved ? (mask ?? "saved") : "Paste key…"}
           onChange={(e) => setV(e.target.value.trim())}
           aria-label={`${title} key`}
           autoComplete="off"

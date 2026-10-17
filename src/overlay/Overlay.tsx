@@ -335,7 +335,7 @@ export default function Overlay() {
       <>
         <Check size={14} strokeWidth={2} className="ok" />
         <span className="msg">
-          Done <span className="mono-dim">· {step?.step ?? 1} {step?.step === 1 ? "step" : "steps"}</span>
+          Done{step?.step ? <span className="mono-dim"> · {step.step} {step.step === 1 ? "step" : "steps"}</span> : null}
         </span>
       </>
     ),
