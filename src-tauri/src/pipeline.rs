@@ -52,7 +52,7 @@ pub fn run(clip: &Clip, o: &Opts, d: &Dictionary, stt: Stt, clean: Cleaner) -> O
     }
     if clip.silent() {
         let name = clip.device_names.last().map(String::as_str).unwrap_or("the mic");
-        return Outcome::Skip(Some(format!("No audio from {name} - check the mic or its input volume")));
+        return Outcome::Skip(Some(format!("No audio from {name}. Is your mic muted?")));
     }
     let hints = d.hints();
     let out = match stt(&SttRequest { audio: &clip.samples, language: o.language, hints: &hints }) {
@@ -165,7 +165,7 @@ mod tests {
             called.set(true);
             anyhow::bail!("must not run")
         };
-        assert_eq!(run(&clip(0.0001, 2000), &opts(), &dict(), &stt, None), Outcome::Skip(Some("No audio from USB Mic - check the mic or its input volume".into())));
+        assert_eq!(run(&clip(0.0001, 2000), &opts(), &dict(), &stt, None), Outcome::Skip(Some("No audio from USB Mic. Is your mic muted?".into())));
         assert_eq!(run(&clip(0.5, 100), &opts(), &dict(), &stt, None), Outcome::Skip(None));
         assert!(!called.get());
     }

@@ -75,6 +75,7 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            paste::watch_activations(); // setup runs on the main thread
 
             let data_dir = app.path().app_data_dir()?;
             #[cfg(debug_assertions)]
@@ -101,6 +102,7 @@ pub fn run() {
             audio::spawn_monitor(h.clone());
             app.manage(hotkey::start(h, &hotkeys, hotkey_tx)?);
             tray::build(h)?;
+            permissions::spawn_watcher(h.clone());
             #[cfg(debug_assertions)]
             test_hooks::start_control(h);
             stt::whisper_local::load_in_background(h.clone());

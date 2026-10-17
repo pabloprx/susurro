@@ -50,7 +50,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "macOS": { "minimumSystemVersion": "11.0" },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "17E64E8AB144CBEFC799BDB0F306A58DBE09605B",
+      "hardenedRuntime": false
+    },
     "resources": ["resources/jfk.wav"],
     "icon": [
       "icons/32x32.png",

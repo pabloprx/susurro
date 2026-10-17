@@ -89,7 +89,7 @@ pub fn sep_ok(sep: &str) -> bool {
 /// Inner separators of a multi-token window ("node.js") are inside the window, so they still match,
 /// except "_" ("pablo_perez" is an identifier, not a name).
 pub fn glued(s: &str, start: usize, end: usize) -> bool {
-    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let word = |c: Option<char>| c.is_some_and(is_word);
     let mut before = s[..start].chars().rev();
     let mut after = s[end..].chars();
     let (b1, b2, a1, a2) = (before.next(), before.next(), after.next(), after.next());

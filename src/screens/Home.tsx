@@ -26,7 +26,7 @@ export default function Home({ nav }: { nav: Nav }) {
     return () => void off.then((f) => f());
   }, []);
 
-  const ptt = settings?.hotkeys.ptt ?? "RightOption";
+  const ptt = settings?.hotkeys.ptt ?? "F1";
   const daily = stats?.daily ?? [];
   const maxDay = Math.max(1, ...daily.map((d) => d.words));
   // streak: consecutive days with words, ending today (or yesterday if today is still empty)

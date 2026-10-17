@@ -906,7 +906,7 @@ test.describe("shortcuts", () => {
   });
   const bind = (page, name) => page.getByRole("button", { name: new RegExp(`^${name}:`) });
   const row = (page, label) => page.locator(".sc-row", { has: page.locator(".label", { hasText: new RegExp(`^${label}$`) }) });
-  test("record push to talk; reset; quick pick fn", async ({ page }) => {
+  test("record push to talk; reset to F1; quick pick right option", async ({ page }) => {
     await bind(page, "Push to talk").click();
     await expect(row(page, "Push to talk").locator(".rec-hint")).toHaveText("Press a key alone or a combo… Esc to cancel");
     await page.keyboard.press("Control+Alt+KeyK");
@@ -914,14 +914,14 @@ test.describe("shortcuts", () => {
     await expect(page.locator(".hint-kbd")).toHaveCount(0);
     await expect(page.getByLabel("Practice field")).toHaveAttribute("placeholder", /hold .*K and talk/);
     await row(page, "Push to talk").getByRole("button", { name: "Reset" }).click();
-    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: RightOption\./);
+    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: F1\./);
     await expect(row(page, "Push to talk").getByRole("button", { name: "Reset" })).toBeDisabled();
     await bind(page, "Push to talk").click();
     await page.keyboard.press("Control+Shift+F5");
     await bind(page, "Push to talk").click();
-    await row(page, "Push to talk").getByRole("button", { name: "Use fn" }).click();
-    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: Fn\./);
-    await expect(page.getByLabel("Practice field")).toHaveAttribute("placeholder", "Click here, hold fn and talk. Your words land in this box.");
+    await row(page, "Push to talk").getByRole("button", { name: "Use Right ⌥" }).click();
+    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: RightOption\./);
+    await expect(page.getByLabel("Practice field")).toHaveAttribute("placeholder", "Click here, hold Right ⌥ and talk. Your words land in this box.");
   });
   test("validation messages", async ({ page }) => {
     const msg = row(page, "Push to talk").locator(".recorder-msg[role=alert]");
@@ -941,7 +941,7 @@ test.describe("shortcuts", () => {
     await expect(msg).toContainText("Use up to 3 keys");
     await page.keyboard.press("Escape");
     await expect(msg).toHaveCount(0);
-    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: RightOption\./);
+    await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: F1\./);
     // one modifier alone is push to talk only
     await bind(page, "Cancel").click();
     await page.keyboard.press("ShiftLeft");
@@ -1014,7 +1014,7 @@ test.describe("shortcuts", () => {
   test("quick picks per action", async ({ page }) => {
     await bind(page, "Push to talk").click();
     const picks = page.getByLabel("Quick picks for Push to talk").getByRole("button");
-    await expect(picks).toHaveText(["right ⌥", "right ⌘", "fn"]);
+    await expect(picks).toHaveText(["F1", "right ⌥", "right ⌘"]);
     await expect(picks.first()).toBeDisabled(); // the current binding
     await page.getByRole("button", { name: "Use Right ⌘" }).click();
     await expect(bind(page, "Push to talk")).toHaveAttribute("aria-label", /^Push to talk: RightCommand\./);
@@ -1026,8 +1026,24 @@ test.describe("shortcuts", () => {
     await page.getByLabel("Quick picks for Paste last").getByRole("button", { name: "Use ⌥ ⇧ V" }).click();
     await expect(bind(page, "Paste last")).toHaveAttribute("aria-label", /^Paste last: Alt\+Shift\+V\./);
   });
-  test("holding the talk key dictates, a chord cancels, recording a binding pauses it", async ({ page }) => {
+  test("holding F1 dictates; a tap does not; a double tap is hands-free", async ({ page }) => {
     const live = page.locator(".shell > .sr-only");
+    await page.keyboard.down("F1");
+    await expect(live).toHaveText("Listening");
+    await page.waitForTimeout(400);
+    await page.keyboard.up("F1");
+    await expect(live).toHaveText("Pasted");
+    await expect(live).toHaveText("", { timeout: 3000 });
+    await page.keyboard.press("F1");
+    await page.keyboard.press("F1");
+    await expect(live).toHaveText("Listening, hands-free");
+    await page.keyboard.press("F1"); // one tap stops
+    await expect(live).toHaveText("Pasted");
+  });
+  test("holding a modifier talk key dictates, a chord cancels, recording a binding pauses it", async ({ page }) => {
+    const live = page.locator(".shell > .sr-only");
+    await bind(page, "Push to talk").click();
+    await page.getByRole("button", { name: "Use Right ⌥" }).click();
     await bind(page, "Cancel").click();
     await page.keyboard.down("AltRight");
     await page.keyboard.press("KeyK");
@@ -1041,6 +1057,7 @@ test.describe("shortcuts", () => {
     await page.keyboard.up("AltRight");
     await page.keyboard.down("AltRight");
     await expect(live).toHaveText("Listening");
+    await page.waitForTimeout(400); // a hold, not a tap
     await page.keyboard.up("AltRight");
     await expect(live).toHaveText("Pasted");
   });
@@ -1113,74 +1130,149 @@ test.describe("settings", () => {
 // ---------------- onboarding ----------------
 
 test.describe("onboarding", () => {
-  const step = (page, n) => expect(page.locator(".ticks .count")).toHaveText(`${n}/7`);
-  const notNow = (page) => page.getByRole("button", { name: "Not now" }).click();
-  test("all seven steps, grants, finish", async ({ page }) => {
-    test.setTimeout(60_000);
+  const step = (page, n) => expect(page.locator(".ticks .count")).toHaveText(`${n}/5`);
+  const card = (page, name) => page.getByRole("listitem", { name: new RegExp(`^${name}:`) });
+  const start = async (page, perms) => {
     await open(page, "/?onboarding");
-    await step(page, 1);
     await expect(page.locator(".onboarding h1")).toHaveText("Talk. It types.");
-    await page.getByRole("button", { name: "Replay" }).click();
+    if (perms) await page.evaluate((p) => window.mock.perms(p), perms);
     await page.getByRole("button", { name: "Get started" }).click();
-    // 2 mic
+  };
+  test("all five steps: grants advance by themselves, mic test, F1, practice, finish", async ({ page }) => {
+    test.setTimeout(60_000);
+    await start(page);
+    // 2 permissions: two cards, the active one first; F1 needs no Input Monitoring
     await step(page, 2);
-    await page.getByRole("button", { name: "Allow microphone" }).click();
-    await expect(page.locator(".ob-panel [role=meter]")).toBeVisible({ timeout: 4000 });
-    await expect(page.getByText("Heard you.")).toBeVisible({ timeout: 8000 });
-    await page.getByRole("button", { name: "Continue" }).click();
-    // 3 accessibility: grant, then it advances by itself
+    await expect(page.getByRole("listitem")).toHaveCount(2);
+    await expect(card(page, "Use your microphone")).toHaveClass(/active/);
+    await expect(page.getByRole("button", { name: "Allow", exact: true })).toBeFocused(); // Enter runs the active card
+    await page.keyboard.press("Enter");
+    await expect(card(page, "Use your microphone")).toHaveAttribute("aria-label", /allowed$/, { timeout: 4000 });
+    await expect(card(page, "Type for you")).toHaveClass(/active/);
+    await expect(card(page, "Type for you").locator(".diagram")).toContainText("Privacy & Security › Accessibility");
+    await page.getByRole("button", { name: "Open System Settings" }).click();
+    await expect(page.getByText("All set")).toBeVisible({ timeout: 4000 });
+    // 3 mic test, with the picker
     await step(page, 3);
-    await expect(page.locator(".eyebrow")).toHaveText("Accessibility");
-    await page.getByRole("button", { name: "Open System Settings" }).click();
-    await expect(page.getByText("Granted")).toBeVisible({ timeout: 4000 });
-    // 4 input monitoring, worded with the real key (default Right Option)
+    await expect(page.locator(".ob-panel [role=meter]")).toBeVisible();
+    await expect(page.getByText("Sounds good.")).toBeVisible({ timeout: 8000 });
+    await expect(page.getByRole("combobox", { name: "Microphone" })).toHaveValue("auto");
+    await page.getByRole("combobox", { name: "Microphone" }).selectOption({ label: "BlackHole 2ch" });
+    await expect(page.getByRole("combobox", { name: "Microphone" })).not.toHaveValue("auto");
+    await page.getByRole("button", { name: "Continue" }).click();
+    // 4 talk key: F1 by default; holding it turns the live check green; mode and language on the same screen
     await step(page, 4);
-    await expect(page.locator(".onboarding h1")).toHaveText("Hold Right ⌥ to talk.");
-    await page.getByRole("button", { name: "Open System Settings" }).click();
-    await expect(page.getByText("Granted")).toBeVisible({ timeout: 4000 });
-    // 5 talk key: live check turns green once holding the key starts a dictation
-    await step(page, 5);
-    await expect(page.locator(".keycap")).toHaveText("right ⌥");
-    await expect(page.locator(".live-check")).toContainText("Right ⌥ is ready. Hold it and say something.");
-    await page.keyboard.down("AltRight");
-    await expect(page.locator(".live-check")).toContainText("Right ⌥ works.");
-    await page.keyboard.up("AltRight");
-    await page.getByRole("button", { name: "Continue" }).click();
-    // 6 rhythm
-    await step(page, 6);
-    await page.getByRole("radio", { name: /Hold to talk/ }).click();
-    await expect(page.getByRole("radio", { name: /Hold to talk/ })).toHaveAttribute("aria-checked", "true");
-    await page.getByRole("radio", { name: /Tap to toggle/ }).click();
-    await expect(page.getByRole("radio", { name: /Tap to toggle/ })).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(".keycap")).toHaveText("F1");
+    await expect(page.getByRole("radio", { name: /F1/ })).toContainText("Recommended");
+    await expect(page.locator(".live-check")).toContainText("Hold F1 now to check it.");
+    await page.keyboard.down("F1");
+    await expect(page.locator(".live-check")).toContainText("F1 works.");
+    await page.waitForTimeout(300);
+    await page.keyboard.up("F1");
+    await sw(page, "Double-tap for hands-free").click();
+    await expect(sw(page, "Double-tap for hands-free")).toHaveAttribute("aria-checked", "false");
+    await sw(page, "Double-tap for hands-free").click();
     await page.getByRole("combobox", { name: "Language" }).selectOption("es");
-    await expect(page.getByRole("combobox", { name: "Language" })).toHaveValue("es");
     await page.getByRole("button", { name: "Continue" }).click();
-    // 7 try: no model yet, so it downloads base q5_1 (multilingual since es)
-    await step(page, 7);
-    await expect(page.locator(".ob-panel")).toContainText("Downloading base q5_1");
+    // 5 practice: base q5_1 downloads first (multilingual since es); hold drill, then hands-free drill
+    await step(page, 5);
+    await expect(page.locator(".ob-panel")).toContainText("Getting base q5_1 ready");
     await expect(page.locator(".ob-panel")).toHaveCount(0, { timeout: 20_000 });
+    const drills = page.locator(".drills li");
+    await expect(drills.nth(0)).toHaveClass(/active/);
+    await expect(page.getByLabel("Practice field")).toBeFocused();
     await page.evaluate(() => (window.mock.dictate(), window.mock.stop()));
     await expect(page.getByLabel("Practice field")).toHaveValue("The new build is up. Can you test the hot-plug flow?");
     await expect(page.locator(".result-line")).toContainText("642 ms to text");
-    await page.getByRole("button", { name: "Finish" }).click();
+    await expect(drills.nth(0)).toHaveClass(/ok/);
+    await expect(drills.nth(1)).toHaveClass(/active/);
+    // a plain hold does not pass the hands-free drill
+    await page.evaluate(() => (window.mock.dictate(), window.mock.stop()));
+    await page.waitForTimeout(1500);
+    await expect(drills.nth(1)).not.toHaveClass(/ok/);
+    await page.evaluate(() => (window.mock.handsfree(), window.mock.stop()));
+    await expect(drills.nth(1)).toHaveClass(/ok/);
+    await expect(page.locator(".onboarding h1")).toHaveText("You are set.");
+    await page.getByRole("button", { name: "Start using susurro" }).click();
     await expect(page.locator(".shell")).toBeVisible();
+    await nav(page, "Settings");
+    await expect(sw(page, "Launch at login")).toHaveAttribute("aria-checked", "true");
     await nav(page, "Providers");
     await expect(page.locator(".models .row", { hasText: "base q5_1" }).filter({ hasNotText: "base.en" })).toContainText("in use");
   });
-  test("talk key: quick picks, record your own, Escape cancels", async ({ page }) => {
-    await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Get started" }).click();
-    for (let i = 0; i < 3; i++) await notNow(page);
-    await step(page, 5);
-    const pick = (name) => page.getByRole("radiogroup", { name: "Talk key" }).getByRole("radio", { name });
-    await expect(pick(/right ⌥/)).toHaveAttribute("aria-checked", "true");
-    await expect(pick(/right ⌥/)).toContainText("Recommended");
+  test("permissions already granted: the page is skipped, both ways", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await step(page, 3);
+    await expect(page.locator(".eyebrow")).toHaveText("Microphone");
+    await page.getByRole("button", { name: "Back" }).click();
+    await step(page, 1);
+  });
+  test("a grant made while the page is open shows a check, then it moves on", async ({ page }) => {
+    await page.clock.install();
+    await start(page, { microphone: "granted" });
+    await step(page, 2);
+    await expect(card(page, "Use your microphone")).toHaveAttribute("aria-label", /allowed$/);
+    await page.clock.pauseAt(Date.now() + 60_000); // the 1 s poll stops: only the focus check can see the grant
+    await page.evaluate(() => window.mock.perms({ accessibility: true }));
+    await expect(page.getByText("All set")).toHaveCount(0);
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(page.getByText("All set")).toBeVisible();
+    await page.clock.runFor(1000);
+    await step(page, 3);
+  });
+  test("Accessibility never offers a restart; after 10 s it says how to fix a stale switch", async ({ page }) => {
+    await page.clock.install();
+    await start(page, { microphone: "granted" });
+    await page.evaluate(() => (window.mock.stale = true));
+    await page.getByRole("button", { name: "Open System Settings" }).click();
+    await page.clock.runFor(3000);
+    await expect(page.getByText("Already on?")).toHaveCount(0);
+    await page.clock.runFor(8000);
+    await expect(page.getByText("Already on? Turn susurro off and on again.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Restart susurro" })).toHaveCount(0);
+  });
+  test("a modifier talk key adds the Input Monitoring card; a stale grant shows one Restart, which reopens here", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await step(page, 3);
+    await page.getByRole("button", { name: "Continue" }).click();
+    await step(page, 4);
+    await page.getByRole("radio", { name: /right ⌥/ }).click();
     await expect(page.locator(".live-check")).toContainText("Right ⌥ needs Input Monitoring.");
+    await page.evaluate(() => (window.mock.stale = true));
+    await page.locator(".live-check").getByRole("button", { name: "Open System Settings" }).click();
+    await expect(page.locator(".live-check").getByRole("button", { name: "Restart susurro" })).toBeVisible({ timeout: 4000 });
+    await page.getByRole("button", { name: "Back" }).click();
+    await step(page, 3);
+    await page.getByRole("button", { name: "Back" }).click();
+    await step(page, 2);
+    await expect(page.getByRole("listitem")).toHaveCount(3);
+    await expect(card(page, "Hear your talk key")).toContainText("macOS applies it after a restart");
+    await expect(page.getByRole("button", { name: "Restart susurro" })).toHaveCount(1);
+    await page.getByRole("button", { name: "Restart susurro" }).click();
+    // reopened on the same step; the grant now counts, so it moves on by itself
+    await expect(page.locator(".eyebrow")).toHaveText("Microphone", { timeout: 5000 });
+    await step(page, 3);
+  });
+  test("Use F1 instead drops the Input Monitoring card", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page.getByRole("radio", { name: /right ⌘/ }).click();
+    await page.getByRole("button", { name: "Back" }).click();
+    await page.getByRole("button", { name: "Back" }).click();
+    await step(page, 2);
+    await expect(card(page, "Hear your talk key")).toHaveClass(/active/);
+    await page.getByRole("button", { name: "Use F1 instead (no permission)" }).click();
+    await step(page, 3);
+  });
+  test("talk key: quick picks, record your own, Escape cancels", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await page.getByRole("button", { name: "Continue" }).click();
+    await step(page, 4);
+    const pick = (name) => page.getByRole("radiogroup", { name: "Talk key" }).getByRole("radio", { name });
+    await expect(pick(/F1/)).toHaveAttribute("aria-checked", "true");
     await pick(/right ⌘/).click();
     await expect(page.locator(".keycap")).toHaveText("right ⌘");
-    await pick(/fn/).click();
-    await expect(page.locator(".keycap")).toHaveText("fn");
-    // record a modifier alone
+    await expect(pick(/right ⌘/)).toContainText("+1 permission");
     await page.getByRole("button", { name: /Record your own/ }).click();
     await expect(page.locator(".keycap .rec-hint")).toHaveText("Press any key or combo");
     await page.keyboard.down("ShiftRight");
@@ -1188,107 +1280,75 @@ test.describe("onboarding", () => {
     await page.keyboard.up("ShiftRight");
     await expect(page.locator(".keycap")).not.toHaveClass(/recording/);
     await expect(page.getByRole("button", { name: /Record your own/ })).toHaveClass(/on/);
-    // record a combo
     await page.locator(".keycap").click();
     await page.keyboard.press("Control+Alt+Space");
     await expect(page.locator(".keycap")).toHaveText("⌃⌥Space");
     await expect(page.locator(".live-check")).not.toContainText("Input Monitoring");
-    // Escape cancels, the binding stays
     await page.locator(".keycap").click();
     await page.keyboard.press("Escape");
     await expect(page.locator(".keycap")).not.toHaveClass(/recording/);
     await expect(page.locator(".keycap")).toHaveText("⌃⌥Space");
     await page.getByRole("button", { name: "Continue" }).click();
-    await step(page, 6);
-    await expect(page.locator(".choice")).toContainText("⌃⌥Space");
-  });
-  test("permission step re-checks on window focus (back from System Settings)", async ({ page }) => {
-    await page.clock.install();
-    await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Get started" }).click();
-    await notNow(page);
-    await step(page, 3);
-    await page.clock.pauseAt(Date.now() + 60_000); // the 1 s poll stops: only the focus check can see the grant
-    await page.evaluate(() => window.mock.perms({ accessibility: true }));
-    await expect(page.getByText("Granted")).toHaveCount(0);
-    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await expect(page.getByText("Granted")).toBeVisible();
-    await page.clock.runFor(1000);
-    await step(page, 4);
-  });
-  test("grant not seen 3 s after coming back: Restart susurro reopens on the same step", async ({ page }) => {
-    await open(page, "/?onboarding");
-    await page.evaluate(() => (window.mock.stale = true));
-    await page.getByRole("button", { name: "Get started" }).click();
-    await notNow(page);
-    await step(page, 3);
-    await page.getByRole("button", { name: "Open System Settings" }).click();
-    await page.waitForTimeout(1600); // the mock "System Settings" grant lands, but this process cannot see it
-    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await expect(page.getByRole("button", { name: "Restart susurro" })).toBeVisible({ timeout: 4500 });
-    await expect(page.locator(".ob-restart")).toContainText("macOS needs a restart to apply Accessibility.");
-    await page.getByRole("button", { name: "Restart susurro" }).click();
-    await step(page, 3);
-    await expect(page.getByText("Granted")).toBeVisible();
-    await step(page, 4);
-  });
-  test("needs_relaunch shows the restart button; I already enabled it restarts too", async ({ page }) => {
-    await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Get started" }).click();
-    await notNow(page);
-    await notNow(page);
-    await step(page, 4);
-    await expect(page.getByRole("button", { name: "Restart susurro" })).toHaveCount(0);
-    await page.evaluate(() => window.mock.perms({ input_monitoring: true, needs_relaunch: true }));
-    await expect(page.getByRole("button", { name: "Restart susurro" })).toBeVisible({ timeout: 2500 });
-    await expect(page.getByText("Granted")).toHaveCount(0);
-    // a fresh case: the user flipped it before; the secondary link restarts right away
-    await page.evaluate(() => window.mock.perms({ input_monitoring: false, needs_relaunch: false }));
-    await expect(page.getByRole("button", { name: "I already enabled it" })).toBeVisible({ timeout: 2500 });
-    await page.getByRole("button", { name: "I already enabled it" }).click();
-    await step(page, 4); // reopened on the same step after the relaunch
-    await expect(page.locator(".eyebrow")).toHaveText("Input Monitoring");
-  });
-  test("back, not now, alt+space, skip", async ({ page }) => {
-    await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Get started" }).click();
-    await step(page, 2);
-    await page.getByRole("button", { name: "Back" }).click();
-    await step(page, 1);
-    await page.getByRole("button", { name: "Get started" }).click();
-    await notNow(page);
-    await step(page, 3);
-    await notNow(page);
-    await step(page, 4);
-    await page.getByRole("button", { name: "Use ⌥ Space instead (no permission)" }).click();
     await step(page, 5);
-    await expect(page.locator(".keycap")).toHaveText("⌥Space");
-    await page.getByRole("button", { name: "Continue" }).click();
-    await step(page, 6);
-    await expect(page.locator(".choice")).toContainText("⌥");
-    await page.getByRole("button", { name: "Skip for now" }).click();
-    await expect(page.locator(".shell")).toBeVisible();
-    await expect(page.locator(".hint-kbd")).toContainText("hold to talk");
+    await expect(page.locator(".drills")).toContainText("⌃⌥Space");
   });
-  test("cloud provider link from the try step", async ({ page }) => {
-    await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Get started" }).click();
-    for (let i = 0; i < 3; i++) await notNow(page);
+  test("practice drills can be skipped; hands-free off leaves one drill", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await page.getByRole("button", { name: "Continue" }).click();
+    await sw(page, "Double-tap for hands-free").click();
+    await page.getByRole("button", { name: "Continue" }).click();
+    await step(page, 5);
+    await expect(page.locator(".drills li")).toHaveCount(1);
+    await page.locator(".drills").getByRole("button", { name: "Skip" }).click();
+    await expect(page.locator(".onboarding h1")).toHaveText("You are set.");
+    await expect(page.getByRole("button", { name: "Start using susurro" })).toBeFocused();
+  });
+  test("resumes on the step it was on after a quit", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
+    await page.getByRole("button", { name: "Continue" }).click();
+    await step(page, 4);
+    await page.evaluate(() => sessionStorage.setItem("mock.perms", JSON.stringify({ microphone: "granted", accessibility: true, input_monitoring: false, fn_key_free: null, needs_relaunch: false })));
+    await page.reload();
+    await step(page, 4);
+  });
+  test("cloud provider link from the practice step", async ({ page }) => {
+    await start(page, { microphone: "granted", accessibility: true });
     await page.getByRole("button", { name: "Continue" }).click();
     await page.getByRole("button", { name: "Continue" }).click();
-    await step(page, 7);
+    await step(page, 5);
     await page.getByRole("button", { name: "Use a cloud provider instead" }).click();
     await expect(page.locator(".shell")).toBeVisible();
     await expect(h1(page)).toHaveText("Where your voice goes.");
   });
-  test("Shortcuts Grant link opens onboarding at Input Monitoring", async ({ page }) => {
+  test("skip setup lands on Home with the talk key hint", async ({ page }) => {
     await open(page, "/?onboarding");
-    await page.getByRole("button", { name: "Skip for now" }).click();
+    await page.getByRole("button", { name: "Skip setup" }).click();
+    await expect(page.locator(".shell")).toBeVisible();
+    await expect(page.locator(".hint-kbd")).toContainText("F1");
+  });
+  test("a grant lost later (new build, switched off) opens only the permissions page, then closes it", async ({ page }) => {
+    await open(page);
+    await page.evaluate(() => window.mock.perms({ accessibility: false }));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus"))); // the app comes to the front
+    await expect(page.locator(".onboarding h1")).toHaveText("Turn it back on.");
+    await expect(page.locator(".ticks")).toHaveCount(0);
+    await expect(card(page, "Use your microphone")).toHaveAttribute("aria-label", /allowed$/);
+    await page.evaluate(() => window.mock.perms({ accessibility: true }));
+    await expect(page.locator(".shell")).toBeVisible({ timeout: 4000 });
+  });
+  test("picking a modifier key without Input Monitoring asks for it; Not now, then the Shortcuts Grant link", async ({ page }) => {
+    await open(page);
+    await page.evaluate(() => window.mock.perms({ input_monitoring: false }));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await nav(page, "Shortcuts");
+    await page.locator(".bind").first().click();
+    await page.getByRole("button", { name: "Use Right ⌥" }).click();
+    await expect(card(page, "Hear your talk key")).toHaveClass(/active/);
+    await page.getByRole("button", { name: "Not now" }).click();
     await nav(page, "Shortcuts");
     await expect(page.locator(".recorder-msg.warn-text")).toContainText("Right ⌥ needs Input Monitoring");
     await page.getByRole("button", { name: "Grant" }).click();
-    await step(page, 4);
-    await expect(page.locator(".eyebrow")).toHaveText("Input Monitoring");
+    await expect(card(page, "Hear your talk key")).toHaveClass(/active/);
   });
 });
 
@@ -1297,14 +1357,16 @@ test.describe("onboarding", () => {
 test.describe("overlay", () => {
   const pill = (page) => page.locator(".pill");
   const cases = [
-    ["idle", "v-idle", "right ⌥ to talk"],
-    ["hover", "v-idle", "right ⌥ to talk"],
+    ["idle", "v-idle", "Click or hold F1"],
+    ["hover", "v-idle", "Click or hold F1"],
     ["listening", "v-listening", null],
     ["handsfree", "v-handsfree", /0:4\d/],
     ["warning", "v-handsfree", /left/],
     ["processing", "v-processing", null],
     ["done", "v-done", "Pasted"],
-    ["copied", "v-copied", "Copied - grant Accessibility"],
+    ["copied", "v-copied", "Copied to clipboard"],
+    ["fixax", "v-notice", "Copied. Turn on Accessibility to paste"],
+    ["nofield", "v-notice", "No text field. Copied"],
     ["error", "v-error", "Mic disconnected"],
     ["notice", "v-notice", "Switched to MacBook Pro Microphone"],
   ];
@@ -1315,6 +1377,9 @@ test.describe("overlay", () => {
       if (text) await expect(pill(page).locator(".layer.in")).toContainText(text);
       if (state === "hover") await expect(pill(page)).toHaveClass(/\bhover\b/);
       if (state === "warning") await expect(pill(page)).toHaveClass(/\bwarning\b/);
+      // a failure names its one-click fix
+      if (state === "fixax") await expect(pill(page).getByRole("button", { name: "Turn on" })).toBeVisible();
+      if (state === "error") await expect(pill(page).getByRole("button", { name: "Check mic" })).toBeVisible();
       if (["listening", "handsfree"].includes(state)) {
         await expect(pill(page).getByRole("button", { name: "Cancel" })).toBeVisible();
         await expect(pill(page).getByRole("button", { name: "Stop and paste" })).toBeVisible();

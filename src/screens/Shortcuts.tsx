@@ -7,15 +7,16 @@ import { S } from "../lib/strings";
 import { Kbd, Label, Title, Toggle } from "../ui";
 import type { Nav } from "../App";
 
-export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last";
-const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last" };
-const DEFAULTS: Hotkeys = { ptt: "RightOption", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V" };
+export type Slot = "ptt" | "hands_free" | "cancel" | "paste_last" | "copy_last";
+const NAMES: Record<Slot, string> = { ptt: "Push to talk", hands_free: "Hands-free", cancel: "Cancel", paste_last: "Paste last", copy_last: "Copy last" };
+const DEFAULTS: Hotkeys = { ptt: "F1", hands_free: null, double_tap: true, cancel: "Escape", paste_last: "Ctrl+Cmd+V", copy_last: "Ctrl+Cmd+C" };
 /** One-click bindings per action, shown while that action records. */
 export const PICKS: Record<Slot, string[]> = {
-  ptt: ["RightOption", "RightCommand", "Fn"],
+  ptt: ["F1", "RightOption", "RightCommand"],
   hands_free: ["Alt+Space", "Ctrl+Alt+Space"],
   cancel: ["Escape", "Ctrl+."],
   paste_last: ["Ctrl+Cmd+V", "Alt+Shift+V"],
+  copy_last: ["Ctrl+Cmd+C", "Alt+Shift+C"],
 };
 const MODS: Record<string, string> = { Control: "Ctrl", Alt: "Alt", Meta: "Cmd", Shift: "Shift" };
 /** KeyboardEvent.code of a modifier -> its modifier-only binding (the contract names in format.ts MOD_ONLY). */
@@ -187,7 +188,7 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
           {isModOnly(hk.ptt) && perms && !perms.input_monitoring && (
             <p className="recorder-msg warn-text">
               <AlertTriangle size={13} strokeWidth={1.5} /> {ptt} needs Input Monitoring -{" "}
-              <button className="link" onClick={() => nav.openOnboarding(3)}>
+              <button className="link" onClick={() => nav.openOnboarding(1) /* the permissions page */}>
                 Grant
               </button>
             </p>
@@ -240,6 +241,18 @@ export default function Shortcuts({ nav }: { nav: Nav }) {
           </span>
           <Reset slot="paste_last" />
           <Msg slot="paste_last" />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Copy last</div>
+            <div className="sub">The last transcript, to the clipboard</div>
+          </div>
+          <span className="inline">
+            <Binding slot="copy_last" />
+            <Picks slot="copy_last" />
+          </span>
+          <Reset slot="copy_last" />
+          <Msg slot="copy_last" />
         </div>
       </div>
 

@@ -48,7 +48,11 @@ export type HotkeyStatus = { binding: string, active: boolean, error?: string, }
  * "RightControl", "LeftControl", "RightShift", "LeftShift") use the CGEventTap and work only for ptt;
  * anything else is an accelerator combo for global-shortcut.
  */
-export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, cancel: string, paste_last: string, };
+export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, cancel: string, paste_last: string, 
+/**
+ * Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
+ */
+copy_last: string, };
 
 export type KeyName = "elevenlabs" | "openrouter" | "local_stt" | "local_llm";
 
@@ -92,7 +96,8 @@ export type OverlayOpts = { show_idle: boolean, };
 
 export type PasteOpts = { restore_clipboard: boolean, 
 /**
- * 350 ms is a guess; needs to be measured per app (PLAN 12).
+ * Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
+ * 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
  */
 restore_delay_ms: number, press_enter_command: boolean, };
 

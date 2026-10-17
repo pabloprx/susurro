@@ -19,7 +19,7 @@ fn main() {
     println!("frontmost app: {app:?}");
     let opts = PasteOpts::default();
     let t = std::time::Instant::now();
-    let out = paste::paste(&text, &opts);
+    let out = paste::paste(&text, &opts, None);
     println!("outcome: {out:?} in {} ms (includes restore_delay_ms = {})", t.elapsed().as_millis(), opts.restore_delay_ms);
 
     let after = paste::clipboard_text();
@@ -33,6 +33,10 @@ fn main() {
         paste::PasteOutcome::CopiedOnly => {
             println!("COPIED ONLY: no Accessibility for this terminal; the text is on the clipboard");
             std::process::exit(2);
+        }
+        paste::PasteOutcome::NoField => {
+            println!("NO FIELD: the focused element takes no text; the text is on the clipboard");
+            std::process::exit(3);
         }
     }
 }

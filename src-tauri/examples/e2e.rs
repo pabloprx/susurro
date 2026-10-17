@@ -81,7 +81,7 @@ fn run() -> anyhow::Result<()> {
     std::thread::sleep(Duration::from_millis(1500)); // ponytail: fixed wait for TextEdit focus; poll if it flakes.
     println!("frontmost:  {:?}", paste::frontmost_app().and_then(|a| a.bundle_id));
     let t = Instant::now();
-    let out = paste::paste(&done.final_text, &PasteOpts::default());
+    let out = paste::paste(&done.final_text, &PasteOpts::default(), None);
     println!("paste:      {:>6} ms  {out:?} (includes restore_delay_ms = 350)", t.elapsed().as_millis());
     key(1, true); // Cmd+S
     std::thread::sleep(Duration::from_millis(800));

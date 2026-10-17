@@ -213,6 +213,7 @@ pub fn validate(b: &Hotkeys) -> Result<(), Vec<String>> {
         ("Hands-free", hands_free(b)),
         ("Cancel", Some(b.cancel.as_str())),
         ("Paste last", Some(b.paste_last.as_str())),
+        ("Copy last", Some(b.copy_last.as_str())),
     ];
     let mut errs = vec![];
     let mut seen: Vec<(String, &str)> = vec![];
@@ -303,6 +304,16 @@ pub fn tap_failed() -> bool {
     TAP_KEY.load(Ordering::Relaxed) != NO_KEY && TAP_FAILED.load(Ordering::Relaxed)
 }
 
+/// A modifier-only talk key is bound, so the event tap is wanted.
+pub fn tap_wanted() -> bool {
+    TAP_KEY.load(Ordering::Relaxed) != NO_KEY
+}
+
+/// The event tap runs in this process (Input Monitoring works now).
+pub fn tap_running() -> bool {
+    TAP_RUNNING.load(Ordering::Relaxed)
+}
+
 /// WP5 stores it with `app.manage(handle)`; save_settings finds it with `app.try_state::<HotkeyHandle>()`.
 pub struct HotkeyHandle {
     inner: Arc<Inner>,
@@ -360,7 +371,7 @@ impl Inner {
         } else {
             *self.ptt_error.lock().unwrap() = None;
         }
-        let mut rest = vec![(b.paste_last.clone(), SessionCmd::PasteLast)];
+        let mut rest = vec![(b.paste_last.clone(), SessionCmd::PasteLast), (b.copy_last.clone(), SessionCmd::CopyLast)];
         if let Some(h) = hands_free(&b) {
             rest.push((h.to_string(), SessionCmd::Toggle));
         }
@@ -514,6 +525,10 @@ impl HotkeyHandle {
     pub fn status(&self) -> HotkeyStatus {
         self.inner.status()
     }
+
+    pub fn bindings(&self) -> Hotkeys {
+        self.inner.b.lock().unwrap().clone()
+    }
 }
 
 /// The page records a new binding: on = unregister every shortcut (so the combo reaches the page) and drop
@@ -630,7 +645,7 @@ mod tests {
 
     #[test]
     fn pause_still_ends_a_hold() {
-        for c in [PttDown, Toggle, PasteLast] {
+        for c in [PttDown, Toggle, PasteLast, CopyLast] {
             assert!(!passes(true, &c), "{c:?}");
         }
         for c in [PttUp, Cancel] {
@@ -646,6 +661,7 @@ mod tests {
             double_tap: true,
             cancel: cancel.into(),
             paste_last: paste.into(),
+            copy_last: "Ctrl+Cmd+C".into(),
         }
     }
 
@@ -706,6 +722,7 @@ mod tests {
         assert!(err(hk("Fn", Some("Fn"), "Escape", "Ctrl+Cmd+V")).contains("only for push to talk"));
         assert!(err(hk("Alt+Space", Some("RightOption"), "Escape", "Ctrl+Cmd+V")).contains("only for push to talk"));
         assert!(err(hk("Alt+Space", None, "Escape", "LeftShift")).contains("only for push to talk"));
+        assert!(err(hk("Ctrl+Cmd+C", None, "Escape", "Ctrl+Cmd+V")).contains("already used by Push to talk"));
     }
 
     #[test]

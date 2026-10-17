@@ -2,7 +2,7 @@
 import { Component, useEffect, useState, type ComponentType, type ReactNode } from "react";
 import { AudioLines, BookA, Cpu, House, Keyboard, Mic, PenLine, Settings2 } from "lucide-react";
 import { on, type SessionState } from "./lib/api";
-import { applyTheme, getTheme, isModOnly, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
+import { applyTheme, getTheme, micStore, modelName, permStore, PROVIDER_LABEL, settingsStore, keyStore } from "./lib/store";
 import { S } from "./lib/strings";
 import { Dot, Meter, Toasts, useLevel } from "./ui";
 import Home from "./screens/Home";
@@ -13,7 +13,7 @@ import Providers from "./screens/Providers";
 import Audio from "./screens/Audio";
 import Shortcuts from "./screens/Shortcuts";
 import Settings from "./screens/Settings";
-import Onboarding, { RESUME_KEY } from "./screens/Onboarding";
+import Onboarding, { allGranted, PERM_STEP, RESUME_KEY } from "./screens/Onboarding";
 import "./styles/tokens.css";
 import "./styles/app.css";
 
@@ -68,20 +68,15 @@ export default function App() {
     return () => mq.removeEventListener("change", f);
   }, []);
 
-  // first launch, or a required permission is missing -> onboarding, resumed at the first missing step
+  // first launch (or a quit mid-setup): onboarding, resumed on its step. Later, a grant that went missing (a rebuild with
+  // a new signature, the user switched it off): only the permissions page.
   useEffect(() => {
     if (!settings || !perms || onboardStep !== null) return;
-    const resume = localStorage.getItem(RESUME_KEY); // relaunch_app from an onboarding step: reopen on it
-    if (resume !== null) return setOnboardStep(+resume);
+    const resume = localStorage.getItem(RESUME_KEY);
+    if (!settings.onboarded) return setOnboardStep(resume !== null ? +resume : 0);
+    if (resume !== null) return setOnboardStep(PERM_STEP); // relaunch_app from the permissions page
     if (sessionStorage.getItem("susurro.skipOnboarding")) return;
-    const ptt = settings.hotkeys.ptt;
-    const missing = [
-      perms.microphone !== "granted",
-      !perms.accessibility,
-      isModOnly(ptt) && (!perms.input_monitoring || perms.needs_relaunch || (ptt === "Fn" && perms.fn_key_free === false)),
-    ];
-    if (!settings.onboarded) setOnboardStep(0);
-    else if (missing.some(Boolean)) setOnboardStep(1 + missing.indexOf(true));
+    if (!allGranted(perms, settings)) setOnboardStep(PERM_STEP);
   }, [settings, perms]);
 
   useEffect(() => {

@@ -48,6 +48,8 @@ pub struct Hotkeys {
     pub double_tap: bool,
     pub cancel: String,
     pub paste_last: String,
+    /// Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
+    pub copy_last: String,
 }
 
 #[serde(default)]
@@ -181,7 +183,8 @@ pub struct DictOpts {
 #[serde(default)]
 pub struct PasteOpts {
     pub restore_clipboard: bool,
-    /// 350 ms is a guess; needs to be measured per app (PLAN 12).
+    /// Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
+    /// 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
     pub restore_delay_ms: u32,
     pub press_enter_command: bool,
 }
@@ -432,7 +435,7 @@ pub struct Navigate {
 
 // ---------- defaults (PLAN 1.5) ----------
 
-/// v2: the default ptt became RightOption; a stored "Fn" moves to it once.
+/// v2: the default ptt became F1; a stored "Fn" moves to it once, and the old 350 ms restore delay becomes 500.
 pub const SETTINGS_VERSION: u32 = 2;
 
 impl Default for Settings {
@@ -460,11 +463,12 @@ impl Default for Settings {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            ptt: "RightOption".into(),
+            ptt: "F1".into(),
             hands_free: None,
             double_tap: true,
             cancel: "Escape".into(),
             paste_last: "Ctrl+Cmd+V".into(),
+            copy_last: "Ctrl+Cmd+C".into(),
         }
     }
 }
@@ -533,7 +537,7 @@ impl Default for DictOpts {
 
 impl Default for PasteOpts {
     fn default() -> Self {
-        Self { restore_clipboard: true, restore_delay_ms: 350, press_enter_command: false }
+        Self { restore_clipboard: true, restore_delay_ms: 500, press_enter_command: false }
     }
 }
 

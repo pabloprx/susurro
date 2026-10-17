@@ -38,6 +38,9 @@ export const permStore = store<Permissions>(api.permissionsStatus);
 /** Last hotkey_status from Rust (null = none seen yet: there is no command to query it). */
 export const hotkeyStore = store<HotkeyStatus | null>(async (): Promise<HotkeyStatus | null> => hotkeyStore.get());
 void on("hotkey_status", hotkeyStore.set);
+// Wispr re-checks permissions when the app comes to the front: the user may have just changed one in System Settings.
+void on("permissions_changed", permStore.set);
+if (typeof window !== "undefined") addEventListener("focus", () => void (permStore.get() && permStore.refresh()));
 // Saves run one at a time: two quick changes (Use a model, then pick a language) must not race, or the second
 // save reads the backend before the first one lands and writes the old value back.
 let chain: Promise<unknown> = Promise.resolve();

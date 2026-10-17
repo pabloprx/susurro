@@ -1,6 +1,6 @@
 //! `{app_data_dir}/settings.json`: load with defaults, atomic save, version migration.
 
-use crate::contract::{MicSettings, SETTINGS_VERSION, Settings};
+use crate::contract::{MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
 use std::path::Path;
 
 /// Missing file -> defaults. Corrupt file -> renamed to `settings.json.bad` (kept for the user), defaults.
@@ -27,9 +27,15 @@ fn migrate(mut s: Settings) -> Settings {
             k.last_seen *= 1000;
         }
     }
-    // v2: fn never worked for most users (system-owned, missing on many keyboards). Later choices are kept.
-    if s.version < 2 && s.hotkeys.ptt.trim().eq_ignore_ascii_case("fn") {
-        s.hotkeys.ptt = "RightOption".into();
+    // v2: fn never worked for most users (system-owned, missing on many keyboards): F1 is the default now.
+    // The 350 ms restore delay was the old default and too short for Electron apps. Later choices are kept.
+    if s.version < 2 {
+        if s.hotkeys.ptt.trim().eq_ignore_ascii_case("fn") {
+            s.hotkeys.ptt = "F1".into();
+        }
+        if s.paste.restore_delay_ms == 350 {
+            s.paste.restore_delay_ms = PasteOpts::default().restore_delay_ms;
+        }
     }
     s.version = SETTINGS_VERSION;
     s
@@ -195,11 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn v1_fn_becomes_right_option_once() {
+    fn v1_fn_becomes_f1_once() {
         let p = tmp_dir("fnmig").join("settings.json");
-        std::fs::write(&p, r#"{"version":1,"hotkeys":{"ptt":"Fn"}}"#).unwrap();
+        std::fs::write(&p, r#"{"version":1,"hotkeys":{"ptt":"Fn"},"paste":{"restore_delay_ms":350}}"#).unwrap();
         let s = load(&p);
-        assert_eq!(s.hotkeys.ptt, "RightOption");
+        assert_eq!(s.hotkeys.ptt, "F1");
+        assert_eq!(s.hotkeys.copy_last, "Ctrl+Cmd+C", "new field gets its default");
+        assert_eq!(s.paste.restore_delay_ms, 500);
         assert_eq!(s.version, SETTINGS_VERSION);
         // A v2 user who picks Fn again keeps it.
         let mut s2 = s.clone();
@@ -209,6 +217,10 @@ mod tests {
         // Other v1 choices are kept.
         std::fs::write(&p, r#"{"version":1,"hotkeys":{"ptt":"Alt+Space"}}"#).unwrap();
         assert_eq!(load(&p).hotkeys.ptt, "Alt+Space");
+        // A v1 user's own delay is kept; the default ptt is F1.
+        std::fs::write(&p, r#"{"version":1,"paste":{"restore_delay_ms":900}}"#).unwrap();
+        assert_eq!(load(&p).paste.restore_delay_ms, 900);
+        assert_eq!(Settings::default().hotkeys.ptt, "F1");
     }
 
     #[test]

@@ -16,12 +16,32 @@ const SIZE: Record<View, [number, number]> = {
   handsfree: [232, 36],
   processing: [120, 36],
   done: [120, 36],
-  copied: [260, 36],
+  copied: [168, 36],
   error: [0, 36], // auto, measured
   notice: [0, 36],
 };
 const WAVE_VIEWS: View[] = ["listening", "handsfree", "processing"];
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
+const SNOOZE_MS = 60 * 60_000;
+
+/** Show the main window on one screen (the bar and its menu have no router of their own). */
+async function openMain(screen: string) {
+  if (!isTauri) return;
+  const [{ Window }, { emitTo }] = await Promise.all([import("@tauri-apps/api/window"), import("@tauri-apps/api/event")]);
+  const main = await Window.getByLabel("main");
+  await main?.show();
+  await main?.setFocus();
+  await emitTo("main", "navigate", { screen });
+}
+
+/** The one-click fix for an error, when the message names a cause the user can change. */
+function fixFor(msg: string | null): { label: string; run: () => unknown } | null {
+  if (!msg) return null;
+  if (/accessibility/i.test(msg)) return { label: "Turn on", run: () => api.requestPermission("accessibility") };
+  if (/microphone|mic\b|no audio|muted/i.test(msg)) return { label: "Check mic", run: () => openMain("audio") };
+  if (/\bkey\b|401|403|openrouter|elevenlabs|provider|server|model/i.test(msg)) return { label: "Fix", run: () => openMain("providers") };
+  return null;
+}
 
 function viewOf(s: SessionState): View {
   switch (s.phase) {
@@ -52,6 +72,7 @@ export default function Overlay() {
   });
   const [notice, setNotice] = useState<Toast | null>(null);
   const [hover, setHover] = useState(false);
+  const [snoozed, setSnoozed] = useState(false);
   const [, tick] = useState(0);
   const wave = useRef<Waveform | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -87,6 +108,12 @@ export default function Overlay() {
     }
     return () => offs.forEach((p) => p.then((f) => f()));
   }, []);
+
+  useEffect(() => {
+    if (!snoozed) return;
+    const t = setTimeout(() => setSnoozed(false), SNOOZE_MS);
+    return () => clearTimeout(t);
+  }, [snoozed]);
 
   // notice lifetime: ttl, capped at 4 s unless it asks for a decision. Undo keeps the exact Rust deadline.
   const deadline = notice !== null && hasDeadline(notice);
@@ -142,7 +169,7 @@ export default function Overlay() {
   useLayoutEffect(() => {
     const c = pill.current?.querySelector<HTMLElement>(".layer.in .content");
     if (!c) return;
-    if (view === "error" || view === "notice") setAutoW(c.offsetWidth + 28);
+    if (view === "error" || view === "notice" || (view === "idle" && hover)) setAutoW(c.offsetWidth + 28);
     const slot = c.querySelector(".wave-slot");
     if (slot) {
       const a = slot.getBoundingClientRect();
@@ -154,15 +181,17 @@ export default function Overlay() {
   let [w, h] = SIZE[view];
   if (!w) w = autoW;
   if (warning) w += view === "listening" ? 70 : 34; // "0:59 left" is wider than "0:42"
-  if (view === "idle" && hover) [w, h] = [120, 24];
+  if (view === "idle" && hover) [w, h] = [autoW, 24];
   const hidden = view === "idle" && settings && !settings.overlay.show_idle;
+  const ptt = keysOf(settings?.hotkeys.ptt ?? "F1").join(" ");
+  const fix = view === "error" ? fixFor(shown.msg) : null;
 
   const timer = (
     <span className={`timer${warning ? " warn" : ""}`}>{warning ? `${mmss(Math.max(0, max - elapsed))} left` : mmss(elapsed)}</span>
   );
 
   const body: Record<View, ReactNode> = {
-    idle: <span className="hint">{keysOf(settings?.hotkeys.ptt ?? "RightOption").join(" ")} to talk</span>,
+    idle: <span className="hint">Click or hold {ptt}</span>,
     listening: (
       <>
         <span className="tally-dot pulse" />
@@ -199,13 +228,24 @@ export default function Overlay() {
     copied: (
       <>
         <Clipboard size={13} strokeWidth={1.75} className="dim" />
-        <span className="msg">Copied - grant Accessibility</span>
+        <span className="msg">Copied to clipboard</span>
       </>
     ),
     error: (
       <>
         <AlertTriangle size={13} strokeWidth={1.75} className="danger" />
         <span className="msg ellipsis" title={shown.msg || undefined}>{shown.msg || "Dictation failed"}</span>
+        {fix && (
+          <button
+            className="link"
+            onClick={(e) => {
+              e.stopPropagation();
+              void fix.run();
+            }}
+          >
+            {fix.label}
+          </button>
+        )}
       </>
     ),
     notice: notice && (
@@ -238,35 +278,34 @@ export default function Overlay() {
   async function menu(e: React.MouseEvent) {
     e.preventDefault();
     if (!isTauri) return;
-    const [{ Menu, CheckMenuItem, MenuItem, PredefinedMenuItem }, { Window }, { emitTo }] = await Promise.all([
-      import("@tauri-apps/api/menu"),
-      import("@tauri-apps/api/window"),
-      import("@tauri-apps/api/event"),
-    ]);
+    const { Menu, CheckMenuItem, MenuItem, PredefinedMenuItem, Submenu } = await import("@tauri-apps/api/menu");
     const mic = await api.getMicState();
     const auto = mic.selection === "auto";
+    const sep = () => PredefinedMenuItem.new({ item: "Separator" });
+    const mics = await Submenu.new({
+      text: "Microphone",
+      items: [
+        await CheckMenuItem.new({ text: "Auto", checked: auto, action: () => void api.setMicSelection("auto") }),
+        await sep(),
+        ...(await Promise.all(
+          mic.devices.map((d) =>
+            CheckMenuItem.new({
+              text: d.name,
+              checked: !auto && mic.active === d.id,
+              action: () => void api.setMicSelection({ device: { id: d.id } }),
+            }),
+          ),
+        )),
+        await sep(),
+        await MenuItem.new({ text: "Audio settings…", action: () => void openMain("audio") }),
+      ],
+    });
     const items = [
-      await CheckMenuItem.new({ text: "Auto", checked: auto, action: () => void api.setMicSelection("auto") }),
-      await PredefinedMenuItem.new({ item: "Separator" }),
-      ...(await Promise.all(
-        mic.devices.map((d) =>
-          CheckMenuItem.new({
-            text: d.name,
-            checked: !auto && mic.active === d.id,
-            action: () => void api.setMicSelection({ device: { id: d.id } }),
-          }),
-        ),
-      )),
-      await PredefinedMenuItem.new({ item: "Separator" }),
-      await MenuItem.new({
-        text: "Open audio settings…",
-        action: async () => {
-          const main = await Window.getByLabel("main");
-          await main?.show();
-          await main?.setFocus();
-          await emitTo("main", "navigate", { screen: "audio" });
-        },
-      }),
+      await MenuItem.new({ text: "Paste last transcript", action: () => void api.pasteLast() }),
+      mics,
+      await sep(),
+      await MenuItem.new({ text: "Hide for 1 hour", action: () => setSnoozed(true) }),
+      await MenuItem.new({ text: "Open susurro", action: () => void openMain("home") }),
     ];
     (await Menu.new({ items })).popup();
   }
@@ -277,7 +316,7 @@ export default function Overlay() {
   return (
     <div className="pill-root">
       <div
-        className={`pill v-${view}${hover ? " hover" : ""}${hidden ? " hidden" : ""}${warning ? " warning" : ""}${shake ? " shake" : ""}`}
+        className={`pill v-${view}${hover ? " hover" : ""}${hidden ? " hidden" : ""}${snoozed && view === "idle" ? " snoozed" : ""}${warning ? " warning" : ""}${shake ? " shake" : ""}`}
         ref={pill}
         style={{ width: w, height: h }}
         onMouseEnter={() => setHover(true)}

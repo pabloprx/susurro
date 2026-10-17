@@ -24,6 +24,8 @@ pub enum SessionCmd {
     Stop,
     Cancel,
     PasteLast,
+    /// Copy the last transcript to the clipboard, no paste.
+    CopyLast,
     DeviceLost,
     Retry(i64),
     ToastAction { toast_id: String, action_id: String },
@@ -376,6 +378,10 @@ impl Actor {
                 }
                 match (toast_id.as_str(), action_id.as_str()) {
                     ("cancelled", "undo") => Ev::Undo,
+                    (_, "fix-ax") => {
+                        let _ = crate::permissions::request_permission(crate::contract::PermKind::Accessibility);
+                        return false;
+                    }
                     ("failed", "retry") => return self.retry_failed(),
                     (id, "retry") => match id.strip_prefix("failed:").and_then(|n| n.parse().ok()) {
                         Some(id) => return self.retry(id),
@@ -389,6 +395,16 @@ impl Actor {
                 self.paste_last();
                 return false;
             }
+            SessionCmd::CopyLast => {
+                match self.last() {
+                    Some(t) => {
+                        paste::copy(&t);
+                        toast(&self.app, None, "copy-last", ToastKind::Info, "Copied the last transcript", &[], 2500);
+                    }
+                    None => toast(&self.app, None, "copy-last", ToastKind::Info, "Nothing to copy yet", &[], 3000),
+                }
+                return false;
+            }
             SessionCmd::PasteText(t) => {
                 // A paste now would break a running dictation (the overlay would show Done while recording).
                 if self.m.phase() != Phase::Idle {
@@ -396,7 +412,7 @@ impl Actor {
                     return false;
                 }
                 self.step_aside();
-                self.deliver(&t, false);
+                self.deliver(&t, false, None);
                 return false;
             }
             SessionCmd::Shutdown => return false,
@@ -447,7 +463,7 @@ impl Actor {
     fn start(&mut self, locked: bool) {
         self.idle_at = None;
         self.kept = None;
-        let front = paste::frontmost_app();
+        let front = paste::target_app(); // a click on the overlay bar activates susurro
         // PLAN 3.2: resolve on a fresh list (about 1 ms), so a mic plugged in under 1.5 s ago counts.
         let Some(dev) = audio::resolve_current(&self.app, true) else {
             self.m.idle();
@@ -542,7 +558,7 @@ impl Actor {
             }
             Outcome::Text(d) => {
                 let latency_ms = t.elapsed().as_millis() as u32; // STT + cleanup, not the paste
-                let status = self.deliver_done(d);
+                let status = self.deliver_done(d, ctx.app.as_ref());
                 let mut item = row(d.raw.clone(), d.final_text.clone(), status, None);
                 item.latency_ms = latency_ms;
                 item.cleanup = run.cleanup(d);
@@ -568,15 +584,15 @@ impl Actor {
     }
 
     /// Paste the pipeline result, press Return if asked, then show Done.
-    fn deliver_done(&mut self, d: &Done) -> HistoryStatus {
-        let status = self.deliver(&d.final_text, d.press_enter);
+    fn deliver_done(&mut self, d: &Done, target: Option<&AppRef>) -> HistoryStatus {
+        let status = self.deliver(&d.final_text, d.press_enter, target);
         self.last_text = Some(d.final_text.clone());
         status
     }
 
-    fn deliver(&mut self, text: &str, press_enter: bool) -> HistoryStatus {
+    fn deliver(&mut self, text: &str, press_enter: bool, target: Option<&AppRef>) -> HistoryStatus {
         let opts = self.state().settings.read().unwrap().paste.clone();
-        let out = if text.is_empty() { PasteOutcome::Pasted } else { paste::paste(text, &opts) };
+        let out = if text.is_empty() { PasteOutcome::Pasted } else { paste::paste(text, &opts, target) };
         let status = match out {
             PasteOutcome::Pasted => {
                 if press_enter {
@@ -586,7 +602,12 @@ impl Actor {
                 HistoryStatus::Pasted
             }
             PasteOutcome::CopiedOnly => {
-                toast(&self.app, None, "copied", ToastKind::Warn, "Copied - grant Accessibility to paste", &[], 5000);
+                let actions = [("fix-ax", "Turn on")];
+                toast(&self.app, None, "copied", ToastKind::Warn, "Copied. Turn on Accessibility to paste", &actions, 8000);
+                HistoryStatus::Copied
+            }
+            PasteOutcome::NoField => {
+                toast(&self.app, None, "no-field", ToastKind::Info, "No text field. Copied: press ⌘V to paste", &[], 5000);
                 HistoryStatus::Copied
             }
         };
@@ -600,13 +621,19 @@ impl Actor {
         if self.m.phase() != Phase::Idle {
             return;
         }
-        let text = self.last_text.clone().or_else(|| history::latest(&self.state().db.lock().unwrap()).ok().flatten().map(|h| h.final_text));
-        match text {
+        match self.last() {
             Some(t) => {
-                self.deliver(&t, false);
+                // The overlay's right-click menu or the main window can make susurro the front app.
+                let target = paste::target_app();
+                self.deliver(&t, false, target.as_ref());
             }
             None => toast(&self.app, None, "paste-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
         }
+    }
+
+    /// The last transcript: this run's, else the newest history row.
+    fn last(&self) -> Option<String> {
+        self.last_text.clone().or_else(|| history::latest(&self.state().db.lock().unwrap()).ok().flatten().map(|h| h.final_text))
     }
 
     /// Toast Retry after a failed STT: re-run the WAV and paste the result into the frontmost app.
@@ -623,7 +650,7 @@ impl Actor {
         self.set(Phase::Processing, None);
         match history::retry(&self.app, id) {
             Ok(item) => {
-                let status = self.deliver(&item.final_text, false);
+                let status = self.deliver(&item.final_text, false, None);
                 self.last_text = Some(item.final_text.clone());
                 let db = self.state().db.lock().unwrap();
                 if let Err(e) = history::set_status(&db, id, &status) {

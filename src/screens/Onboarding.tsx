@@ -1,142 +1,122 @@
-// DESIGN 6.9 / PLAN 8: seven resumable steps, full window, no sidebar.
+// DESIGN 6.9 / PLAN 8, Wispr order: welcome -> permissions -> mic test -> talk key -> practice. Resumable.
+// Permissions already granted are never asked again: the step is skipped, and a card that is done shows a check.
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, Check, Globe, Hand, Repeat, RotateCw } from "lucide-react";
-import { api, on, type HistoryItem, type ModelInfo, type ModelProgress } from "../lib/api";
-import { hotkeyStore, isModOnly, keyLabel, keysOf, modelName, permStore, saveSettings, secs, settingsStore } from "../lib/store";
-import { Kbd, Meter, radioKeys, Serif, useLevel } from "../ui";
+import { AlertTriangle, Check, Keyboard, Mic, MousePointerClick, RotateCw } from "lucide-react";
+import { api, on, type HistoryItem, type ModelInfo, type ModelProgress, type Permissions, type Settings } from "../lib/api";
+import { hotkeyStore, isModOnly, keyLabel, keysOf, micStore, modelName, permStore, saveSettings, secs, settingsStore } from "../lib/store";
+import { Kbd, Meter, radioKeys, Serif, Toggle, useLevel } from "../ui";
 import { LANGUAGES } from "./Providers";
 import { useRecorder } from "./Shortcuts";
 import type { Nav } from "../App";
 
-const STEPS = 7;
-/** The step to reopen on after relaunch_app (App reads it on boot). */
+export const STEPS = 5;
+export const PERM_STEP = 1;
+/** The step to reopen on: after relaunch_app, or after a quit in the middle of onboarding (App reads it on boot). */
 export const RESUME_KEY = "susurro.obStep";
-const recheck = () => api.permissionsStatus().then(permStore.set);
+const recheck = () => permStore.refresh();
 
-export default function Onboarding({ start, onDone, nav }: { start: number; onDone: () => void; nav: Nav }) {
-  const [step, setStep] = useState(start);
-  const [dir, setDir] = useState<"fwd" | "back">("fwd");
-  // reopened by a restart: a grant that shows up now still gets its check mark and advances by itself
-  const [resumed, setResumed] = useState(() => localStorage.getItem(RESUME_KEY) !== null);
-  useEffect(() => localStorage.removeItem(RESUME_KEY), []);
-  const perms = permStore.use();
-  const s = settingsStore.use();
+type Need = "microphone" | "accessibility" | "input_monitoring";
+/** The grants this setup needs right now, and which of them are done. Input Monitoring only for a held modifier. */
+export function needs(p: Permissions, s: Settings): [Need, boolean][] {
+  const out: [Need, boolean][] = [
+    ["microphone", p.microphone === "granted"],
+    ["accessibility", p.accessibility],
+  ];
+  if (isModOnly(s.hotkeys.ptt)) out.push(["input_monitoring", p.input_monitoring && !p.needs_relaunch]);
+  return out;
+}
+export const allGranted = (p: Permissions, s: Settings) => needs(p, s).every(([, ok]) => ok);
 
-  // macOS has no grant callback: poll every 1 s while a permission step is open (PLAN 8), and re-check the moment
-  // the window comes back (the user returns from System Settings)
+/** macOS has no grant callback: poll every 1 s while `active`, re-check when the window comes back (the user returns
+ *  from System Settings), and take a pushed permissions_changed when Rust sends one. */
+function usePermWatch(active: boolean) {
   useEffect(() => {
-    if (step < 1 || step > 4) return;
+    if (!active) return;
     const t = setInterval(recheck, 1000);
     const back = () => document.visibilityState !== "hidden" && void recheck();
     addEventListener("focus", back);
     document.addEventListener("visibilitychange", back);
+    const off = on("permissions_changed", permStore.set);
     return () => {
       clearInterval(t);
       removeEventListener("focus", back);
       document.removeEventListener("visibilitychange", back);
+      void off.then((f) => f());
     };
+  }, [active]);
+}
+
+export default function Onboarding({ start, onDone, nav }: { start: number; onDone: () => void; nav: Nav }) {
+  const perms = permStore.use();
+  const s = settingsStore.use();
+  // already onboarded: only the permissions page, opened because a grant went missing (or from a Grant link)
+  const [repair] = useState(() => settingsStore.get()?.onboarded === true);
+  const [step, setStep] = useState(() => Math.max(0, Math.min(STEPS - 1, repair ? PERM_STEP : start)));
+  const [dir, setDir] = useState<"fwd" | "back">("fwd");
+
+  useEffect(() => {
+    if (repair) localStorage.removeItem(RESUME_KEY);
+    else localStorage.setItem(RESUME_KEY, String(step));
   }, [step]);
 
-  const go = (n: number) => {
+  const finish = async () => {
+    localStorage.removeItem(RESUME_KEY);
+    sessionStorage.setItem("susurro.skipOnboarding", "1");
+    // Wispr turns on open at login at first launch; a dictation app that is not running does nothing
+    if (!repair) await saveSettings((x) => void ((x.onboarded = true), (x.autostart = true)));
+    onDone();
+  };
+  const go = async (n: number) => {
+    if (repair) return void finish();
+    // never stop on a permissions page that has nothing left to ask (fresh read: a grant can land any time)
+    if (n === PERM_STEP) {
+      const p = await api.permissionsStatus().catch(() => null);
+      const cur = settingsStore.get();
+      if (p) permStore.set(p);
+      if (p && cur && allGranted(p, cur)) n += n < step ? -1 : 1;
+    }
     setDir(n < step ? "back" : "fwd");
-    setResumed(false);
     setStep(Math.max(0, Math.min(STEPS - 1, n)));
   };
+  const next = () => void go(step + 1);
   const restart = () => {
     localStorage.setItem(RESUME_KEY, String(step));
     void api.relaunchApp();
   };
-  const next = () => go(step + 1);
-  const finish = async () => {
-    sessionStorage.setItem("susurro.skipOnboarding", "1");
-    await saveSettings((x) => void (x.onboarded = true));
-    onDone();
-  };
 
   if (!s || !perms) return <div className="onboarding" />;
-  const ptt = s.hotkeys.ptt;
-  const label = keyLabel(ptt);
 
   const steps: ReactNode[] = [
-    <Welcome key="w" onNext={next} />,
-    <MicStep key="m" granted={perms.microphone === "granted"} denied={perms.microphone === "denied"} onNext={next} />,
-    <PermStep
-      key="a"
-      eyebrow="Accessibility"
-      title={["Paste where you ", "type."]}
-      why="Accessibility lets susurro press ⌘V in the app you are using."
-      not="susurro does not read your screen."
-      granted={perms.accessibility}
-      onGrant={() => api.requestPermission("accessibility")}
-      onNext={next}
-      onRestart={restart}
-      resumed={resumed}
-      pane="Accessibility"
-    />,
-    <PermStep
-      key="i"
-      eyebrow="Input Monitoring"
-      title={["Hold ", label, " to talk."]}
-      why={`Input Monitoring lets susurro see ${label} from any app.`}
-      not="It does not record what you type."
-      granted={perms.input_monitoring && !perms.needs_relaunch && (ptt !== "Fn" || perms.fn_key_free !== false)}
-      needsRelaunch={perms.needs_relaunch}
-      onGrant={perms.input_monitoring ? null : () => api.requestPermission("input_monitoring")}
-      onNext={next}
-      onRestart={restart}
-      resumed={resumed}
-      pane="Input Monitoring"
-      blocked={
-        perms.input_monitoring &&
-        !perms.needs_relaunch &&
-        ptt === "Fn" &&
-        perms.fn_key_free === false && (
-          <div className="ob-panel">
-            <p className="note warn-text" style={{ justifyContent: "center" }}>
-              <AlertTriangle size={14} strokeWidth={1.5} /> Set &lsquo;Press fn key to&rsquo; = Do Nothing, or fn also opens the emoji picker.
-            </p>
-            <button className="btn primary" style={{ marginTop: 12 }} onClick={() => api.requestPermission("fn_key")}>
-              Open Keyboard settings
-            </button>
-          </div>
-        )
-      }
-      extra={
-        <button
-          className="link small"
-          onClick={async () => {
-            await saveSettings((x) => void (x.hotkeys.ptt = "Alt+Space"));
-            next();
-          }}
-        >
-          Use ⌥ Space instead (no permission)
-        </button>
-      }
-    />,
-    <TalkKeyStep key="k" onNext={next} onRestart={restart} onGrant={() => go(3)} />,
-    <ShortcutStep key="s" onNext={next} />,
-    <TryStep key="t" ptt={ptt} onFinish={finish} onCloud={async () => (await finish(), nav.go("providers"))} />,
+    <Welcome key="w" ptt={s.hotkeys.ptt} onNext={next} />,
+    <PermsStep key="p" onNext={next} onRestart={restart} repair={repair} onUseF1={() => saveSettings((x) => void (x.hotkeys.ptt = "F1"))} />,
+    <MicStep key="m" onNext={next} />,
+    <TalkKeyStep key="k" onNext={next} onRestart={restart} />,
+    <TryStep key="t" onFinish={finish} onCloud={async () => (await finish(), nav.go("providers"))} />,
   ];
 
   return (
     <div className="onboarding">
       <div className="ob-top" data-tauri-drag-region>
-        <div className="ticks" aria-label={`Step ${step + 1} of ${STEPS}`}>
-          {Array.from({ length: STEPS }, (_, i) => (
-            <i key={i} className={i < step ? "done" : i === step ? "cur" : ""} />
-          ))}
-          <span className="count">
-            {step + 1}/{STEPS}
-          </span>
-        </div>
+        {repair ? (
+          <span />
+        ) : (
+          <div className="ticks" aria-label={`Step ${step + 1} of ${STEPS}`}>
+            {Array.from({ length: STEPS }, (_, i) => (
+              <i key={i} className={i < step ? "done" : i === step ? "cur" : ""} />
+            ))}
+            <span className="count">
+              {step + 1}/{STEPS}
+            </span>
+          </div>
+        )}
         <span className="inline">
-          {step > 0 && (
-            <button className="btn ghost sm" onClick={() => go(step - 1)}>
+          {step > 0 && !repair && (
+            <button className="btn ghost sm" onClick={() => void go(step - 1)}>
               Back
             </button>
           )}
           <button className="btn ghost sm" onClick={finish}>
-            Skip for now
+            {repair ? "Not now" : "Skip setup"}
           </button>
         </span>
       </div>
@@ -149,15 +129,17 @@ export default function Onboarding({ start, onDone, nav }: { start: number; onDo
   );
 }
 
-const Head = ({ eyebrow, title }: { eyebrow: string; title: string[] }) => (
+const Head = ({ eyebrow, title, sub }: { eyebrow: string; title: string[]; sub?: ReactNode }) => (
   <>
     <div className="eyebrow">{eyebrow}</div>
     <Serif as="h1" parts={title} />
+    {sub && <p className="why">{sub}</p>}
   </>
 );
 
-function Welcome({ onNext }: { onNext: () => void }) {
-  const [run, setRun] = useState(0);
+// ---------------- 1. welcome ----------------
+
+function Welcome({ ptt, onNext }: { ptt: string; onNext: () => void }) {
   // the messy line: fillers strike and float FILLER, "friday no actually" collapses as BACKTRACK
   const W: [string, number?, string?][] = [["um", 200, "FILLER"], ["so", 450, "FILLER"], ["I"], ["think"], ["we"], ["should,"], ["uh,", 700, "FILLER"], ["ship"], ["it"], ["friday", 1000, "BACKTRACK"], ["no", 1000], ["actually", 1000], ["thursday"]];
   return (
@@ -166,7 +148,7 @@ function Welcome({ onNext }: { onNext: () => void }) {
       <h1>
         Talk. It <em>types.</em>
       </h1>
-      <div className="demo" key={run} aria-label="um so I think we should, uh, ship it friday no actually thursday, becomes: I think we should ship it Thursday.">
+      <div className="demo" aria-label="um so I think we should, uh, ship it friday no actually thursday, becomes: I think we should ship it Thursday.">
         <div className="messy" aria-hidden>
           {W.map(([w, at, tag], i) => (
             <span key={i}>
@@ -184,188 +166,246 @@ function Welcome({ onNext }: { onNext: () => void }) {
           I think we should ship it Thursday.
         </div>
       </div>
+      <p className="why">
+        Hold <Kbd keys={keysOf(ptt)} /> in any app, speak, let go. Clean text lands where you type.
+      </p>
       <div className="ob-actions">
         <button className="btn primary ob-next" onClick={onNext} autoFocus>
           Get started
         </button>
-        <button className="link small" onClick={() => setRun(run + 1)}>
-          Replay
-        </button>
+      </div>
+      <p className="not">About a minute. Audio stays on this Mac with Local Whisper.</p>
+    </>
+  );
+}
+
+// ---------------- 2. permissions ----------------
+
+const PANE: Record<Need, string> = { microphone: "Microphone", accessibility: "Accessibility", input_monitoring: "Input Monitoring" };
+
+/** A picture of the exact row to turn on in System Settings. */
+function Diagram({ pane }: { pane: string }) {
+  return (
+    <div className="diagram" aria-label={`In System Settings, Privacy and Security, ${pane}: turn on susurro`}>
+      <div className="bar" aria-hidden>
+        <i />
+        <i />
+        <i />
+        <span>Privacy &amp; Security › {pane}</span>
+      </div>
+      <div className="item" aria-hidden>
+        <span className="app-ico">T</span> Terminal
+        <span className="toggle" aria-hidden>
+          <span />
+        </span>
+      </div>
+      <div className="item me" aria-hidden>
+        <span className="app-ico">s</span> susurro
+        <span className="hand" aria-hidden>
+          <MousePointerClick size={14} strokeWidth={1.5} />
+        </span>
+        <span className="toggle on" aria-hidden>
+          <span />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PermsStep({ onNext, onRestart, repair, onUseF1 }: { onNext: () => void; onRestart: () => void; repair: boolean; onUseF1: () => void }) {
+  const p = permStore.use()!;
+  const s = settingsStore.use()!;
+  const list = needs(p, s);
+  const done = list.every(([, ok]) => ok);
+  const active = list.find(([, ok]) => !ok)?.[0] ?? null;
+  usePermWatch(!done);
+  // the grant shows up: a short beat on the check marks, then move on by itself
+  useEffect(() => {
+    if (!done) return;
+    const t = setTimeout(onNext, 700);
+    return () => clearTimeout(t);
+  }, [done]);
+
+  const label = keyLabel(s.hotkeys.ptt);
+  const n = list.length === 2 ? "Two" : "Three";
+  return (
+    <>
+      <Head
+        eyebrow={repair ? "Permissions" : "Setup"}
+        title={repair ? ["Turn it back ", "on."] : [`${n} `, "quick", " switches."]}
+        sub={repair ? "macOS turned a permission off. Switch it back on and susurro sees it right away." : "macOS asks once. Anything you already allowed shows a check."}
+      />
+      <div className="perm-cards" role="list">
+        {list.map(([k, ok]) => (
+          <PermCard key={k} kind={k} ok={ok} active={k === active} p={p} label={label} onRestart={onRestart} />
+        ))}
+      </div>
+      <div className="ob-links">
+        {active === "input_monitoring" && (
+          <button className="link small" onClick={onUseF1}>
+            Use F1 instead (no permission)
+          </button>
+        )}
+        {done && (
+          <p className="ob-granted" role="status">
+            <Check size={16} strokeWidth={2} /> All set
+          </p>
+        )}
       </div>
     </>
   );
 }
 
-function MicStep({ granted, denied, onNext }: { granted: boolean; denied: boolean; onNext: () => void }) {
+const CARD: Record<Need, { icon: ReactNode; title: string; sub: (key: string) => string }> = {
+  microphone: { icon: <Mic size={16} strokeWidth={1.5} />, title: "Use your microphone", sub: (k) => `Only while you hold ${k}. The menu bar dot shows it.` },
+  accessibility: { icon: <MousePointerClick size={16} strokeWidth={1.5} />, title: "Type for you", sub: () => "Accessibility lets susurro paste into the app you are using. It does not read your screen." },
+  input_monitoring: { icon: <Keyboard size={16} strokeWidth={1.5} />, title: "Hear your talk key", sub: (k) => `Input Monitoring lets susurro notice ${k} in any app. It does not record what you type.` },
+};
+
+function PermCard({ kind, ok, active, p, label, onRestart }: { kind: Need; ok: boolean; active: boolean; p: Permissions; label: string; onRestart: () => void }) {
+  const [asked, setAsked] = useState(false);
+  const [slow, setSlow] = useState(false);
+  // asked and still nothing after 10 s: the old switch is probably stale (an older build). Say how to fix it.
+  useEffect(() => {
+    if (!asked || ok) return;
+    const t = setTimeout(() => setSlow(true), 10_000);
+    return () => clearTimeout(t);
+  }, [asked, ok]);
+  const ask = () => {
+    setAsked(true);
+    void api.requestPermission(kind);
+  };
+  // Input Monitoring is the one grant macOS applies only to a new process
+  const relaunch = kind === "input_monitoring" && p.input_monitoring && p.needs_relaunch;
+  const micPrompt = kind === "microphone" && p.microphone === "undetermined";
+  const c = CARD[kind];
+  return (
+    <div className={`perm-card${ok ? " ok" : active ? " active" : ""}`} role="listitem" aria-label={`${c.title}: ${ok ? "allowed" : "not allowed yet"}`}>
+      <div className="pc-head">
+        <span className="pc-ico" aria-hidden>
+          {ok ? <Check size={16} strokeWidth={2} /> : c.icon}
+        </span>
+        <span className="pc-text">
+          <span className="t">{c.title}</span>
+          <span className="d">{c.sub(label)}</span>
+        </span>
+        {ok ? (
+          <span className="pc-state ok-text">Allowed</span>
+        ) : active && !relaunch && micPrompt ? (
+          <button className="btn primary sm" onClick={ask} autoFocus>
+            Allow
+          </button>
+        ) : active && !relaunch ? (
+          <button className="btn primary sm" onClick={ask} autoFocus>
+            Open System Settings
+          </button>
+        ) : relaunch ? (
+          <button className="btn primary sm" onClick={onRestart} autoFocus>
+            Restart susurro
+          </button>
+        ) : null}
+      </div>
+      {active && !micPrompt && (
+        <div className="pc-body">
+          {relaunch ? (
+            <p className="ob-restart" role="status">
+              <RotateCw size={14} strokeWidth={1.5} /> Allowed. macOS applies it after a restart, and susurro reopens right here.
+            </p>
+          ) : (
+            <>
+              <Diagram pane={PANE[kind]} />
+              <p className="small">{asked ? "Turn on susurro in the list. This page sees it by itself." : `Click the button, then turn on susurro in ${PANE[kind]}.`}</p>
+              {slow && (
+                <p className="note warn-text pc-slow" role="status">
+                  <AlertTriangle size={14} strokeWidth={1.5} /> Already on? Turn susurro off and on again. macOS keeps an old switch from an earlier build.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------- 3. microphone test ----------------
+
+function MicStep({ onNext }: { onNext: () => void }) {
+  const p = permStore.use()!;
+  const mic = micStore.use();
+  const granted = p.microphone === "granted";
   const [heard, setHeard] = useState(false);
   const lvl = useLevel(granted);
+  usePermWatch(!granted);
+  const sel = mic?.selection === "auto" ? "auto" : (mic?.selection.device.id ?? "auto");
   useEffect(() => {
     if (!granted) return;
+    setHeard(false);
     api.micTestStart(null).catch(() => {});
     return () => void api.micTestStop();
-  }, [granted]);
+  }, [granted, sel]);
   useEffect(() => {
     if (lvl.db > -40) setHeard(true);
   }, [lvl.db]);
+  const active = mic?.devices.find((d) => d.id === mic.active);
+  const pickMic = (v: string) => api.setMicSelection(v === "auto" ? "auto" : { device: { id: v } }).then(micStore.set);
   return (
     <>
-      <Head eyebrow="Microphone" title={["Let it ", "listen."]} />
-      <p className="why">susurro opens the mic only while you hold the key. The orange dot in the menu bar tells you.</p>
-      <p className="not">Audio stays on this Mac with Local Whisper.</p>
+      <Head eyebrow="Microphone" title={["Say ", "something."]} sub="Check that the meter moves when you talk." />
       {granted ? (
         <div className="ob-panel">
           <Meter db={lvl.db} peak={lvl.peak} segments={32} />
-          <p className={`note ${heard ? "ok-text" : ""}`} style={{ justifyContent: "center" }}>
+          <p className={`note ${heard ? "ok-text" : ""}`} style={{ justifyContent: "center" }} aria-live="polite">
             {heard ? (
               <>
-                <Check size={14} strokeWidth={2} /> Heard you.
+                <Check size={14} strokeWidth={2} /> Sounds good.
               </>
             ) : (
-              "Say something."
+              "Listening…"
             )}
           </p>
+          <label className="mic-pick">
+            <span className="label">Microphone</span>
+            <select className="input" value={sel} onChange={(e) => void pickMic(e.target.value)} aria-label="Microphone">
+              <option value="auto">Auto{active ? ` (${active.name})` : ""}</option>
+              {mic?.devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
-      ) : null}
+      ) : (
+        <div className="ob-panel">
+          <p className="note warn-text" style={{ justifyContent: "center" }}>
+            <AlertTriangle size={14} strokeWidth={1.5} /> susurro cannot use the microphone yet.
+          </p>
+        </div>
+      )}
       <div className="ob-actions">
         {!granted && (
-          <button className="btn primary ob-primary" onClick={() => api.requestPermission("microphone")}>
-            {denied ? "Open System Settings" : "Allow microphone"}
+          <button className="btn secondary" onClick={() => api.requestPermission("microphone")}>
+            {p.microphone === "denied" ? "Open System Settings" : "Allow microphone"}
           </button>
         )}
-        <button className={`btn ${granted ? "primary" : "ghost"} ob-next`} onClick={onNext}>
-          {granted ? "Continue" : "Not now"}
+        <button className="btn primary ob-next" onClick={onNext} autoFocus={granted}>
+          Continue
         </button>
       </div>
     </>
   );
 }
 
-type PermProps = {
-  eyebrow: string;
-  title: string[];
-  why: string;
-  not: string;
-  granted: boolean;
-  /** Rust sees the grant but this process cannot use it until it restarts. */
-  needsRelaunch?: boolean;
-  onGrant: (() => void) | null;
-  onNext: () => void;
-  onRestart: () => void;
-  resumed: boolean;
-  pane: string;
-  extra?: ReactNode;
-  blocked?: ReactNode;
-};
-function PermStep(p: PermProps) {
-  const was = useRef(p.granted && !p.resumed);
-  const [opened, setOpened] = useState(false);
-  const [stuck, setStuck] = useState(false);
-  // back from System Settings and the grant still does not show after 3 s: macOS wants a new process
-  useEffect(() => {
-    if (!opened || p.granted) return;
-    let t = 0;
-    const back = () => {
-      if (document.visibilityState === "hidden") return;
-      clearTimeout(t);
-      t = window.setTimeout(() => setStuck(true), 3000);
-    };
-    addEventListener("focus", back);
-    document.addEventListener("visibilitychange", back);
-    return () => {
-      clearTimeout(t);
-      removeEventListener("focus", back);
-      document.removeEventListener("visibilitychange", back);
-    };
-  }, [opened, p.granted]);
-  const restart = !p.granted && (p.needsRelaunch || stuck);
-  // advance by itself once the grant shows up
-  useEffect(() => {
-    if (p.granted && !was.current) {
-      const t = setTimeout(p.onNext, 900);
-      return () => clearTimeout(t);
-    }
-    was.current = p.granted;
-  }, [p.granted]);
-  return (
-    <>
-      <Head eyebrow={p.eyebrow} title={p.title} />
-      <p className="why">{p.why}</p>
-      <p className="not">{p.not}</p>
-      {/* blocked: the grant is done but a follow-up check fails; only its fix shows, not the grant block */}
-      {p.blocked || (
-        <>
-          <div className="diagram" aria-label={`System Settings, Privacy and Security, ${p.pane}: turn susurro on`}>
-            <div className="bar">
-              <i />
-              <i />
-              <i />
-              <span>Privacy &amp; Security › {p.pane}</span>
-            </div>
-            <div className="item">
-              <span className="app-ico">T</span> Terminal
-              <span className="toggle" aria-hidden>
-                <span />
-              </span>
-            </div>
-            <div className="item me">
-              <span className="app-ico">s</span> susurro
-              <span className="toggle on" aria-hidden>
-                <span />
-              </span>
-            </div>
-          </div>
-          {p.granted ? (
-            <p className="ob-granted">
-              <Check size={16} strokeWidth={2} /> Granted
-            </p>
-          ) : restart ? (
-            <p className="ob-restart" role="status">
-              <RotateCw size={14} strokeWidth={1.5} /> macOS needs a restart to apply {p.pane}. susurro reopens right here.
-            </p>
-          ) : null}
-          <div className="ob-actions">
-            {restart ? (
-              <button className="btn primary ob-primary" onClick={p.onRestart}>
-                Restart susurro
-              </button>
-            ) : (
-              !p.granted &&
-              p.onGrant && (
-                <button className="btn primary ob-primary" onClick={() => (setOpened(true), p.onGrant!())}>
-                  Open System Settings
-                </button>
-              )
-            )}
-            <button className={`btn ${p.granted ? "primary" : "ghost"} ob-next`} onClick={p.onNext}>
-              {p.granted ? "Continue" : "Not now"}
-            </button>
-          </div>
-        </>
-      )}
-      <div className="ob-links">
-        {!p.granted && !restart && !p.blocked && (
-          <button className="link small" onClick={p.onRestart}>
-            I already enabled it
-          </button>
-        )}
-        {restart && p.onGrant && (
-          <button className="link small" onClick={p.onGrant}>
-            Open System Settings again
-          </button>
-        )}
-        {p.extra}
-      </div>
-    </>
-  );
-}
+// ---------------- 4. talk key ----------------
 
 const KEY_PICKS: [string, string][] = [
-  ["RightOption", "Recommended"],
-  ["RightCommand", "Beside space"],
-  ["Fn", "Apple keyboards"],
+  ["F1", "Recommended"],
+  ["RightOption", "+1 permission"],
+  ["RightCommand", "+1 permission"],
 ];
 
-function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRestart: () => void; onGrant: () => void }) {
+function TalkKeyStep({ onNext, onRestart }: { onNext: () => void; onRestart: () => void }) {
   const s = settingsStore.use()!;
   const perms = permStore.use()!;
   const st = hotkeyStore.use();
@@ -390,22 +430,13 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
 
   const custom = !KEY_PICKS.some(([k]) => k === b);
   const status = st?.binding === b ? st : null;
-  const needsIm = isModOnly(b) && !perms.input_monitoring;
+  const needsIm = isModOnly(b) && (!perms.input_monitoring || perms.needs_relaunch);
+  usePermWatch(needsIm);
   return (
     <>
-      <Head eyebrow="Your talk key" title={["Pick your ", "talk", " key."]} />
-      <p className="why">Hold it to talk, double-tap it for hands-free.</p>
-      <p className="not">Shortcuts with it still type, like ⌥ 2 for @.</p>
+      <Head eyebrow="Talk key" title={["Pick your ", "talk", " key."]} sub="Hold it to talk. Let go to paste." />
       <button className={`keycap${rec ? " recording" : ""}`} onClick={() => setRec(!rec)} aria-label={rec ? "Recording a talk key. Press Escape to cancel." : `Talk key: ${label}. Press to record your own.`}>
-        {rec ? (
-          r.held.length ? (
-            r.held.map((k, i) => <kbd key={i}>{k}</kbd>)
-          ) : (
-            <span className="rec-hint">Press any key or combo</span>
-          )
-        ) : (
-          keysOf(b).map((k, i) => <kbd key={i}>{k}</kbd>)
-        )}
+        {rec ? r.held.length ? r.held.map((k, i) => <kbd key={i}>{k}</kbd>) : <span className="rec-hint">Press any key or combo</span> : keysOf(b).map((k, i) => <kbd key={i}>{k}</kbd>)}
       </button>
       {rec && !r.err && <p className="small">Esc to cancel</p>}
       {rec && r.err && (
@@ -416,16 +447,8 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
       <div className="keypicks">
         <div role="radiogroup" aria-label="Talk key" onKeyDown={radioKeys}>
           {KEY_PICKS.map(([k, tag]) => (
-            <button key={k} role="radio" aria-checked={b === k} tabIndex={b === k || (custom && k === "RightOption") ? 0 : -1} onClick={() => pick(k)}>
-              <span className="cap">
-                {k === "Fn" ? (
-                  <>
-                    fn <Globe size={12} strokeWidth={1.5} aria-hidden />
-                  </>
-                ) : (
-                  keysOf(k)[0]
-                )}
-              </span>
+            <button key={k} role="radio" aria-checked={b === k} tabIndex={b === k || (custom && k === "F1") ? 0 : -1} onClick={() => pick(k)}>
+              <span className="cap">{keysOf(k)[0]}</span>
               <span className="d">{tag}</span>
             </button>
           ))}
@@ -443,18 +466,19 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
         ) : needsIm ? (
           <p className="note warn-text">
             <AlertTriangle size={14} strokeWidth={1.5} /> {label} needs Input Monitoring.{" "}
-            <button className="link" onClick={onGrant}>
-              Grant
-            </button>
+            {perms.input_monitoring ? (
+              <button className="link" onClick={onRestart}>
+                Restart susurro
+              </button>
+            ) : (
+              <button className="link" onClick={() => api.requestPermission("input_monitoring")}>
+                Open System Settings
+              </button>
+            )}
           </p>
         ) : status && !status.active ? (
           <p className="note warn-text">
             <AlertTriangle size={14} strokeWidth={1.5} /> {label} is not working: {status.error ?? "unknown reason"}.
-            {perms.needs_relaunch && (
-              <button className="link" onClick={onRestart}>
-                Restart susurro
-              </button>
-            )}
           </p>
         ) : heard ? (
           <p className="note ok-text">
@@ -462,7 +486,7 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
           </p>
         ) : (
           <p className="note">
-            <span className="dot idle" aria-hidden /> {status?.active ? `${label} is ready. ` : ""}Hold it and say something.
+            <span className="dot idle" aria-hidden /> Hold {label} now to check it.
           </p>
         )}
         {b === "Fn" && perms.fn_key_free === false && (
@@ -474,6 +498,34 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
           </p>
         )}
       </div>
+      <div className="ob-prefs">
+        <div className="pref">
+          <span>
+            <span className="t">Hands-free</span>
+            <span className="d">Double-tap {label} to talk without holding. Tap it again to stop.</span>
+          </span>
+          <Toggle label="Double-tap for hands-free" on={s.hotkeys.double_tap} onChange={(v) => saveSettings((x) => void (x.hotkeys.double_tap = v))} />
+        </div>
+        <div className="pref">
+          <span>
+            <span className="t">Language</span>
+            <span className="d">One language is more accurate than auto.</span>
+          </span>
+          <select className="input" value={s.language} onChange={(e) => saveSettings((x) => void (x.language = e.target.value))} aria-label="Language">
+            {LANGUAGES.slice(0, 3).map(([v, n]) => (
+              <option key={v} value={v}>
+                {n}
+              </option>
+            ))}
+            <option disabled>──</option>
+            {LANGUAGES.slice(3).map(([v, n]) => (
+              <option key={v} value={v}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
       <div className="ob-actions">
         <button className="btn primary ob-next" onClick={onNext}>
           Continue
@@ -483,69 +535,93 @@ function TalkKeyStep({ onNext, onRestart, onGrant }: { onNext: () => void; onRes
   );
 }
 
-function ShortcutStep({ onNext }: { onNext: () => void }) {
+// ---------------- 5. practice ----------------
+
+type Drill = { id: "hold" | "free"; title: (k: string[]) => ReactNode; say: string };
+const DRILLS: Drill[] = [
+  {
+    id: "hold",
+    title: (k) => (
+      <>
+        Hold <Kbd keys={k} />, say the line, let go.
+      </>
+    ),
+    say: "This is my first dictation with susurro.",
+  },
+  {
+    id: "free",
+    title: (k) => (
+      <>
+        Double-tap <Kbd keys={k} />, talk hands-free, tap it once to stop.
+      </>
+    ),
+    say: "Hands-free is great for longer messages.",
+  },
+];
+
+function TryStep({ onFinish, onCloud }: { onFinish: () => void; onCloud: () => void }) {
   const s = settingsStore.use()!;
   const keys = keysOf(s.hotkeys.ptt);
-  const set = (double_tap: boolean) => saveSettings((x) => void (x.hotkeys.double_tap = double_tap));
-  return (
-    <>
-      <Head eyebrow="Your shortcut" title={["One key. ", "Your", " rhythm."]} />
-      <div className="choice" role="radiogroup" aria-label="How you dictate" onKeyDown={radioKeys}>
-        <button role="radio" aria-checked={!s.hotkeys.double_tap} tabIndex={s.hotkeys.double_tap ? -1 : 0} onClick={() => set(false)}>
-          <span className="t">
-            <Hand size={16} strokeWidth={1.5} /> Hold to talk
-          </span>
-          <span className="d">
-            Hold <Kbd keys={keys} />, talk, release. Text lands where you type.
-          </span>
-        </button>
-        <button role="radio" aria-checked={s.hotkeys.double_tap} tabIndex={s.hotkeys.double_tap ? 0 : -1} onClick={() => set(true)}>
-          <span className="t">
-            <Repeat size={16} strokeWidth={1.5} /> Tap to toggle
-          </span>
-          <span className="d">
-            Hold works too. Double-tap <Kbd keys={keys} /> to talk hands-free, tap again to stop.
-          </span>
-        </button>
-      </div>
-      <div className="lang-row" style={{ justifyContent: "center" }}>
-        <span className="label">Language</span>
-        <select className="input" value={s.language} onChange={(e) => saveSettings((x) => void (x.language = e.target.value))} aria-label="Language">
-          {LANGUAGES.slice(0, 3).map(([v, n]) => (
-            <option key={v} value={v}>
-              {n}
-            </option>
-          ))}
-          <option disabled>──</option>
-          {LANGUAGES.slice(3).map(([v, n]) => (
-            <option key={v} value={v}>
-              {n}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="ob-actions">
-        <button className="btn primary ob-next" onClick={onNext}>
-          Continue
-        </button>
-      </div>
-    </>
-  );
-}
-
-function TryStep({ ptt, onFinish, onCloud }: { ptt: string; onFinish: () => void; onCloud: () => void }) {
-  const s = settingsStore.use()!;
+  const drills = s.hotkeys.double_tap ? DRILLS : DRILLS.slice(0, 1);
+  const [at, setAt] = useState(0);
+  const [passed, setPassed] = useState<boolean[]>([]);
   const [result, setResult] = useState<HistoryItem | null>(null);
   const [models, setModels] = useState<ModelInfo[] | null>(null);
   const [prog, setProg] = useState<ModelProgress | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [tryErr, setTryErr] = useState<string | null>(null);
+  const field = useRef<HTMLTextAreaElement>(null);
+  const locked = useRef(false);
+  const mine = useRef(false); // a dictation started on this step (one from the step before can land late)
+  const atRef = useRef(at);
+  atRef.current = at;
   const needModel = s.stt.provider === "whisper_local" && models !== null && !models.some((m) => m.downloaded);
+  const allDone = at >= drills.length;
+
+  const pass = () => {
+    if (!mine.current) return;
+    mine.current = false;
+    const d = drills[atRef.current];
+    // the hands-free drill passes only on a hands-free dictation
+    if (d && (d.id === "hold" || locked.current)) {
+      setPassed((p) => Object.assign([...p], { [atRef.current]: true }));
+      setTimeout(() => setAt((a) => Math.max(a, atRef.current + 1)), 900);
+    }
+    locked.current = false;
+  };
 
   useEffect(() => {
-    const offs = [on("history_added", setResult), on("model_progress", setProg)];
+    const offs = [
+      on("session_state", (x) => {
+        if (x.phase === "recording" || x.phase === "locked") {
+          mine.current = true;
+          setTryErr(null);
+        }
+        if (x.phase === "locked") locked.current = true;
+        // Done is the pass signal: history_added never comes with "store history" off.
+        if (x.phase === "done" && (x.message === "pasted" || x.message === "copied")) pass();
+        if (x.phase === "error" && mine.current) {
+          mine.current = locked.current = false;
+          setTryErr(x.message ?? "That did not work. Try again.");
+        }
+      }),
+      on("history_added", (h) => {
+        // A failed row (no model, bad cloud key) has empty text: it never passes a drill.
+        if ((h.status !== "pasted" && h.status !== "copied") || !h.final_text.trim()) {
+          if (mine.current) setTryErr(h.error ?? "Nothing was transcribed. Try again.");
+          return;
+        }
+        setResult(h);
+        pass();
+      }),
+      on("model_progress", setProg),
+    ];
     api.whisperModels().then(setModels);
     return () => offs.forEach((p) => p.then((f) => f()));
-  }, []);
+  }, [drills.length]);
+
+  // focus the field, so a real paste lands in it like it would in any app
+  useEffect(() => void (!allDone && field.current?.focus()), [at, needModel]);
 
   // no model yet: base q5_1 first so the first try is fast, then turbo q5_0 in the background (DESIGN 6.9)
   useEffect(() => {
@@ -564,10 +640,17 @@ function TryStep({ ptt, onFinish, onCloud }: { ptt: string; onFinish: () => void
 
   return (
     <>
-      <Head eyebrow="Try it" title={["Say it ", "once."]} />
-      <p className="why">
-        Click the box, hold <Kbd keys={keysOf(ptt)} /> and say: <em>this is my first dictation</em>.
-      </p>
+      <Head
+        eyebrow="Practice"
+        title={allDone ? ["You are ", "set."] : ["Your first ", "dictation."]}
+        sub={allDone ? (
+          <>
+            Now try it anywhere: Slack, Mail, your editor. Hold <Kbd keys={keys} /> and talk.
+          </>
+        ) : (
+          "The text lands in the box below, like it will in any app."
+        )}
+      />
       {needModel && !err && (
         <div className="ob-panel">
           <div className="progress">
@@ -577,7 +660,7 @@ function TryStep({ ptt, onFinish, onCloud }: { ptt: string; onFinish: () => void
             <span className="mono">{prog ? `${Math.floor((prog.done / prog.total) * 100)}%` : "starting"}</span>
           </div>
           <p className="small" style={{ marginTop: 8 }}>
-            Downloading {modelName(s.language === "en" ? "ggml-base.en-q5_1.bin" : "ggml-base-q5_1.bin")}, the fast model, first.{" "}
+            Getting {modelName(s.language === "en" ? "ggml-base.en-q5_1.bin" : "ggml-base-q5_1.bin")} ready, the fast model.{" "}
             <button className="link" onClick={onCloud}>
               Use a cloud provider instead
             </button>
@@ -589,17 +672,47 @@ function TryStep({ ptt, onFinish, onCloud }: { ptt: string; onFinish: () => void
           <AlertTriangle size={13} strokeWidth={1.5} /> {err}
         </p>
       )}
-      <textarea className="input practice" placeholder="Your words land here." defaultValue={result?.final_text} key={result?.id} aria-label="Practice field" />
-      {result && (
-        <p className="result-line">
-          <span className="ok-text">✓ {result.words} words</span>
-          <span>{secs(result.duration_ms)} spoken</span>
-          <span>{result.latency_ms} ms to text</span>
-        </p>
-      )}
+      <ol className="drills">
+        {drills.map((d, i) => (
+          <li key={d.id} className={passed[i] ? "ok" : i === at ? "active" : i < at ? "skipped" : ""} aria-current={i === at ? "step" : undefined}>
+            <span className="n" aria-hidden>
+              {passed[i] ? <Check size={13} strokeWidth={2.25} /> : i + 1}
+            </span>
+            <span className="body">
+              <span className="t">{d.title(keys)}</span>
+              {i === at && (
+                <span className="say">
+                  Say: <em>&ldquo;{d.say}&rdquo;</em>
+                </span>
+              )}
+            </span>
+            {i === at && !passed[i] && (
+              <button className="link small" onClick={() => setAt(i + 1)}>
+                Skip
+              </button>
+            )}
+          </li>
+        ))}
+      </ol>
+      <textarea ref={field} className="input practice" placeholder="Your words land here." defaultValue={result?.final_text} key={result?.id} aria-label="Practice field" />
+      <p className="result-line" aria-live="polite">
+        {tryErr ? (
+          <span className="field-error" role="alert">
+            <AlertTriangle size={13} strokeWidth={1.5} /> {tryErr}
+          </span>
+        ) : result ? (
+          <>
+            <span className="ok-text">✓ {result.words} words</span>
+            <span>{secs(result.duration_ms)} spoken</span>
+            <span>{result.latency_ms} ms to text</span>
+          </>
+        ) : (
+          <span>&nbsp;</span>
+        )}
+      </p>
       <div className="ob-actions">
-        <button className="btn primary ob-next" onClick={onFinish}>
-          Finish
+        <button className={`btn ${allDone ? "primary" : "ghost"} ob-next`} onClick={onFinish} key={String(allDone)} autoFocus={allDone}>
+          {allDone ? "Start using susurro" : "Skip practice"}
         </button>
       </div>
     </>

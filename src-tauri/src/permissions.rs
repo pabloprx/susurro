@@ -12,6 +12,34 @@ pub fn fn_free(value: Option<i64>) -> bool {
     value == Some(0)
 }
 
+/// Pure: Input Monitoring (granted, usable in this process). `probe` creates a throwaway tap, which can
+/// itself trigger the system prompt, so it runs only when preflight already says yes or the tap is wanted
+/// (a modifier-only talk key). F1 uses RegisterEventHotKey and needs no Input Monitoring.
+fn im_state(preflight: bool, tap_wanted: bool, tap_running: bool, probe: impl FnOnce() -> bool) -> (bool, bool) {
+    if tap_running {
+        return (true, true);
+    }
+    if preflight {
+        return (true, probe());
+    }
+    if tap_wanted && probe() {
+        // Preflight can stay false after a grant until restart; a live tap means the grant works now.
+        return (true, true);
+    }
+    (false, false)
+}
+
+/// Pure: a grant shows in TCC but this process cannot use it.
+fn needs_relaunch(granted: bool, usable: bool, tap_failed: bool) -> bool {
+    granted && (!usable || tap_failed)
+}
+
+/// Pure: is a permission susurro needs right now still missing? Input Monitoring counts only for a
+/// modifier-only talk key.
+fn missing(p: &Permissions, mod_only: bool) -> bool {
+    p.microphone != PermState::Granted || !p.accessibility || p.needs_relaunch || (mod_only && !p.input_monitoring)
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
@@ -40,10 +68,13 @@ mod mac {
         unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) != 0 }
     }
 
-    /// (granted, usable now). Preflight can stay false after a grant until restart; the probe tap is live.
     pub fn input_monitoring() -> (bool, bool) {
-        let probe = crate::hotkey::probe_tap();
-        (objc2_core_graphics::CGPreflightListenEventAccess() || probe, probe)
+        im_state(
+            objc2_core_graphics::CGPreflightListenEventAccess(),
+            crate::hotkey::tap_wanted(),
+            crate::hotkey::tap_running(),
+            crate::hotkey::probe_tap,
+        )
     }
 
     pub fn prompt_input_monitoring() -> bool {
@@ -91,21 +122,63 @@ pub fn accessibility_trusted() -> bool {
     false
 }
 
+/// Live status: every call asks TCC again (AXIsProcessTrusted, preflight, AV status). `with_fn` also runs
+/// `defaults` for the fn-key setting (a subprocess, so the 1 s watcher skips it).
+#[cfg(target_os = "macos")]
+fn status(with_fn: bool) -> Permissions {
+    let (granted, usable) = mac::input_monitoring();
+    Permissions {
+        microphone: mac::microphone(),
+        accessibility: mac::accessibility(),
+        input_monitoring: granted,
+        fn_key_free: if with_fn { fn_usage_type().map(fn_free) } else { None },
+        needs_relaunch: needs_relaunch(granted, usable, crate::hotkey::tap_failed()),
+    }
+}
+
 #[tauri::command]
 pub fn permissions_status() -> Result<Permissions, String> {
     #[cfg(target_os = "macos")]
-    {
-        let (granted, usable) = mac::input_monitoring();
-        return Ok(Permissions {
-            microphone: mac::microphone(),
-            accessibility: mac::accessibility(),
-            input_monitoring: granted,
-            fn_key_free: fn_usage_type().map(fn_free),
-            needs_relaunch: granted && (!usable || crate::hotkey::tap_failed()),
-        });
-    }
+    return Ok(status(true));
     #[cfg(not(target_os = "macos"))]
     Err("not supported on this OS".into())
+}
+
+/// Emits `permissions_changed` (Permissions) when a grant changes: every 1 s while something susurro needs
+/// is missing, every 5 s otherwise (a revoke). Also one startup toast if paste cannot work.
+/// ponytail: polling, macOS has no TCC change callback.
+pub fn spawn_watcher(app: tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    std::thread::Builder::new()
+        .name("perm-watch".into())
+        .spawn(move || {
+            use tauri::{Emitter, Manager};
+            let mod_only = || {
+                let s = app.state::<crate::AppState>();
+                let ptt = s.settings.read().unwrap().hotkeys.ptt.clone();
+                crate::hotkey::mod_key(&ptt).is_some()
+            };
+            let mut last = status(false);
+            // Let the overlay page load first, so the toast has somewhere to show.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let onboarded = app.state::<crate::AppState>().settings.read().unwrap().onboarded;
+            if onboarded && !mac::accessibility() {
+                crate::session::toast(&app, None, "ax-missing", crate::contract::ToastKind::Warn, "Turn on Accessibility so susurro can paste", &[("fix-ax", "Turn on")], 10_000);
+            }
+            loop {
+                let now = status(false);
+                if now != last {
+                    log::info!("permissions changed: {now:?}");
+                    let _ = app.emit("permissions_changed", Permissions { fn_key_free: fn_usage_type().map(fn_free), ..now.clone() });
+                    last = now;
+                }
+                let secs = if missing(&last, mod_only()) { 1 } else { 5 };
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+            }
+        })
+        .expect("spawn perm-watch");
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 /// Shows the system prompt where one exists, and opens the Settings pane when the prompt cannot help.
@@ -118,11 +191,14 @@ pub fn request_permission(kind: PermKind) -> Result<(), String> {
             PermState::Denied => open(&format!("{PANE}Privacy_Microphone")),
             PermState::Granted => {}
         },
+        // Never prompt for a grant that is already there.
+        PermKind::Accessibility if mac::accessibility() => {}
         PermKind::Accessibility => {
             if !mac::prompt_accessibility() {
                 open(&format!("{PANE}Privacy_Accessibility"));
             }
         }
+        PermKind::InputMonitoring if objc2_core_graphics::CGPreflightListenEventAccess() || crate::hotkey::tap_running() => {}
         PermKind::InputMonitoring => {
             // The hotkey module retries its tap every second and starts by itself once the grant is live.
             if !mac::prompt_input_monitoring() {
@@ -153,6 +229,35 @@ pub fn relaunch_app(app: tauri::AppHandle, state: tauri::State<'_, crate::AppSta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_monitoring_decision() {
+        let no = || -> bool { panic!("must not probe: a tap can show the system prompt") };
+        assert_eq!(im_state(false, false, false, no), (false, false), "F1 user without the grant: no probe, no prompt");
+        assert_eq!(im_state(false, true, true, no), (true, true), "running tap");
+        assert_eq!(im_state(false, true, false, || true), (true, true), "grant live before preflight sees it");
+        assert_eq!(im_state(false, true, false, || false), (false, false));
+        assert_eq!(im_state(true, false, false, || true), (true, true));
+        assert_eq!(im_state(true, false, false, || false), (true, false), "granted, unusable in this process");
+    }
+
+    #[test]
+    fn relaunch_only_for_an_unusable_grant() {
+        assert!(!needs_relaunch(false, false, false));
+        assert!(!needs_relaunch(true, true, false));
+        assert!(needs_relaunch(true, false, false));
+        assert!(needs_relaunch(true, true, true), "the tap failed to start after creation");
+    }
+
+    #[test]
+    fn watcher_counts_input_monitoring_only_for_modifier_keys() {
+        let all = Permissions { microphone: PermState::Granted, accessibility: true, input_monitoring: false, fn_key_free: None, needs_relaunch: false };
+        assert!(!missing(&all, false), "F1 needs no Input Monitoring");
+        assert!(missing(&all, true));
+        assert!(missing(&Permissions { accessibility: false, ..all.clone() }, false));
+        assert!(missing(&Permissions { microphone: PermState::Undetermined, ..all.clone() }, false));
+        assert!(missing(&Permissions { needs_relaunch: true, ..all }, false));
+    }
 
     #[test]
     fn fn_key_mapping() {

@@ -63,6 +63,8 @@ export type Events = {
   model_progress: C.ModelProgress;
   navigate: C.Navigate;
   hotkey_status: C.HotkeyStatus;
+  /** Pushed by Rust when a grant changes (optional: the UI also polls and re-checks on focus). */
+  permissions_changed: C.Permissions;
 };
 
 /** Subscribe to a Rust event. Returns the unsubscribe function. */

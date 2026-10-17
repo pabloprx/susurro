@@ -48,6 +48,11 @@ body,
 .pill.hidden:not(.hover) {
   opacity: 0;
 }
+/* "Hide for 1 hour": gone, hover included, until the hour is up or a dictation starts */
+.pill.snoozed {
+  opacity: 0;
+  pointer-events: none;
+}
 
 /* "On air": the only glow in the product, at 40% strength. */
 .pill.v-listening {
@@ -257,4 +262,9 @@ body.mock-desk #root {
   height: 96px;
   outline: 1px dashed rgb(255 255 255 / 0.12);
   outline-offset: 0;
+}
+
+/* a notice with a fix button gets the full window width (360 px window, 348 px pill) */
+.pill.v-notice .content {
+  max-width: 320px;
 }
