@@ -82,7 +82,8 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
             opts: st.elevenlabs.clone(),
         }),
         // The live provider's batch path (Retry, the fallback after a failed socket): MAI, else Scribe v2 batch.
-        SttProvider::ElevenLabsRealtime => {
+        // ponytail: OpenAI Realtime falls back like Scribe Realtime (MAI, else Scribe batch); no OpenAI batch path.
+        SttProvider::ElevenLabsRealtime | SttProvider::OpenAiRealtime => {
             let mut b = s.clone();
             b.stt.provider = batch_for_realtime(secrets::get(KeyName::Openrouter).is_some() && !st.openrouter_model.is_empty());
             return build(&b, state);
@@ -115,12 +116,18 @@ pub fn command_provider(s: &Settings, elevenlabs_key: bool) -> SttProvider {
     }
 }
 
-/// The realtime session options, or None when the ElevenLabs key is missing. `keyterms`: dictionary words
-/// (commands always send them, vc-feedback 18a; dictation follows the Send keyterms toggle).
-pub fn realtime_opts(s: &Settings, rate: u32, hints: &Hints, keyterms: bool) -> Option<scribe_rt::Opts> {
-    let key = secrets::get(KeyName::Elevenlabs)?;
+/// The realtime session options of provider `p`, or None when `p` is not a realtime provider or its key is
+/// missing. `keyterms`: dictionary words (commands always send them, vc-feedback 18a; dictation follows the Send
+/// keyterms toggle).
+pub fn realtime_opts(p: &SttProvider, s: &Settings, rate: u32, hints: &Hints, keyterms: bool) -> Option<scribe_rt::Opts> {
+    let (proto, url, k) = match p {
+        SttProvider::ElevenLabsRealtime => (scribe_rt::Proto::Scribe, scribe_rt::URL, KeyName::Elevenlabs),
+        SttProvider::OpenAiRealtime => (scribe_rt::Proto::OpenAi, scribe_rt::OPENAI_URL, KeyName::Openai),
+        _ => return None,
+    };
+    let key = secrets::get(k)?;
     let keyterms = if keyterms { crate::dictionary::keyterms(hints, 50) } else { vec![] };
-    Some(scribe_rt::Opts { url: scribe_rt::URL.into(), key, rate, language: Some(s.language.clone()), keyterms })
+    Some(scribe_rt::Opts { proto, url: url.into(), key, rate, language: Some(s.language.clone()), keyterms })
 }
 
 struct WithFallback {
@@ -275,8 +282,8 @@ fn run_test(app: &AppHandle, which: &str) -> anyhow::Result<String> {
     let state = app.state::<AppState>();
     let mut s = state.settings.read().unwrap().clone();
     match which {
-        "stt" if s.stt.provider == SttProvider::ElevenLabsRealtime => {
-            let o = realtime_opts(&s, 16000, &Hints::default(), false).ok_or_else(|| anyhow::anyhow!("Add an ElevenLabs API key first"))?;
+        "stt" if s.stt.provider.realtime() => {
+            let o = realtime_opts(&s.stt.provider, &s, 16000, &Hints::default(), false).ok_or_else(|| anyhow::anyhow!("Add the provider's API key first"))?;
             Ok(scribe_rt::transcribe(o, &jfk(), false, Duration::from_secs(20))?.0)
         }
         "stt" => {

@@ -18,6 +18,7 @@ pub fn init(data_dir: &Path) {
 fn account(k: KeyName) -> &'static str {
     match k {
         KeyName::Elevenlabs => "elevenlabs",
+        KeyName::Openai => "openai",
         KeyName::Openrouter => "openrouter",
         KeyName::LocalStt => "local_stt",
         KeyName::LocalLlm => "local_llm",
@@ -84,6 +85,7 @@ pub fn status() -> KeyStatus {
     let has = |k| keys.get(account(k)).is_some_and(|s: &String| !s.is_empty());
     KeyStatus {
         elevenlabs: has(KeyName::Elevenlabs),
+        openai: has(KeyName::Openai),
         openrouter: has(KeyName::Openrouter),
         local_stt: has(KeyName::LocalStt),
         local_llm: has(KeyName::LocalLlm),

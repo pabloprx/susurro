@@ -197,18 +197,23 @@ pub fn reorder(priority: &[KnownDevice], ids: &[String], connected: &[DeviceInfo
 
 /// Resample a mono buffer to 16 kHz (rubato poly cubic, `process_all`).
 pub fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
+    resample_to(samples, rate, RATE)
+}
+
+/// Resample a mono buffer from `rate` to `to`.
+pub fn resample_to(samples: &[f32], rate: u32, to: u32) -> Vec<f32> {
     use audioadapter_buffers::direct::InterleavedSlice;
     use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
-    if rate == RATE || samples.is_empty() {
+    if rate == to || samples.is_empty() {
         return samples.to_vec();
     }
     let run = || -> anyhow::Result<Vec<f32>> {
-        let mut r = Async::<f32>::new_poly(RATE as f64 / rate as f64, 1.0, PolynomialDegree::Cubic, 1024, 1, FixedAsync::Input)?;
+        let mut r = Async::<f32>::new_poly(to as f64 / rate as f64, 1.0, PolynomialDegree::Cubic, 1024, 1, FixedAsync::Input)?;
         let input = InterleavedSlice::new(samples, 1, samples.len())?;
         Ok(r.process_all(&input, samples.len(), None)?.take_data())
     };
     run().unwrap_or_else(|e| {
-        log::error!("resample {rate} -> {RATE} failed: {e}");
+        log::error!("resample {rate} -> {to} failed: {e}");
         vec![]
     })
 }

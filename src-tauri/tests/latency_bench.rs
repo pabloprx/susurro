@@ -1,7 +1,7 @@
 //! next-queue 5: release -> final text, per STT path, on the e2e fixtures streamed at real-time pace (100 ms of
 //! audio every 100 ms, as the mic delivers it). Median of 3. #[ignore]: real model, real money.
 //!   SUSURRO_TEST_MODEL=~/.cache/susurro/ggml-large-v3-turbo-q5_0.bin SUSURRO_WHISPER_THREADS=6 \
-//!   OPENROUTER_API_KEY=.. ELEVENLABS_API_KEY=.. cargo test --release --test latency_bench -- --ignored --nocapture --test-threads=1
+//!   OPENROUTER_API_KEY=.. ELEVENLABS_API_KEY=.. OPENAI_API_KEY=.. cargo test --release --test latency_bench -- --ignored --nocapture --test-threads=1
 //! Any env missing = that row is skipped. Audio sent: ~16 s per run per cloud path (3 runs: ~47 s per path).
 //! scribe_rt_probe: one short clip and the silence clip through Scribe Realtime (~5 s of audio).
 
@@ -94,7 +94,14 @@ fn latency_bench() {
             Ok((released.elapsed().as_millis(), o.text))
         });
         row("Scribe v2 Realtime", &mut |audio, lang| {
-            let o = scribe_rt::Opts { url: scribe_rt::URL.into(), key: key.clone(), rate: 16000, language: Some(lang.into()), keyterms: vec![] };
+            let o = scribe_rt::Opts { proto: scribe_rt::Proto::Scribe, url: scribe_rt::URL.into(), key: key.clone(), rate: 16000, language: Some(lang.into()), keyterms: vec![] };
+            let (text, after) = scribe_rt::transcribe(o, audio, true, Duration::from_secs(30))?;
+            Ok((after.as_millis(), text))
+        });
+    }
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        row("OpenAI Realtime (gpt-live-transcribe)", &mut |audio, lang| {
+            let o = scribe_rt::Opts { proto: scribe_rt::Proto::OpenAi, url: scribe_rt::OPENAI_URL.into(), key: key.clone(), rate: 16000, language: Some(lang.into()), keyterms: vec![] };
             let (text, after) = scribe_rt::transcribe(o, audio, true, Duration::from_secs(30))?;
             Ok((after.as_millis(), text))
         });
@@ -111,7 +118,7 @@ fn command_chunks() {
         let audio = wav(clip);
         if let Ok(key) = std::env::var("ELEVENLABS_API_KEY") {
             let (tx, rx) = std::sync::mpsc::channel();
-            let o = scribe_rt::Opts { url: scribe_rt::URL.into(), key, rate: 16000, language: Some("en".into()), keyterms: vec![] };
+            let o = scribe_rt::Opts { proto: scribe_rt::Proto::Scribe, url: scribe_rt::URL.into(), key, rate: 16000, language: Some("en".into()), keyterms: vec![] };
             let live = scribe_rt::Live::start(o, move |e| drop(tx.send((Instant::now(), e))));
             let mut ch = Chunker::with_cuts(16000, COMMAND);
             let mut cuts = vec![];
@@ -159,7 +166,7 @@ fn command_chunks() {
 fn scribe_rt_probe() {
     let key = std::env::var("ELEVENLABS_API_KEY").expect("set ELEVENLABS_API_KEY");
     for clip in ["en_snippet.wav", "silence.wav"] {
-        let o = scribe_rt::Opts { url: scribe_rt::URL.into(), key: key.clone(), rate: 16000, language: None, keyterms: vec!["Contaflow".into()] };
+        let o = scribe_rt::Opts { proto: scribe_rt::Proto::Scribe, url: scribe_rt::URL.into(), key: key.clone(), rate: 16000, language: None, keyterms: vec!["Contaflow".into()] };
         let r = scribe_rt::transcribe(o, &wav(clip), true, Duration::from_secs(15));
         println!("{clip}: {r:?}");
         assert!(r.is_ok(), "{r:?}");
