@@ -89,6 +89,33 @@ static DENIED: AtomicBool = AtomicBool::new(false);
 /// 0 = not waiting, 1 = confirm, 2 = pick.
 static WAITING: AtomicU8 = AtomicU8::new(0);
 static ANSWER: Mutex<Option<String>> = Mutex::new(None);
+/// Pick mode: the choices on screen (global points), and the one Pablo clicked by hand.
+static PICK_RECTS: Mutex<Vec<PtRect>> = Mutex::new(Vec::new());
+static CLICKED: Mutex<Option<usize>> = Mutex::new(None);
+
+/// The marks window shows these pick choices (Real::emit).
+pub fn set_pick_rects(r: Vec<PtRect>) {
+    *PICK_RECTS.lock().unwrap() = r;
+}
+
+/// Pablo's own left click at `p` (global points) while a pick waits: true = it hit a choice (the app got the click
+/// too, so the executor must not click again).
+pub fn user_clicked(p: (f64, f64)) -> bool {
+    if waiting() != Some(Wait::Pick) {
+        return false;
+    }
+    let hit = choice_at(&PICK_RECTS.lock().unwrap(), p);
+    if let Some(i) = hit {
+        *CLICKED.lock().unwrap() = Some(i);
+    }
+    hit.is_some()
+}
+
+/// The choice under a click: the smallest one, since a big choice (a web area) may hold the others.
+pub fn choice_at(rects: &[PtRect], p: (f64, f64)) -> Option<usize> {
+    let inside = |r: &PtRect| p.0 >= r.x && p.0 <= r.x + r.w && p.1 >= r.y && p.1 <= r.y + r.h;
+    (0..rects.len()).filter(|&i| inside(&rects[i])).min_by(|&a, &b| (rects[a].w * rects[a].h).total_cmp(&(rects[b].w * rects[b].h)))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Wait {
@@ -140,8 +167,12 @@ pub fn answer(text: String) {
 pub enum Answer {
     Yes,
     Text(String),
-    /// Esc, a spoken no, or the timeout.
+    /// Pick mode: Pablo clicked choice N (0-based) himself; the click already happened.
+    Clicked(usize),
+    /// Esc or a spoken no.
     No,
+    /// Nobody answered in time.
+    Timeout,
 }
 
 /// The local yes / no words (VOICE_CONTROL_V2 2.2): 0 ms, $0. None = not a plain answer (ask the planner).
@@ -250,7 +281,9 @@ pub fn pick_by_name(text: &str, options: &[(u32, String)]) -> Option<u32> {
         .iter()
         .filter(|(_, name)| {
             let name = crate::text::norm(name).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
-            name.chars().count() >= 3 && (said.contains(&name) || (said.chars().count() >= 3 && name.contains(&said)))
+            // a name with at most one word around it ("open youtube music"): "ok search youtube" is an order
+            let near = said.split(' ').count() <= name.split(' ').count() + 1;
+            name.chars().count() >= 3 && ((near && said.contains(&name)) || (said.chars().count() >= 3 && name.contains(&said)))
         })
         .map(|o| o.0)
         .collect();
@@ -266,9 +299,109 @@ pub fn looks_like_pick(text: &str, question: &str) -> bool {
     if words.is_empty() || words.len() > 5 {
         return false;
     }
-    let ord = ["first", "primer", "second", "segund", "third", "tercer", "last", "últim", "ultim"];
+    let ord = ["first", "primer", "second", "segund", "third", "tercer", "fourth", "cuart", "fifth", "quint", "last", "últim", "ultim"];
     let number = |w: &str| w.parse::<u32>().is_ok() || NUMBERS.iter().any(|(s, _)| *s == w);
-    words.iter().any(|w| number(w) || ord.iter().any(|o| w.starts_with(o))) || pick_by_name(text, &pick_options(question)).is_some()
+    let n = crate::text::norm(text);
+    let normed: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| number(w) || ord.iter().any(|o| w.starts_with(o))) || this_one(&normed) || pick_by_name(text, &pick_options(question)).is_some()
+}
+
+/// Pick mode ("Clicks: I choose"): what Pablo said to the numbered choices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Picked {
+    /// The choice at this place (0-based): "dos", "the second", "3", its name, "sí" for a highlighted #1.
+    Nth(usize),
+    /// A mark that is not a choice: a number above the choices that names a mark on screen ("41").
+    Mark(u32),
+}
+
+/// "ese", "sí", "that one": the highlighted choice #1. `words` are normalized (text::norm).
+fn this_one(words: &[&str]) -> bool {
+    const W: [&str; 12] = ["si", "yes", "yeah", "yep", "ok", "okay", "dale", "ese", "esa", "este", "esta", "eso"];
+    // every word: "ok search youtube" is an order, not a yes to choice 1
+    !words.is_empty() && words.len() <= 3 && words.iter().all(|w| W.contains(w) || ["that", "this", "one"].contains(w)) && words.iter().any(|w| *w != "one")
+}
+
+/// The answer to the numbered choices (1..=names.len()). `pre` = #1 is highlighted, so a yes picks it.
+pub fn parse_choice(text: &str, names: &[String], ids: &[u32], pre: bool) -> Option<Picked> {
+    let l = crate::text::norm(text);
+    let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let n = names.len();
+    let num = |k: u32| if k >= 1 && k as usize <= n { Some(Picked::Nth(k as usize - 1)) } else { ids.contains(&k).then_some(Picked::Mark(k)) };
+    for w in &words {
+        if let Ok(k) = w.parse::<u32>() {
+            return num(k);
+        }
+        let ord = [("first", 0), ("primer", 0), ("second", 1), ("segund", 1), ("third", 2), ("tercer", 2), ("fourth", 3), ("cuart", 3), ("fifth", 4), ("quint", 4)];
+        if let Some((_, k)) = ord.iter().find(|(o, _)| w.starts_with(o)) {
+            return (*k < n).then_some(Picked::Nth(*k));
+        }
+        if (w.starts_with("last") || w.starts_with("ultim")) && n > 0 {
+            return Some(Picked::Nth(n - 1));
+        }
+    }
+    let opts: Vec<(u32, String)> = names.iter().enumerate().map(|(i, s)| (i as u32 + 1, s.clone())).collect();
+    if let Some(k) = pick_by_name(text, &opts) {
+        return Some(Picked::Nth(k as usize - 1));
+    }
+    if let Some(k) = words.iter().find_map(|w| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1)) {
+        return num(k);
+    }
+    (pre && this_one(&words)).then_some(Picked::Nth(0))
+}
+
+/// "[41] YouTube Music (link, main)" -> (Some(41), "YouTube Music (link, main)"). The planner copies the mark text with
+/// its on-screen number.
+pub fn split_mark(words: &str) -> (Option<u32>, &str) {
+    let w = words.trim();
+    if let Ok(n) = w.trim_start_matches('#').parse() {
+        return (Some(n), ""); // "41", "#41"
+    }
+    let Some(rest) = w.strip_prefix('[') else { return (None, w) };
+    match rest.split_once(']') {
+        Some((n, tail)) => match n.trim().parse() {
+            Ok(n) => (Some(n), tail.trim()),
+            Err(_) => (None, w),
+        },
+        None => (None, w),
+    }
+}
+
+/// The element a "[N] label" target means on a fresh read: the label when it is unique, else the mark N that was
+/// drawn (`board`: what Pablo saw) found again by its rect, else the fresh mark N if it has the same label.
+pub fn mark_target<'a>(words: &str, els: &'a [El], board: &[El]) -> Option<&'a El> {
+    let (n, rest) = split_mark(words);
+    if let Some(e) = local_match(rest, els) {
+        return Some(e);
+    }
+    let n = n?;
+    let same = |a: &El, b: &El| ax::describe(a) == ax::describe(b);
+    match board.iter().find(|b| b.mark.id == n) {
+        Some(b) => els.iter().find(|e| ax::same_rect(e.mark.rect, b.mark.rect) && same(e, b)).or_else(|| els.iter().find(|e| e.mark.id == n && same(e, b))),
+        // no board (tests, a first order): only a bare "[N]" may take the fresh mark N
+        None => rest.is_empty().then(|| els.iter().find(|e| e.mark.id == n)).flatten(),
+    }
+}
+
+/// Pablo said this number himself ("open the first link, 41"): he already chose, no pick list.
+pub fn said_number(said: &str, n: u32) -> bool {
+    said.split(|c: char| !c.is_ascii_digit()).any(|w| w.parse() == Ok(n))
+}
+
+/// Return sends a message only in chat and mail apps (Claude desktop counts: its chat input sends). In browsers,
+/// terminals, address bars and any search field it runs at once.
+/// ponytail: a fixed app list; add an app here when Return sends there.
+const CHAT_APPS: [&str; 18] = [
+    "Slack", "WhatsApp", "Messages", "Mail", "Discord", "Microsoft Teams", "Teams", "Telegram", "Claude", "com.tinyspeck.slackmacgap",
+    "net.whatsapp.WhatsApp", "com.apple.MobileSMS", "com.apple.mail", "com.hnc.Discord", "com.microsoft.teams2", "com.microsoft.teams",
+    "ru.keepcoder.Telegram", "com.anthropic.claudefordesktop",
+];
+
+pub fn return_asks(f: &Field) -> bool {
+    let chat = CHAT_APPS.iter().any(|a| a.eq_ignore_ascii_case(&f.app) || a.eq_ignore_ascii_case(&f.bundle));
+    let n = crate::text::norm(&f.name);
+    let search = f.role == "AXSearchField" || ["search", "buscar", "busca", "find"].iter().any(|w| n.contains(w));
+    chat && !search
 }
 
 /// The text of "type hello in the search field", "write 'meet in the lobby'", "busca gatos".
@@ -506,11 +639,21 @@ pub trait Desk {
     fn learn_word(&mut self, _word: &str, _heard: &str) -> Result<(), String> {
         Ok(())
     }
+    /// The marks drawn on screen right now (what Pablo reads a number from). Empty = none known.
+    fn board(&mut self) -> Vec<El> {
+        vec![]
+    }
     /// The installed app names (open_app matches the spoken name against them). Empty = open the name as said.
     fn apps(&mut self) -> Vec<String> {
         vec![]
     }
 }
+
+/// Spoken name -> app name.
+const APP_ALIASES: [(&str, &str); 9] = [
+    ("vs code", "Visual Studio Code"), ("vscode", "Visual Studio Code"), ("visual studio", "Visual Studio Code"), ("code", "Visual Studio Code"),
+    ("edge", "Microsoft Edge"), ("chrome", "Google Chrome"), ("claude", "Claude"), ("ghosty", "Ghostty"), ("ghostie", "Ghostty"),
+];
 
 /// The installed app a spoken name means: "edge" -> Microsoft Edge, "ghosty" -> Ghostty. Rungs, first hit wins:
 /// 1. the same name, 2. a whole word of the name, 3. a name that starts with it, 4. 1-2 typos (names of 5+ letters).
@@ -520,6 +663,10 @@ pub fn match_app(spoken: &str, installed: &[String]) -> Option<String> {
     let want = squash(spoken.trim().trim_end_matches(".app"));
     if want.is_empty() {
         return None;
+    }
+    // The names STT and Pablo use for apps (live log 2026-10-18): the alias wins, installed or not.
+    if let Some((_, name)) = APP_ALIASES.iter().find(|(a, _)| squash(a) == want) {
+        return Some(installed.iter().find(|n| n.eq_ignore_ascii_case(name)).cloned().unwrap_or_else(|| name.to_string()));
     }
     let wc: Vec<char> = want.chars().collect();
     let max_typos = match wc.len() { 0..=4 => 0, 5..=8 => 1, _ => 2 };
@@ -537,6 +684,8 @@ pub fn match_app(spoken: &str, installed: &[String]) -> Option<String> {
 
 pub struct Cfg {
     pub confirm_risky: bool,
+    /// "Clicks: I choose": every click target shows numbered choices and waits for Pablo's pick.
+    pub choose: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -621,6 +770,9 @@ fn quote(s: &str) -> String {
 /// One action in flight: its step row and the end helpers.
 struct Run {
     st: CommandStep,
+    choose: bool,
+    /// The words of the order (Action::said).
+    said: String,
 }
 
 impl Run {
@@ -639,14 +791,18 @@ impl Run {
         self.end(desk, status, Some(message), String::new())
     }
 
-    /// Wait for a yes. false = no / timeout / Esc (the run ends Stopped).
-    fn confirm(&mut self, desk: &mut dyn Desk, question: &str) -> bool {
+    /// Wait for a yes. Err = the run ended Stopped: no / Esc, or a timeout that says so (the pill shows it).
+    fn confirm(&mut self, desk: &mut dyn Desk, question: &str, what: &str) -> Result<(), End> {
         self.st.status = CmdStatus::Confirm;
         self.st.message = Some(question.into());
         desk.emit(&self.st);
-        let ok = desk.wait(Wait::Confirm, CONFIRM_TIMEOUT) == Answer::Yes;
+        let a = desk.wait(Wait::Confirm, CONFIRM_TIMEOUT);
         self.st.message = None;
-        ok
+        match a {
+            Answer::Yes => Ok(()),
+            Answer::Timeout => Err(self.fail(desk, CmdStatus::Stopped, &format!("No answer in {} s: {what}", CONFIRM_TIMEOUT.as_secs()))),
+            _ => Err(self.end(desk, CmdStatus::Stopped, None, String::new())),
+        }
     }
 }
 
@@ -657,6 +813,16 @@ struct Hit {
     url: Option<String>,
     value: Option<String>,
     risky: f32,
+    /// Pablo chose it (pick mode): no risky confirm on top.
+    picked: bool,
+    /// Pablo clicked it himself: the app already got the click.
+    by_user: bool,
+}
+
+impl Hit {
+    fn of(e: &El, risky: f32) -> Self {
+        Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky, picked: false, by_user: false }
+    }
 }
 
 /// Read the screen and find `words` on it. Err = the run ended (unsure, setup, pick refused...).
@@ -666,17 +832,29 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
         Err(e) if e == "accessibility" => return Err(r.fail(desk, CmdStatus::Setup, "accessibility")),
         Err(e) => return Err(r.fail(desk, CmdStatus::Unsure, &e)),
     };
+    // the marks Pablo read a number from, before this read replaces them on screen
+    let board = desk.board();
     r.st.display = scr.display;
     r.st.marks = scr.els.iter().map(|e| e.mark.clone()).collect();
     r.st.status = CmdStatus::Marks;
     desk.emit(&r.st);
-    if let Some(e) = local_match(words, &scr.els) {
+    let local = mark_target(words, &scr.els, &board);
+    // pick mode: every click; another target (the field to type into...) only when no mark has its exact name
+    let pick_mode = r.choose && (verb == "click" || local.is_none());
+    // A number Pablo said himself ("41") is his choice already.
+    let said_it = split_mark(words).0.is_some_and(|n| said_number(&r.said, n));
+    if let Some(e) = local.filter(|_| !pick_mode || said_it) {
         let risky = if risky_name(&e.mark.name) { 1.0 } else { 0.0 };
-        return Ok(Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky });
+        return Ok(Hit { picked: said_it, ..Hit::of(e, risky) });
     }
+    let words = split_mark(words).1;
     let instr = format!("{verb} {words}");
     if scr.els.len() < MIN_AX {
         return box_ground(r, &instr, &scr, ask, desk);
+    }
+    if pick_mode {
+        let instr = if r.said.trim().is_empty() { instr } else { format!("{instr} (the user said: \"{}\")", r.said.trim()) };
+        return choose(r, &instr, &scr, local.map(|e| e.mark.id), ask, desk);
     }
     let display = scr.display;
     let d = {
@@ -721,7 +899,89 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
         _ => {}
     }
     let Some(e) = id.and_then(|id| scr.els.iter().find(|e| e.mark.id == id)) else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
-    Ok(Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky: d.risky })
+    Ok(Hit::of(e, d.risky))
+}
+
+/// Choices shown in pick mode.
+pub const CHOICES_MAX: usize = 5;
+/// Past the first 3, a choice needs this much of Jev's probability to be shown.
+const CHOICE_MIN: f32 = 0.05;
+/// Jev this sure of #1 (and #2 under PRE_NEXT_MAX): #1 is highlighted, "sí" takes it.
+pub const PRE_TOP_MIN: f32 = 0.97;
+pub const PRE_NEXT_MAX: f32 = 0.3;
+
+/// The choices Pablo sees: Jev's ranking (ids on screen only), the planner's exact match kept in, 3 to 5 of them.
+pub fn choices(ranked: &[(String, f32)], ids: &[u32], local: Option<u32>) -> Vec<(u32, f32)> {
+    let mut c: Vec<(u32, f32)> = ranked.iter().filter_map(|(k, p)| k.parse::<u32>().ok().filter(|k| ids.contains(k)).map(|k| (k, *p))).collect();
+    if let Some(l) = local.filter(|l| !c.iter().take(CHOICES_MAX).any(|x| x.0 == *l)) {
+        c.retain(|x| x.0 != l);
+        c.insert(c.len().min(CHOICES_MAX - 1), (l, 0.0));
+    }
+    c.truncate(CHOICES_MAX);
+    let mut i = 0;
+    c.retain(|x| {
+        i += 1;
+        i <= 3 || x.1 >= CHOICE_MIN || Some(x.0) == local
+    });
+    c
+}
+
+/// #1 is highlighted (Jev is sure and #2 far behind).
+pub fn preselect(c: &[(u32, f32)]) -> bool {
+    c.first().is_some_and(|x| x.1 >= PRE_TOP_MIN) && c.get(1).is_none_or(|x| x.1 < PRE_NEXT_MAX)
+}
+
+/// Pick mode: marks + the marked screenshot -> Jev ranks the marks -> the top 3-5 as numbered choices -> Pablo
+/// answers by voice ("dos", "the second", the name, "41"), with the command key or "sí" for a highlighted #1, or
+/// clicks the choice himself.
+fn choose(r: &mut Run, instr: &str, scr: &Screen, local: Option<u32>, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
+    let shot = if !desk.aborted() && desk.screen_ok() {
+        desk.sleep(MARKS_DRAW_MS);
+        desk.capture(scr.display, false).map_err(|e| log::warn!("screenshot: {e:#}")).ok().map(|b| jev::image(&b, "image/jpeg"))
+    } else {
+        None
+    };
+    let (s, q) = marks_request(instr, &scr.app, &scr.els, shot.as_ref());
+    let rep = ask(&s, &q).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + rep.latency_ms, r.st.cost_usd + rep.cost);
+    if desk.aborted() {
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
+    }
+    let d = parse(&rep);
+    let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
+    let c = choices(&d.target.ranked, &ids, local);
+    if c.is_empty() {
+        return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE));
+    }
+    let el = |id: u32| scr.els.iter().find(|e| e.mark.id == id);
+    let names: Vec<String> = c.iter().map(|(id, _)| el(*id).map(|e| e.mark.name.clone()).unwrap_or_default()).collect();
+    let pre = preselect(&c);
+    let list = names.iter().enumerate().map(|(i, n)| format!("{} {}", i + 1, if n.is_empty() { "(no name)" } else { n })).collect::<Vec<_>>().join(" · ");
+    (r.st.choices, r.st.choose, r.st.preselect, r.st.status) = (c.clone(), true, pre, CmdStatus::Pick);
+    r.st.target = pre.then_some(c[0].0);
+    r.st.message = Some(format!("Which one? {list}"));
+    desk.emit(&r.st);
+    let until = std::time::Instant::now() + PICK_TIMEOUT;
+    let got = loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        match desk.wait(Wait::Pick, left) {
+            Answer::Text(t) => match parse_choice(&t, &names, &ids, pre) {
+                Some(Picked::Nth(i)) => break (c[i].0, false),
+                Some(Picked::Mark(n)) => break (n, false),
+                // not an answer: the list stays up, the time keeps running
+                None => continue,
+            },
+            Answer::Yes if pre => break (c[0].0, false),
+            Answer::Yes => continue,
+            Answer::Clicked(i) if i < c.len() => break (c[i].0, true),
+            Answer::Clicked(_) => continue,
+            Answer::Timeout => return Err(r.fail(desk, CmdStatus::Stopped, &format!("No answer in {} s: nothing clicked", PICK_TIMEOUT.as_secs()))),
+            Answer::No => return Err(r.end(desk, CmdStatus::Stopped, None, String::new())),
+        }
+    };
+    (r.st.choices, r.st.choose, r.st.preselect, r.st.message) = (vec![], false, false, None);
+    let Some(e) = el(got.0) else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
+    Ok(Hit { picked: true, by_user: got.1, ..Hit::of(e, d.risky) })
 }
 
 /// The box fallback (an app with < 5 AX elements): full-resolution tiles, Jev box per tile, the visible noul.
@@ -756,11 +1016,11 @@ fn box_ground(r: &mut Run, instr: &str, scr: &Screen, ask: &mut Ask, desk: &mut 
     let p = box_point(b, tile);
     let rect = PtRect { x: tile.x + b.left * tile.w, y: tile.y + b.top * tile.h, w: (b.right - b.left) * tile.w, h: (b.bottom - b.top) * tile.h };
     Ok(match snap(p, &scr.els) {
-        Some(e) => Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky },
+        Some(e) => Hit::of(e, risky),
         None => {
             let mark = Mark { id: 1, rect, name: String::new(), role: "box".into(), region: "screen".into() };
             r.st.marks = vec![mark.clone()];
-            Hit { target: Target::Point(p.0.round(), p.1.round()), mark, url: None, value: None, risky }
+            Hit { target: Target::Point(p.0.round(), p.1.round()), mark, url: None, value: None, risky, picked: false, by_user: false }
         }
     })
 }
@@ -784,7 +1044,9 @@ fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) ->
     if desk.aborted() {
         return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
     }
-    desk.act(&Act::Focus(h.target.clone())).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    if !h.by_user {
+        desk.act(&Act::Focus(h.target.clone())).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    }
     desk.sleep(FOCUS_MS);
     Ok(Some(h))
 }
@@ -792,7 +1054,7 @@ fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) ->
 /// Runs one planner action. `step` numbers the action in the session, `order` the planner reply it came from.
 pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
     let st = CommandStep { instruction: crate::planner::label(a), step, max: 0, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
-    let mut r = Run { st };
+    let mut r = Run { st, choose: cfg.choose, said: a.said.clone() };
     if desk.aborted() {
         return r.end(desk, CmdStatus::Stopped, None, String::new());
     }
@@ -812,12 +1074,13 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             if crate::paste::blocked_combo(code, flags) {
                 return r.fail(desk, CmdStatus::Blocked, &format!("{keys} is blocked for voice control"));
             }
-            // Return sends in every chat app, whatever the planner says (v1 rule, any app).
-            let enter = code == 36 || code == 76;
+            // Return sends in chat and mail apps, whatever the planner says; elsewhere it runs at once.
+            let f = desk.focused();
+            let enter = (code == 36 || code == 76) && return_asks(&f);
             if enter || (a.risky && cfg.confirm_risky) {
-                let q = if enter { "Press Return? Say yes · F11 · Esc" } else { "Do it? Say yes · F11 · Esc" };
-                if !r.confirm(desk, q) {
-                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                let (q, what) = if enter { ("Press Return? Say yes · F11 · Esc", "Return not pressed") } else { ("Do it? Say yes · F11 · Esc", "not done") };
+                if let Err(end) = r.confirm(desk, q, what) {
+                    return end;
                 }
             }
             if desk.secure_input() {
@@ -826,7 +1089,6 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             if desk.aborted() {
                 return r.end(desk, CmdStatus::Stopped, None, String::new());
             }
-            let f = desk.focused();
             if let Err(e) = desk.act(&Act::Combo(code, flags)) {
                 return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
             }
@@ -870,14 +1132,19 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
                 Ok(h) => h,
                 Err(end) => return end,
             };
-            let risky = a.risky || h.risky >= RISKY_MIN;
+            // Pablo picked or clicked it himself: that was his yes.
+            let risky = !h.picked && (a.risky || h.risky >= RISKY_MIN);
             if gate(1.0, if risky { 1.0 } else { 0.0 }, cfg.confirm_risky) == Gate::Confirm {
                 r.st.target = Some(h.mark.id);
-                if !r.confirm(desk, &format!("Click {}? Say yes · F11 · Esc", quote(&h.mark.name))) {
-                    return r.end(desk, CmdStatus::Stopped, None, String::new());
+                if let Err(end) = r.confirm(desk, &format!("Click {}? Say yes · F11 · Esc", quote(&h.mark.name)), "nothing clicked") {
+                    return end;
                 }
             }
             aim(&mut r, desk, &h);
+            if h.by_user {
+                remember(mem, MemKind::Clicked, &h.mark.name, &desk.focused(), None);
+                return r.done(desk, format!("you clicked {} ({})", quote(&h.mark.name), h.mark.role));
+            }
             if let Target::Point(x, y) = h.target {
                 if desk.secure_at((x, y)) {
                     return r.fail(desk, CmdStatus::Blocked, BLOCKED);
@@ -1215,24 +1482,30 @@ pub fn wait_flags(w: Wait, timeout: Duration) -> Answer {
     CONFIRMED.store(false, Ordering::SeqCst);
     DENIED.store(false, Ordering::SeqCst);
     *ANSWER.lock().unwrap() = None;
+    *CLICKED.lock().unwrap() = None;
     WAITING.store(if w == Wait::Confirm { 1 } else { 2 }, Ordering::SeqCst);
     let until = std::time::Instant::now() + timeout;
     let out = loop {
         if ABORT.load(Ordering::SeqCst) || DENIED.swap(false, Ordering::SeqCst) {
             break Answer::No;
         }
-        if w == Wait::Confirm && CONFIRMED.swap(false, Ordering::SeqCst) {
+        // the command key: yes to a confirm, "the highlighted one" to a pick
+        if CONFIRMED.swap(false, Ordering::SeqCst) {
             break Answer::Yes;
+        }
+        if let Some(i) = CLICKED.lock().unwrap().take() {
+            break Answer::Clicked(i);
         }
         if let Some(t) = ANSWER.lock().unwrap().take() {
             break Answer::Text(t);
         }
         if std::time::Instant::now() >= until {
-            break Answer::No;
+            break Answer::Timeout;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     WAITING.store(0, Ordering::SeqCst);
+    PICK_RECTS.lock().unwrap().clear();
     out
 }
 
@@ -1288,7 +1561,7 @@ pub mod mac {
         }
     }
 
-    fn displays() -> Vec<(PtRect, f64)> {
+    pub fn displays() -> Vec<(PtRect, f64)> {
         CGDisplay::active_displays()
             .unwrap_or_default()
             .into_iter()
@@ -1452,9 +1725,17 @@ pub mod mac {
         }
 
         /// Rust owns the marks window: it shows on every step with marks; live.rs hides it (session end, took over).
+        fn board(&mut self) -> Vec<El> {
+            crate::live::board()
+        }
+
         fn emit(&mut self, s: &CommandStep) {
             if !s.marks.is_empty() && !crate::live::took_over() {
                 crate::platform::macos::show_marks(&self.app, Some(s.display));
+                crate::live::set_board(self.els.clone());
+            }
+            if s.status == CmdStatus::Pick && s.choose {
+                set_pick_rects(s.choices.iter().filter_map(|(id, _)| self.els.iter().find(|e| e.mark.id == *id).map(|e| e.mark.rect)).collect());
             }
             crate::live::step_seen(&self.app, s);
             publish(&self.app, s.clone());
@@ -1656,6 +1937,7 @@ mod tests {
         screen_ok: bool,
         abort_after_acts: Option<usize>,
         installed: Vec<String>,
+        board: Vec<El>,
     }
 
     impl FakeDesk {
@@ -1800,6 +2082,9 @@ mod tests {
         fn apps(&mut self) -> Vec<String> {
             self.installed.clone()
         }
+        fn board(&mut self) -> Vec<El> {
+            self.board.clone()
+        }
     }
 
     fn mk(id: u32, name: &str, role: &str, region: &str, url: Option<&str>, value: Option<&str>) -> El {
@@ -1853,7 +2138,8 @@ mod tests {
         Action { op: op.into(), target: Some(target.into()), ..Default::default() }
     }
 
-    const CFG: Cfg = Cfg { confirm_risky: true };
+    const CFG: Cfg = Cfg { confirm_risky: true, choose: false };
+    const CHOOSE: Cfg = Cfg { confirm_risky: true, choose: true };
 
     const INSTALLED: [&str; 12] = [
         "Microsoft Edge", "Google Chrome", "Chrome Remote Desktop", "Ghostty", "Claude", "Safari", "Slack", "Notes",
@@ -1876,11 +2162,19 @@ mod tests {
             ("note", Some("Notes")),
             ("arc", Some("Arc")),
             ("ark", None),
+            ("vs code", Some("Visual Studio Code")),
+            ("VS Code", Some("Visual Studio Code")),
+            ("visual studio", Some("Visual Studio Code")),
+            ("Ghosty", Some("Ghostty")),
             ("photoshop", None),
             ("", None),
         ];
         for (said, want) in rows {
             assert_eq!(match_app(said, &apps).as_deref(), want, "{said:?}");
+        }
+        // the alias table holds when the app list is empty (open -a gets the real name)
+        for (said, want) in [("edge", "Microsoft Edge"), ("chrome", "Google Chrome"), ("vs code", "Visual Studio Code"), ("ghosty", "Ghostty"), ("claude", "Claude")] {
+            assert_eq!(match_app(said, &[]).as_deref(), Some(want), "{said:?}");
         }
     }
 
@@ -1934,12 +2228,16 @@ mod tests {
         assert_eq!(mem.back().unwrap().e.kind, MemKind::Typed);
     }
 
+    fn slack() -> FakeDesk {
+        FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message #general", "", None)], ..Default::default() }
+    }
+
     #[test]
-    fn return_waits_for_confirm_then_voice_si_resolves() {
-        // case 2: "run ls" = type + return, Return always confirms
-        let (mut d, mut mem) = (ghostty(), Memory::new());
+    fn return_waits_for_confirm_in_chat_apps_then_voice_si_resolves() {
+        // case 2 in a chat app: Return sends, so it asks
+        let (mut d, mut mem) = (slack(), Memory::new());
         d.answers = vec![Answer::Yes];
-        let e = run_all(&[typ("ls", None), key("return")], &mut d, &mut mem);
+        let e = run_all(&[typ("hola", None), key("return")], &mut d, &mut mem);
         assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Done]);
         assert_eq!(d.waits, [Wait::Confirm]);
         assert_eq!(d.acts, [Act::Combo(36, 0)]);
@@ -1948,23 +2246,51 @@ mod tests {
         assert_eq!(yes_no("dale"), Some(true));
         assert_eq!(yes_no("No."), Some(false));
         assert_eq!(yes_no("open slack"), None);
+        // a terminal runs it at once (live log 2026-10-18: Return waited 10 s and stopped)
+        let (mut d, mut mem) = (ghostty(), Memory::new());
+        let e = run_all(&[typ("ls", None), key("return")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Done]);
+        assert!(d.waits.is_empty());
+        assert_eq!(d.acts, [Act::Combo(36, 0)]);
     }
 
     #[test]
-    fn a_typed_newline_never_bypasses_the_return_confirm() {
-        let (mut d, mut mem) = (ghostty(), Memory::new());
-        let e = run_all(&[typ("ls\n", None), typ("pwd\r\n", None)], &mut d, &mut mem);
-        assert_eq!(statuses(&e), vec![CmdStatus::Done; 2]);
-        assert_eq!(d.typed, ["ls", "pwd"]);
-        assert!(d.waits.is_empty() && d.acts.is_empty());
+    fn return_confirm_only_where_it_sends() {
+        let f = |app: &str, bundle: &str, role: &str, name: &str| Field { app: app.into(), bundle: bundle.into(), role: role.into(), name: name.into(), ..Default::default() };
+        let rows = [
+            (f("Slack", "com.tinyspeck.slackmacgap", "AXTextArea", "Message #general"), true),
+            (f("WhatsApp", "", "AXTextArea", "Type a message"), true),
+            (f("Messages", "com.apple.MobileSMS", "AXTextArea", ""), true),
+            (f("Mail", "", "AXTextArea", ""), true),
+            (f("Discord", "", "AXTextArea", "Message @ana"), true),
+            (f("Microsoft Teams", "", "AXTextArea", ""), true),
+            (f("Telegram", "", "AXTextArea", ""), true),
+            (f("Claude", "com.anthropic.claudefordesktop", "AXTextArea", "Write your prompt to Claude"), true),
+            (f("Claude", "com.anthropic.claudefordesktop", "AXTextField", "Search chats"), false),
+            (f("Slack", "", "AXSearchField", ""), false),
+            (f("Microsoft Edge", "com.microsoft.edgemac", "AXTextField", "Address and search bar"), false),
+            (f("Google Chrome", "", "AXTextField", ""), false),
+            (f("Ghostty", "com.mitchellh.ghostty", "AXTextArea", ""), false),
+            (f("Terminal", "", "AXTextArea", ""), false),
+            (f("Visual Studio Code", "", "AXTextArea", ""), false),
+        ];
+        for (field, want) in rows {
+            assert_eq!(return_asks(&field), want, "{} {}", field.app, field.name);
+        }
     }
 
     #[test]
-    fn return_no_answer_in_10s_stops() {
-        let (mut d, mut mem) = (ghostty(), Memory::new());
+    fn a_confirm_that_times_out_says_so() {
+        let (mut d, mut mem) = (slack(), Memory::new());
+        d.answers = vec![Answer::Timeout];
         let e = run_all(&[key("enter")], &mut d, &mut mem);
         assert_eq!(statuses(&e), [CmdStatus::Stopped]);
+        assert_eq!(e[0].message.as_deref(), Some("No answer in 10 s: Return not pressed"));
         assert!(d.acts.is_empty(), "nothing pressed without a yes");
+        // a spoken no stops without a message
+        let mut d = slack();
+        let e = run_all(&[key("enter")], &mut d, &mut mem);
+        assert_eq!((e[0].status.clone(), e[0].message.clone()), (CmdStatus::Stopped, None));
     }
 
     #[test]
@@ -2368,6 +2694,163 @@ mod tests {
         assert_eq!(d.acts, [Act::Click(Target::Mark(6))], "the 2nd of the ranked list (8, 6, 1)");
     }
 
+    /// A Jev ranking: (mark id, probability), best first.
+    fn ranking(r: &[(&str, f32)]) -> Value {
+        let probs: Map<String, Value> = r.iter().map(|(k, p)| (k.to_string(), json!(p))).collect();
+        json!({ "target": { "choice": r[0].0, "probabilities": probs, "confidence": r[0].1 }, "risky": { "noul": 0.0 } })
+    }
+
+    fn pick_desk(answers: Vec<Answer>) -> FakeDesk {
+        FakeDesk { screen_ok: true, answers, ..chrome_desk() }
+    }
+
+    fn said(a: Action, words: &str) -> Action {
+        Action { said: words.into(), ..a }
+    }
+
+    #[test]
+    fn pick_mode_ranks_with_the_screenshot_and_waits_for_pablos_number() {
+        // "Clicks: I choose": even an exact mark goes to Jev and the numbered choices
+        let (mut ask, seen) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.03), ("9", 0.01)])]);
+        let mut d = pick_desk(vec![Answer::Text("la dos".into())]);
+        let e = exec(&said(on("click", "[2] Share (button, toolbar)"), "click share"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(8))], "choice 2 = mark 8, not mark 2");
+        assert_eq!(d.waits, [Wait::Pick]);
+        let (st, q) = seen.lock().unwrap()[0].clone();
+        assert!(st.to_string().contains("numbered mark"), "the marked screenshot went to Jev");
+        assert!(q["target"]["instructions"].as_str().unwrap().contains("the user said: \"click share\""));
+        let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).unwrap();
+        assert!(pick.choose && !pick.preselect && pick.target.is_none());
+        assert_eq!(pick.choices.iter().map(|c| c.0).collect::<Vec<_>>(), [2, 8, 3], "3 shown: the 4th is under 5%");
+        assert_eq!(pick.message.as_deref(), Some("Which one? 1 Share · 2 Share · 3 Search"));
+        assert!(looks_like_pick("la dos", pick.message.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn pick_mode_a_sure_first_choice_is_highlighted_and_si_takes_it() {
+        for answer in [Answer::Text("sí".into()), Answer::Text("ese".into()), Answer::Yes] {
+            let (mut ask, _) = script(vec![ranking(&[("5", 0.98), ("2", 0.01), ("8", 0.01)])]);
+            let mut d = pick_desk(vec![answer.clone()]);
+            let e = exec(&on("click", "copy link"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+            assert_eq!(e.status, CmdStatus::Done, "{answer:?}");
+            assert_eq!(d.acts, [Act::Click(Target::Mark(5))], "{answer:?}");
+            let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).unwrap();
+            assert!(pick.preselect && pick.target == Some(5), "#1 is highlighted");
+        }
+        // not sure enough: "sí" is no answer, the list waits for a number
+        let (mut ask, _) = script(vec![ranking(&[("5", 0.9), ("2", 0.05), ("8", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Text("sí".into()), Answer::Text("hmm what".into()), Answer::Text("uno".into())]);
+        let e = exec(&on("click", "copy link"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.waits.len()), (CmdStatus::Done, 3));
+        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
+    }
+
+    #[test]
+    fn pick_mode_a_click_by_hand_a_mark_number_a_timeout() {
+        // Pablo clicks choice 2 himself: the app got that click, susurro does not click again
+        let (mut ask, _) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Clicked(1)]);
+        let mut mem = Memory::new();
+        let e = exec(&on("click", "share"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut mem);
+        assert_eq!((e.status, e.summary.as_str()), (CmdStatus::Done, "you clicked “Share” (button)"));
+        assert!(d.acts.is_empty());
+        assert_eq!(mem.back().unwrap().e.kind, MemKind::Clicked);
+        // a number past the choices names a mark: Send (risky by name) needs no confirm, picking it was the yes
+        let (mut ask, _) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Text("9".into())]);
+        let e = exec(&on("click", "share"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.waits.as_slice()), (CmdStatus::Done, &[Wait::Pick][..]));
+        assert_eq!(d.acts, [Act::Click(Target::Mark(9))]);
+        // nobody answers: it says so
+        let (mut ask, _) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Timeout]);
+        let e = exec(&on("click", "share"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, e.message.as_deref()), (CmdStatus::Stopped, Some("No answer in 20 s: nothing clicked")));
+        assert!(d.acts.is_empty());
+        // type into a choice Pablo clicked: no second focus, the text goes in
+        let (mut ask, _) = script(vec![ranking(&[("3", 0.6), ("7", 0.35), ("2", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Clicked(1)]);
+        d.focus = 2; // his click focused Message
+        let e = exec(&typ("hola", Some("the message box")), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
+        assert!(d.acts.is_empty());
+        assert_eq!(d.value(2), "hola");
+    }
+
+    #[test]
+    fn pick_mode_a_number_pablo_said_is_his_choice() {
+        // "open the first link, 41": the planner (or mark_ref) wrote "[N] label", he said N: no list, no Jev
+        let mut d = pick_desk(vec![]);
+        let e = exec(&said(on("click", "[5] Copy link (button, main)"), "click the 5"), 1, 1, &CHOOSE, &mut no_jev, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
+        assert!(d.waits.is_empty());
+        // auto mode: today's path, an exact label clicks at once
+        let mut d = chrome_desk();
+        let e = exec(&on("click", "[5] Copy link (button, main)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(5))][..]));
+    }
+
+    #[test]
+    fn pick_tables() {
+        let names: Vec<String> = ["Search", "New chat", "YouTube Music"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<u32> = (1..=50).collect();
+        let rows: [(&str, bool, Option<Picked>); 16] = [
+            ("uno", false, Some(Picked::Nth(0))),
+            ("la dos", false, Some(Picked::Nth(1))),
+            ("tres", false, Some(Picked::Nth(2))),
+            ("2", false, Some(Picked::Nth(1))),
+            ("the second one", false, Some(Picked::Nth(1))),
+            ("el tercero", false, Some(Picked::Nth(2))),
+            ("the last one", false, Some(Picked::Nth(2))),
+            ("new chat", false, Some(Picked::Nth(1))),
+            ("youtube music", false, Some(Picked::Nth(2))),
+            ("41", false, Some(Picked::Mark(41))),
+            ("la 41", false, Some(Picked::Mark(41))),
+            ("99", false, None),
+            ("sí", true, Some(Picked::Nth(0))),
+            ("ese", true, Some(Picked::Nth(0))),
+            ("sí", false, None),
+            ("what was that", true, None),
+        ];
+        for (t, pre, want) in rows {
+            assert_eq!(parse_choice(t, &names, &ids, pre), want, "{t:?} pre={pre}");
+        }
+        // Jev's ranking -> what Pablo sees
+        let r = |v: &[(&str, f32)]| v.iter().map(|(k, p)| (k.to_string(), *p)).collect::<Vec<_>>();
+        let on_screen = [1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(choices(&r(&[("1", 0.5), ("none", 0.3), ("2", 0.1), ("3", 0.06), ("4", 0.03), ("99", 0.01)]), &on_screen, None), [(1, 0.5), (2, 0.1), (3, 0.06)], "none and unknown ids drop, 4th under 5%");
+        assert_eq!(choices(&r(&[("1", 0.3), ("2", 0.2), ("3", 0.2), ("4", 0.2), ("5", 0.05), ("6", 0.05)]), &on_screen, None).len(), 5, "5 at most");
+        assert_eq!(choices(&r(&[("1", 0.6), ("2", 0.4)]), &on_screen, Some(7)), [(1, 0.6), (2, 0.4), (7, 0.0)], "the planner's exact mark stays in");
+        assert!(preselect(&[(1, 0.98), (2, 0.01)]) && preselect(&[(1, 0.99)]));
+        assert!(!preselect(&[(1, 0.96), (2, 0.01)]) && !preselect(&[(1, 0.98), (2, 0.31)]));
+        assert!(looks_like_pick("ese", "Which one? 1 Search · 2 New chat"));
+        assert!(!looks_like_pick("open a new tab and type hello", "Which one? 1 Search · 2 New chat"));
+    }
+
+    #[test]
+    fn mark_numbers_resolve_against_what_was_drawn() {
+        assert_eq!(split_mark("[41] YouTube Music (link, main)"), (Some(41), "YouTube Music (link, main)"));
+        assert_eq!(split_mark("[41]"), (Some(41), ""));
+        assert_eq!(split_mark("41"), (Some(41), ""));
+        assert_eq!(split_mark("#41"), (Some(41), ""));
+        assert_eq!(split_mark("Share (button, toolbar)"), (None, "Share (button, toolbar)"));
+        assert_eq!(split_mark("[x] y"), (None, "[x] y"));
+        assert!(said_number("Open the first link, 41.", 41) && !said_number("open 141", 41) && !said_number("click share", 2));
+        let els = chrome().els;
+        let id = |e: Option<&El>| e.map(|e| e.mark.id);
+        assert_eq!(id(mark_target("[5] Copy link (button, main)", &els, &[])), Some(5));
+        assert_eq!(id(mark_target("Copy link (button, main)", &els, &[])), Some(5), "no number: the label");
+        // two "Share" buttons: the label is ambiguous, the drawn mark 8 found again by its rect
+        assert_eq!(id(mark_target("[8] Share", &els, &els)), Some(8));
+        // the page moved on: the board's 41 is gone from the fresh read -> nothing, never another mark 41
+        let mut board = els.clone();
+        board[4].mark.name = "YouTube Music".into();
+        assert_eq!(id(mark_target("[5] YouTube Music (link, main)", &els, &board)), None);
+        assert_eq!(id(mark_target("[5]", &els, &[])), Some(5), "a bare number with no board");
+    }
+
     #[test]
     fn ax_tree_to_marks_request() {
         let tree = n("AXWindow", "", (0.0, 0.0, 1440.0, 900.0), (0..6).map(|i| n("AXButton", &format!("B{i}"), (100.0 * i as f64 + 400.0, 400.0, 50.0, 20.0), vec![])).collect());
@@ -2423,5 +2906,111 @@ mod tests {
         }
         println!("{hits}/{total} hits, {} calls, ${cost:.5}", calls.get());
         assert!(hits >= 22, "{hits}/24");
+    }
+
+    #[test]
+    fn pick_mode_adversarial() {
+        // a big choice (a web area) holds a small one: the click goes to the smallest under it
+        let big = PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 };
+        let small = PtRect { x: 100.0, y: 50.0, w: 80.0, h: 24.0 };
+        assert_eq!(choice_at(&[big, small], (120.0, 60.0)), Some(1));
+        assert_eq!(choice_at(&[big, small], (700.0, 700.0)), Some(0));
+        assert_eq!(choice_at(&[small], (700.0, 700.0)), None);
+        // an order that also holds a yes word or a choice name is an order, not a pick
+        let q = "Which one? 1 Share · 2 Share · 3 Search";
+        for order in ["ok search youtube", "sí, abre slack", "ok open edge", "search for cats"] {
+            assert!(!looks_like_pick(order, q), "{order}");
+        }
+        for answer in ["ok", "sí", "ese", "that one", "this one", "la dos", "the second one", "search", "open search"] {
+            assert!(looks_like_pick(answer, q), "{answer}");
+        }
+        let names: Vec<String> = ["Share", "Share", "Search"].map(String::from).to_vec();
+        assert_eq!(parse_choice("open search", &names, &[2, 8, 3], false), Some(Picked::Nth(2)));
+        assert_eq!(parse_choice("ok search youtube", &names, &[2, 8, 3], false), None);
+        assert_eq!(parse_choice("ok", &names, &[2, 8, 3], false), None, "a yes picks only a highlighted #1");
+        // Esc while the list waits: nothing clicked, no message
+        let (mut ask, _) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::No]);
+        let e = exec(&on("click", "share"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, e.message, d.acts.len()), (CmdStatus::Stopped, None, 0));
+        // a number in the order that is on the board: no list, the drawn mark is clicked
+        let mut d = FakeDesk { board: chrome().els, ..pick_desk(vec![]) };
+        let (mut ask, seen) = script(vec![]);
+        let e = exec(&said(on("click", "[8] Share (button, main)"), "share, 8"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice(), seen.lock().unwrap().len()), (CmdStatus::Done, &[Act::Click(Target::Mark(8))][..], 0));
+        // a type target is a field to focus, not a click: no list (replay 2026-10-18: "type YouTube" into the address bar)
+        let mut d = pick_desk(vec![]);
+        let (mut ask, seen) = script(vec![]);
+        let e = exec(&typ("cats", Some("[3] Search (search field, toolbar)")), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.typed.as_slice(), seen.lock().unwrap().len(), d.waits.len()), (CmdStatus::Done, &["cats".to_string()][..], 0, 0));
+    }
+
+    /// Real API: Pablo's live session (susurro.log 2026-10-18 00:28-00:30 UTC) end to end on a fake desk: the
+    /// mark-number pass, the real planner (DEFAULT_PLANNER), then exec in pick mode with a scripted Jev ranking.
+    /// `OPENROUTER_API_KEY=... cargo test replay_the_live_session_on_a_fake_desk -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay_the_live_session_on_a_fake_desk() {
+        use crate::planner::{Input, mark_ref, plan_openrouter};
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY");
+        let model = std::env::var("PLANNER").unwrap_or_else(|_| crate::contract::DEFAULT_PLANNER.into());
+        let model = model.as_str();
+        let claude = Screen { app: "Claude".into(), display: chrome().display, scale: 2.0, els: vec![
+            mk(1, "New chat", "button", "sidebar", None, None), mk(2, "Search", "button", "sidebar", None, None),
+            mk(3, "Write your prompt to Claude", "text area", "main", None, None), mk(4, "Send message", "button", "main", None, None)] };
+        let edge_new = Screen { app: "Microsoft Edge".into(), display: chrome().display, scale: 2.0, els: vec![
+            mk(1, "New Tab", "tab", "top", None, None), mk(2, "Address and search bar", "text field", "toolbar", None, None),
+            mk(3, "Search the web", "search field", "main", None, None), mk(4, "YouTube", "link", "main", None, None)] };
+        let res: Vec<El> = [(34, "Address and search bar", "text field", "toolbar"), (35, "Videos", "link", "top"), (40, "YouTube YouTube https://www.youtube.com", "link", "main"),
+            (41, "YouTube Music", "link", "main"), (42, "YouTube - Wikipedia", "link", "main")].iter().map(|(i, n, r, g)| mk(*i, n, r, g, None, None)).collect();
+        let edge_res = Screen { app: "Microsoft Edge".into(), display: chrome().display, scale: 2.0, els: res };
+        let fields = |app: &str| match app {
+            "Claude" => vec![FField::new("AXTextArea", "Write your prompt to Claude", "", Some(3))],
+            _ => vec![FField::new("AXTextField", "Address and search bar", "", Some(2)), FField::new("AXWebArea", "", "", None)],
+        };
+        // (order, screen, Jev ranking for a pick, Pablo's pick answer)
+        let orders: Vec<(&str, Screen, Value, Answer)> = vec![
+            ("Open, Microsoft Edge.", claude, json!(null), Answer::No),
+            ("search for you- YouTube.", edge_new, json!(null), Answer::No),
+            ("Open the first link.", edge_res.clone(), ranking(&[("40", 0.7), ("41", 0.2), ("42", 0.06), ("35", 0.02)]), Answer::Text("uno".into())),
+            ("Open the first link, 41.", edge_res, json!(null), Answer::No),
+        ];
+        let mut mem = Memory::new();
+        let (mut cost, mut log) = (0.0, vec![]);
+        for (step, (utt, scr, rank, answer)) in orders.into_iter().enumerate() {
+            let app = scr.app.clone();
+            let mut d = FakeDesk { app: app.clone(), fields: fields(&app), screens: vec![scr.clone()], board: scr.els.clone(), screen_ok: true, answers: vec![answer],
+                installed: vec!["Microsoft Edge".into(), "Claude".into(), "Google Chrome".into()], ..Default::default() };
+            let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
+            let plan = match mark_ref(utt, &ids).and_then(|n| scr.els.iter().find(|e| e.mark.id == n)) {
+                Some(e) => crate::planner::Plan { complete: true, actions: vec![Action { op: "click".into(), target: Some(format!("[{}] {}", e.mark.id, ax::describe(e))), ..Default::default() }], ..Default::default() },
+                None => {
+                    let focused = d.focused();
+                    let input = Input { utterance: utt.into(), app: app.clone(), focused, marks: scr.els.iter().map(|e| format!("[{}] {}", e.mark.id, ax::describe(e))).collect(), ..Default::default() };
+                    let (p, m) = plan_openrouter(&key, model, &input).unwrap_or_else(|e| panic!("{utt}: {e:#}"));
+                    cost += m.cost;
+                    p
+                }
+            };
+            let (mut ask, _) = script(if rank.is_null() { vec![] } else { vec![rank] });
+            let mut ends = vec![];
+            for a in &plan.actions {
+                let e = exec(&Action { said: utt.into(), ..a.clone() }, step as u32 + 1, 1, &CHOOSE, &mut ask, &mut d, &mut mem);
+                let stop = e.status != CmdStatus::Done;
+                ends.push(e);
+                if stop {
+                    break;
+                }
+            }
+            let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).map(|s| s.choices.iter().map(|c| c.0).collect::<Vec<_>>());
+            println!("{utt:30} -> {:?}\n   acts {:?} typed {:?} waits {:?} pick {pick:?} ends {:?}", plan.actions.iter().map(crate::planner::label).collect::<Vec<_>>(), d.acts, d.typed, d.waits, statuses(&ends));
+            log.push((d.acts.clone(), d.typed.clone(), d.waits.clone(), pick, statuses(&ends)));
+        }
+        println!("${cost:.5}");
+        let done = |e: &Vec<CmdStatus>| !e.is_empty() && e.iter().all(|s| *s == CmdStatus::Done);
+        assert!(done(&log[0].4) && log[0].0 == [Act::OpenApp("Microsoft Edge".into())], "open Edge");
+        assert!(done(&log[1].4) && log[1].0.first() == Some(&Act::Combo(37, CMD)) && log[1].1 == ["YouTube"] && log[1].0.last() == Some(&Act::Combo(36, 0)) && log[1].2.is_empty(), "cmd+l, YouTube, Return without a confirm");
+        assert!(done(&log[2].4) && log[2].3.as_ref().is_some_and(|c| c.starts_with(&[40, 41, 42])) && log[2].0 == [Act::Click(Target::Mark(40))], "pick list, 'uno' clicks 40");
+        assert!(done(&log[3].4) && log[3].0 == [Act::Click(Target::Mark(41))] && log[3].2.is_empty(), "41 clicks mark 41, no list");
     }
 }

@@ -37,6 +37,46 @@ static OWN_AT: AtomicI64 = AtomicI64::new(0);
 /// Pablo's input within this long after one of susurro's own events is susurro's.
 const OWN_MS: i64 = 300;
 
+/// The marks drawn on screen now (their numbers are what Pablo says). Set by every draw.
+static BOARD: Mutex<Vec<crate::ax::El>> = Mutex::new(Vec::new());
+/// The executor runs a step: only its own reads draw the marks (a pick list must not change under Pablo).
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// Steps started; a late board refresh checks that no new step began.
+static STEPS: AtomicI64 = AtomicI64::new(0);
+
+pub fn board() -> Vec<crate::ax::El> {
+    BOARD.lock().unwrap().clone()
+}
+
+pub fn set_board(els: Vec<crate::ax::El>) {
+    *BOARD.lock().unwrap() = els;
+}
+
+/// Draws a fresh read as the marks board (step 0 = board only, Marks.tsx), so the numbers on screen are the ones
+/// the planner and the next step see (live log 2026-10-18: Pablo read "41" off a board from before a page load).
+#[cfg(target_os = "macos")]
+fn draw_board(app: &AppHandle, els: &[crate::ax::El], window: crate::contract::PtRect) {
+    if els.is_empty() || took_over() || command::waiting().is_some() {
+        return;
+    }
+    let (display, _) = command::display_for(command::center(window), &command::mac::displays()).unwrap_or((window, 1.0));
+    crate::platform::macos::show_marks(app, Some(display));
+    set_board(els.to_vec());
+    let _ = app.emit("command_step", CommandStep { status: CmdStatus::Marks, display, marks: els.iter().map(|e| e.mark.clone()).collect(), ..Default::default() });
+}
+
+/// Re-read the front app and draw it (after a step, when nothing else is queued).
+#[cfg(target_os = "macos")]
+fn refresh_board(app: &AppHandle) {
+    if !crate::permissions::accessibility_trusted() {
+        return;
+    }
+    let Some(front) = crate::paste::target_app() else { return };
+    if let Some(tree) = crate::ax::mac::read(front.pid) {
+        draw_board(app, &crate::ax::collect(&tree.root, tree.window), tree.window);
+    }
+}
+
 /// The marks window hides (Pablo took over): until the next order.
 pub fn took_over() -> bool {
     TOOK_OVER.load(Ordering::SeqCst)
@@ -72,8 +112,13 @@ pub fn paused() -> bool {
 
 /// The input monitor saw Pablo's own event. `hard` = a key or a click (not a mouse move or scroll): the queue
 /// pauses too, so susurro never types over what he does by hand.
-pub fn user_input(app: &AppHandle, hard: bool) {
+/// `click` = where a left click landed (global points): a click on a pick choice answers the pick instead.
+pub fn user_input(app: &AppHandle, hard: bool, click: Option<(f64, f64)>) {
     if crate::history::now_ms() - OWN_AT.load(Ordering::SeqCst) < OWN_MS {
+        return;
+    }
+    if click.is_some_and(command::user_clicked) {
+        log::info!("live: Pablo clicked a pick choice himself");
         return;
     }
     let pause = hard && !PAUSED.swap(true, Ordering::SeqCst);
@@ -377,11 +422,12 @@ impl RtAudio {
         Some(pad)
     }
 
-    /// Scribe answered the oldest commit. After the release no next chunk catches a lost order: an empty answer for
-    /// audio with speech in it goes to the batch STT.
-    fn committed(&mut self, t: &str, ended: bool) -> RtAnswer {
+    /// Scribe answered the oldest commit. An empty answer for audio with speech in it goes to the batch STT at once,
+    /// mid-session too (live log 2026-10-18: 9 empty commits, orders lost until the release).
+    /// ponytail: if Scribe sends those words later in the next commit, they come twice; not seen in the log.
+    fn committed(&mut self, t: &str) -> RtAnswer {
         let Some((n, a)) = self.unanswered.pop_front() else { return RtAnswer::Nothing };
-        if t.trim().is_empty() && ended && crate::audio::worth(&crate::audio::resample(&a, self.rate)) {
+        if t.trim().is_empty() && crate::audio::worth(&crate::audio::resample(&a, self.rate)) {
             return RtAnswer::Batch(n, a);
         }
         RtAnswer::Text(n, t.to_string())
@@ -533,6 +579,8 @@ pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Ha
     command::clear_log();
     TOOK_OVER.store(false, Ordering::SeqCst);
     PAUSED.store(false, Ordering::SeqCst);
+    // a number names a mark on this session's screen, never one drawn in an earlier session
+    set_board(vec![]);
     let (provider, rt_opts) = {
         let st = app.state::<AppState>();
         let s = st.settings.read().unwrap().clone();
@@ -590,6 +638,16 @@ fn live_loop(
     // The release (Scribe gets RT_FINISH_MS from here) and the last new words (a held order runs HOLD_MS after).
     let (mut released, mut words_at): (Option<Instant>, Instant) = (None, Instant::now());
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
+        // "41", "la 41", "open the first link, 41": the mark Pablo reads on screen, no LLM.
+        if pending.is_none() {
+            let shown = board();
+            let ids: Vec<u32> = shown.iter().map(|e| e.mark.id).collect();
+            if let Some(e) = planner::mark_ref(text, &ids).and_then(|n| shown.iter().find(|e| e.mark.id == n)) {
+                let target = format!("[{}] {}", e.mark.id, crate::ax::describe(e));
+                log::info!("live: mark number {text:?} -> click {target:?}");
+                return Ok(Plan { complete: true, actions: vec![Action { op: "click".into(), target: Some(target), ..Default::default() }], ..Default::default() });
+            }
+        }
         let (mut input, here) = context(&app);
         (input.utterance, input.last) = (text.to_string(), last);
         input.pending = pending.map(String::from);
@@ -645,14 +703,14 @@ fn live_loop(
                 }
                 scribe_rt::Ev::Partial(_) => {}
                 // Scribe answers in commit order; the answer goes the way of a finished batch chunk.
-                scribe_rt::Ev::Committed(t) => match rta.committed(&t, released.is_some()) {
+                scribe_rt::Ev::Committed(t) => match rta.committed(&t) {
                     RtAnswer::Text(n, t) => {
                         log::info!("live: commit {n}: {t:?}");
                         in_flight += 1;
                         let _ = tx.send(Msg::Text(n, Ok(command_words(&app, &t))));
                     }
                     RtAnswer::Batch(n, a) => {
-                        log::info!("live: commit {n} came back empty after the release, the batch STT tries it");
+                        log::info!("live: commit {n} came back empty with speech in it, the batch STT tries it");
                         waiting.push_back((n, to_16k(&a)));
                     }
                     RtAnswer::Nothing => {}
@@ -815,7 +873,8 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
         Heard::Pick(t) => command::answer(t),
         Heard::Order(order, actions, say) => {
             let said = core.said.last().cloned().unwrap_or_default();
-            for a in actions {
+            for mut a in actions {
+                a.said = said.clone();
                 queue.push(Item::Do { order, said: said.clone(), action: a });
             }
             // The next order shows the marks again (case 13) and resumes a paused queue (open risk a).
@@ -837,7 +896,7 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
 
 fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSettings, ctl: Arc<Ctl>) {
     let t0 = Instant::now();
-    let cfg = Cfg { confirm_risky: settings.confirm_risky };
+    let cfg = Cfg { confirm_risky: settings.confirm_risky, choose: !settings.auto_click };
     let mut ask = |s: &serde_json::Value, q: &serde_json::Value| crate::jev::ask(crate::jev::DECISIONS_URL, &key, &settings.model, s, q);
     let (mut step, mut summary, mut worst, mut message) = (0u32, vec![], CmdStatus::Done, None);
     let mut skip: Option<u32> = None;
@@ -869,8 +928,11 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 }
                 let labels = queue.labels();
                 update(&app, |l| l.queue = labels);
+                BUSY.store(true, Ordering::SeqCst);
+                STEPS.fetch_add(1, Ordering::SeqCst);
                 #[cfg(target_os = "macos")]
                 let end = command::exec(&action, step, order, &cfg, &mut ask, &mut desk, &mut mem);
+                BUSY.store(false, Ordering::SeqCst);
                 #[cfg(not(target_os = "macos"))]
                 let end = {
                     let _ = (&cfg, &mut ask, &action);
@@ -883,6 +945,10 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 if end.status != CmdStatus::Done {
                     // The rest of this order depends on this action.
                     skip = Some(order);
+                    // A timeout or a miss says so in the pill (live log 2026-10-18: a Return confirm stopped silently).
+                    if let Some(m) = end.message.as_deref().filter(|m| !matches!(*m, "accessibility" | "screen_recording" | "key")) {
+                        crate::session::toast(&app, Some("overlay"), "live-step", crate::contract::ToastKind::Warn, m.to_string(), &[], 5000);
+                    }
                     (worst, message) = (end.status.clone(), end.message.clone());
                     command::remember(&mut mem, MemKind::Failed, &planner::label(&action), &crate::ax::Field::default(), None);
                 } else {
@@ -893,6 +959,16 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 #[cfg(target_os = "macos")]
                 if !marks_visible(LIVE.lock().unwrap().on, queued, false, took_over()) {
                     crate::platform::macos::show_marks(&app, None);
+                } else if queued == 0 && !ctl.stopped.load(Ordering::SeqCst) {
+                    // the next order reads its numbers off the screen as it is now; a page load gets a second look
+                    refresh_board(&app);
+                    let (app, at) = (app.clone(), STEPS.load(Ordering::SeqCst));
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(BOARD_AGAIN_MS));
+                        if STEPS.load(Ordering::SeqCst) == at && !BUSY.load(Ordering::SeqCst) && LIVE.lock().unwrap().on {
+                            refresh_board(&app);
+                        }
+                    });
                 }
                 let _ = queued;
             }
@@ -906,7 +982,10 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
     finish(&app, &ctl, Ended { instruction, end, latency_ms: t0.elapsed().as_millis() as u32 });
 }
 
-/// The planner's view right before the call: app, focused field, marks (ids dropped). true = `type_here`.
+/// A page load after a click: the board is read again this long after the step. ponytail: a guess, not measured.
+const BOARD_AGAIN_MS: u64 = 1200;
+
+/// The planner's view right before the call: app, focused field, marks ("[N] label"). true = `type_here`.
 fn context(app: &AppHandle) -> (planner::Input, bool) {
     let _ = app;
     let t = Instant::now();
@@ -923,7 +1002,11 @@ fn context(app: &AppHandle) -> (planner::Input, bool) {
             if let Some(tree) = crate::ax::mac::read(front.pid) {
                 let els = crate::ax::collect(&tree.root, tree.window);
                 inputs = els.iter().filter(|e| crate::ax::takes_text(&e.mark.role)).count();
-                input.marks = els.iter().map(crate::ax::describe).collect();
+                input.marks = els.iter().map(|e| format!("[{}] {}", e.mark.id, crate::ax::describe(e))).collect();
+                // what the planner numbers is what Pablo sees (a running step draws its own reads)
+                if !BUSY.load(Ordering::SeqCst) {
+                    draw_board(app, &els, tree.window);
+                }
             }
         }
     }
@@ -1192,17 +1275,21 @@ mod tests {
         let mut seq = 0;
         assert!(!r.audio(&speech, false, &mut seq));
         assert_eq!(r.end(&mut seq), Some(vec![]), "long enough: no pad, one last commit");
-        assert_eq!(r.committed("Open Edge.", true), RtAnswer::Text(0, "Open Edge.".into()));
+        assert_eq!(r.committed("Open Edge."), RtAnswer::Text(0, "Open Edge.".into()));
         // Scribe answers the last commit with nothing: the batch STT tries the audio (no next chunk will catch it)
         let mut r = RtAudio { rate, ..Default::default() };
         r.audio(&speech, false, &mut seq);
         r.end(&mut seq);
-        assert!(matches!(r.committed("", true), RtAnswer::Batch(1, ref a) if a.len() == speech.len()));
-        // mid-session an empty commit is just silence
+        assert!(matches!(r.committed(""), RtAnswer::Batch(1, ref a) if a.len() == speech.len()));
+        // mid-session: an empty answer for speech goes batch at once (live log 2026-10-18), silence stays silence
+        let mut r = RtAudio { rate, ..Default::default() };
+        r.audio(&speech, true, &mut seq);
+        assert!(matches!(r.committed(""), RtAnswer::Batch(2, _)));
+        seq -= 1;
         let mut r = RtAudio { rate, ..Default::default() };
         r.audio(&vec![0.0; rate as usize], true, &mut seq);
-        assert_eq!(r.committed("", false), RtAnswer::Text(2, String::new()));
-        assert_eq!(r.committed("late", true), RtAnswer::Nothing, "no commit left");
+        assert_eq!(r.committed(""), RtAnswer::Text(2, String::new()));
+        assert_eq!(r.committed("late"), RtAnswer::Nothing, "no commit left");
         // the socket closes or fails with audio not answered: it all goes batch, in order
         let mut r = RtAudio { rate, ..Default::default() };
         r.audio(&speech, true, &mut seq);

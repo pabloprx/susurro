@@ -427,3 +427,78 @@ body,
   display: block;
   font-weight: 600;
 }
+
+/* ---- pick mode ("Clicks: I choose"): the 3-5 candidates get big place numbers 1..5 and their names; the rest dim.
+   Read from across the room: 28 px digits, tally orange like "Which one?". #1 pre-highlighted = "sí" takes it. ---- */
+.mark.choice {
+  box-shadow:
+    0 0 0 2px #ff6a3d,
+    0 0 0 4px rgb(18 17 16 / 0.55),
+    0 0 22px -2px rgb(255 106 61 / 0.5);
+}
+.mark.choice.pre {
+  box-shadow:
+    0 0 0 3px #ffd166,
+    0 0 0 5px rgb(18 17 16 / 0.6),
+    0 0 28px 0 rgb(255 209 102 / 0.55);
+}
+.choice-n {
+  display: grid;
+  place-items: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  font: 600 20px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: #1a0a04;
+  background: #ff6a3d;
+  border-radius: 9px;
+  box-shadow: 0 0 0 1.5px rgb(18 17 16 / 0.6), 0 4px 12px -3px rgb(0 0 0 / 0.6);
+}
+/* centered on the left edge (rows 25 pt apart stay apart); the name sits outside, right of the element */
+.mark .choice-n {
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  translate: 0 -50%;
+}
+.mark.pre .choice-n,
+.hud-choices li.pre .choice-n {
+  background: #ffd166;
+}
+.choice-name {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  translate: 0 -50%;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 500 12px/20px var(--font-ui);
+  padding: 0 7px;
+  color: var(--paper);
+  background: rgb(18 17 16 / 0.88);
+  border-radius: 5px;
+  box-shadow: 0 0 0 1px rgb(237 232 223 / 0.2);
+}
+.hud-choices {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+  display: grid;
+  gap: 4px;
+}
+.hud-choices li {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  font-size: 14px;
+}
+.hud-choices li.pre .pick-name {
+  font-weight: 600;
+}

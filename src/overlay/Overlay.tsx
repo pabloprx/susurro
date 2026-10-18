@@ -150,7 +150,8 @@ export default function Overlay() {
         if (s.phase === "recording" || s.phase === "locked") api.getSettings().then(setSettings);
       }),
       on("audio_level", (l) => wave.current?.push(l.db)),
-      on("command_step", (c) => setStep({ ...c, at: Date.now() })),
+      // step 0 = a marks board refresh (live.rs draw_board), not a step: the pill keeps what it shows
+      on("command_step", (c) => c.step !== 0 && setStep({ ...c, at: Date.now() })),
       on("command_live", (l) => {
         // the session just ended: its last step is the result to show (viewOf shows a fresh end step)
         setLive((prev) => (isLive(prev) && !isLive(l) && setStep((st) => st && { ...st, at: Date.now() }), l));

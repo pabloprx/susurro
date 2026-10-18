@@ -53,6 +53,9 @@ pub struct CommandSettings {
     /// The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
     /// spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
     pub planner_model: String,
+    /// "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
+    /// choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
+    pub auto_click: bool,
     /// The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
     /// "Latency"), else the dictation provider.
     pub stt: Option<SttProvider>,
@@ -553,8 +556,12 @@ pub struct CommandStep {
     pub marks: Vec<Mark>,
     /// The chosen mark (aim, confirm).
     pub target: Option<u32>,
-    /// pick: the top 3 (mark id, confidence).
+    /// pick: the top 3 (mark id, confidence). Pick mode (`choose`): 3 to 5, numbered 1.. in this order.
     pub choices: Vec<(u32, f32)>,
+    /// Pick mode ("Clicks: I choose"): the choices are numbered by place (1..5), not by mark id.
+    pub choose: bool,
+    /// Pick mode: Jev is sure of choice 1, it is highlighted and "sí" takes it.
+    pub preselect: bool,
     pub latency_ms: u32,
     pub cost_usd: f64,
     /// unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
@@ -640,7 +647,7 @@ pub struct Navigate {
 /// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
 /// v5: hotkeys.recents ("Ctrl+" + an F-key ptt), the old 400 ms grace becomes 1000, LLM cleanup off once for MAI STT.
 /// v6: "press enter" at the end of a dictation is on by default (turned on once for older files).
-pub const SETTINGS_VERSION: u32 = 6;
+pub const SETTINGS_VERSION: u32 = 7;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
 /// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
 /// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
@@ -784,7 +791,7 @@ impl Default for SessionState {
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), stt: None }
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None }
     }
 }
 

@@ -151,7 +151,9 @@ pub fn watch_user_input(app: &AppHandle, on: bool) {
                 }
                 if crate::live::is_users(user_data, key, &bound, if key.is_some() { 0.0 } else if ty == NSEventType::MouseMoved { moved.get() } else { 99.0 }) {
                     moved.set(0.0);
-                    crate::live::user_input(&app2, ty != NSEventType::MouseMoved && ty != NSEventType::ScrollWheel);
+                    // a left click's spot (CG global points): it may answer a pick
+                    let at = (ty == NSEventType::LeftMouseDown).then(|| e.CGEvent().map(|c| objc2_core_graphics::CGEvent::location(Some(&c)))).flatten().map(|p| (p.x, p.y));
+                    crate::live::user_input(&app2, ty != NSEventType::MouseMoved && ty != NSEventType::ScrollWheel, at);
                 }
             });
             let mask = NSEventMask::MouseMoved | NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::ScrollWheel | NSEventMask::KeyDown;

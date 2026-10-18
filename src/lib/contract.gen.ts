@@ -40,6 +40,11 @@ model: string,
  */
 planner_model: string, 
 /**
+ * "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
+ * choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
+ */
+auto_click: boolean, 
+/**
  * The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
  * "Latency"), else the dictation provider.
  */
@@ -79,9 +84,17 @@ marks: Array<Mark>,
  */
 target: number | null, 
 /**
- * pick: the top 3 (mark id, confidence).
+ * pick: the top 3 (mark id, confidence). Pick mode (`choose`): 3 to 5, numbered 1.. in this order.
  */
-choices: Array<[number, number]>, latency_ms: number, cost_usd: number, 
+choices: Array<[number, number]>, 
+/**
+ * Pick mode ("Clicks: I choose"): the choices are numbered by place (1..5), not by mark id.
+ */
+choose: boolean, 
+/**
+ * Pick mode: Jev is sure of choice 1, it is highlighted and "sí" takes it.
+ */
+preselect: boolean, latency_ms: number, cost_usd: number, 
 /**
  * unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
  */

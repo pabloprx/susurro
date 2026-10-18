@@ -6,7 +6,7 @@ import { AlertTriangle, Check, MonitorUp, RotateCw } from "lucide-react";
 import { api, on, type CommandStep, type MemKind, type MemoryEntry } from "../lib/api";
 import { clock, keyLabel, keysOf, keyStore, opOf, permStore, save, saveSettings, settingsStore, VERB } from "../lib/store";
 import { S } from "../lib/strings";
-import { Kbd, Label, radioKeys, Title, toast, Toggle } from "../ui";
+import { Kbd, Label, radioKeys, Segmented, Title, toast, Toggle } from "../ui";
 import { Diagram, usePermWatch } from "./Onboarding";
 import { DEFAULTS, PICKS, useRecorder } from "./Shortcuts";
 import type { Nav } from "../App";
@@ -15,16 +15,17 @@ import type { SttProvider } from "../lib/contract.gen";
 const PINNED_MODEL = "typesafe/jev-1.14";
 const ENDED: CommandStep["status"][] = ["done", "stopped", "unsure", "blocked", "setup", "error"];
 
-type Planner = { id: string; name: string; via: string; same: number; strict: number; p50: number; p90: number; usd: number; tag?: string };
-/** .lo/planner-bench.md, 2026-10-17: v2 prompt, 20 scenarios from Pablo's log x 3 runs = 60 calls per model, one request
- *  at a time from this Mac. same = the plan had the right end effect; p50 / p90 = wall clock of one request; usd = usage.cost.
- *  Ranked by same-effect score, then p50. ponytail: a fixed table; re-run the bench (and edit it here) to update it. */
+type Planner = { id: string; name: string; via: string; same: number; of: number; p50: number; p90: number; usd: number; tag?: string };
+/** .lo/planner-bench.md. v3 (2026-10-18): the app's prompt, 28 orders (20 old + 8 from Pablo's live log) x 2 runs, one
+ *  request at a time from this Mac; same = right end effect, out of 54 (the "41" case left out: no model could see mark
+ *  numbers then). v2 (2026-10-17, older prompt): 20 orders x 3 runs. p50 / p90 = wall clock of one request; usd = usage.cost.
+ *  ponytail: a fixed table; re-run the bench (and edit it here) to update it. */
 export const PLANNERS: Planner[] = [
-  { id: "openai/gpt-oss-120b", name: "gpt-oss-120b", via: "Cerebras · reasoning low", same: 60, strict: 57, p50: 0.78, p90: 1.11, usd: 0.00045, tag: "FASTEST" },
-  { id: "openai/gpt-6-luna", name: "GPT-6 Luna", via: "reasoning minimal", same: 60, strict: 56, p50: 1.67, p90: 3.15, usd: 0.00012, tag: "CHEAPEST" },
-  { id: "google/gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", via: "reasoning minimal", same: 60, strict: 57, p50: 1.8, p90: 1.99, usd: 0.000349 },
-  { id: "anthropic/claude-haiku-5.5", name: "Claude Haiku 5.5", via: "Anthropic", same: 60, strict: 60, p50: 2.05, p90: 2.86, usd: 0.000233, tag: "MOST EXACT" },
-  { id: "google/gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite", via: "misses 7 of 60", same: 53, strict: 53, p50: 0.98, p90: 1.22, usd: 0.000105 },
+  { id: "openai/gpt-6-luna", name: "GPT-6 Luna", via: "reasoning minimal · 14/16 on your log", same: 52, of: 54, p50: 1.87, p90: 3.33, usd: 0.00006, tag: "DEFAULT" },
+  { id: "openai/gpt-oss-120b", name: "gpt-oss-120b", via: "Cerebras · 12/16 on your log", same: 52, of: 54, p50: 0.77, p90: 1.02, usd: 0.00061, tag: "FASTEST" },
+  { id: "google/gemini-3.8-flash", name: "Gemini 3.8 Flash", via: "reasoning minimal · 12/16 on your log · 2 of 58 over 6 s", same: 52, of: 54, p50: 2.91, p90: 4.19, usd: 0.0015 },
+  { id: "google/gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", via: "older bench (v2)", same: 60, of: 60, p50: 1.8, p90: 1.99, usd: 0.000349 },
+  { id: "anthropic/claude-haiku-5.5", name: "Claude Haiku 5.5", via: "older bench (v2)", same: 60, of: 60, p50: 2.05, p90: 2.86, usd: 0.000233 },
 ];
 const SLOWEST = Math.max(...PLANNERS.map((p) => p.p90));
 
@@ -201,6 +202,26 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
         <div className="sc-row">
           <div>
+            <div className="label">Clicks</div>
+            <div className="sub">Who picks what to click</div>
+          </div>
+          <span className="small">
+            {s.command.auto_click
+              ? "Clicks what Jev picks. Asks only when it is not sure."
+              : "Shows the 3-5 best matches, numbered. Say the number, or click it."}
+          </span>
+          <Segmented
+            label="Clicks"
+            value={s.command.auto_click ? "auto" : "choose"}
+            options={[
+              { value: "choose", label: "I choose" },
+              { value: "auto", label: "Auto" },
+            ]}
+            onChange={(v) => save((x) => void (x.command.auto_click = v === "auto"))}
+          />
+        </div>
+        <div className="sc-row">
+          <div>
             <div className="label">Target model</div>
             <div className="sub">Picks the button you named</div>
           </div>
@@ -231,10 +252,10 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
       </div>
 
-      <Label right={<span className="small">60 calls per model, measured</span>}>Planner</Label>
+      <Label right={<span className="small">measured, one request at a time</span>}>Planner</Label>
       <PlannerPicker value={s.command.planner_model} onPick={(id) => save((x) => void (x.command.planner_model = id))} />
       <p className="small vc-bench-note">
-        Measured on Oct 17 from this Mac: 20 orders from your log, 3 runs each, one request at a time. Real screens send more text, so real
+        Measured on Oct 18 from this Mac: 28 orders, 8 of them from your live log, 2 runs each. Real screens send more text, so real
         times run higher. Same effect = the plan did the right thing, even with other steps.
       </p>
 
@@ -246,15 +267,20 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </li>
         <li>
           <span className="label">Marks</span>
-          <span>Before each click it reads the screen again, numbers the buttons and picks the one you named.</span>
+          <span>Before each click it reads the screen again and numbers the buttons. Say a number you see (“41”) and it clicks that one.</span>
         </li>
         <li>
           <span className="label">Look</span>
           <span>Only for “the red one” or “next to Send”: one screenshot of one display. Nothing is saved.</span>
         </li>
         <li>
-          <span className="label">Ask</span>
-          <span>Under 80% sure, it asks “Which one?”: say the number. Before Return or a send, it asks: say “yes”.</span>
+          <span className="label">Choose</span>
+          <span>
+            {s.command.auto_click
+              ? "Under 80% sure, it asks “Which one?”: say the number."
+              : "It shows the best 3-5 matches as big numbers 1-5: say “uno”, “the second”, the name, or click it. When it is sure, 1 is lit and “sí” takes it."}{" "}
+            Before Return in a chat or mail app, it asks: say “yes”.
+          </span>
         </li>
       </ol>
       <p className="small vc-safety">
@@ -359,7 +385,9 @@ function PlannerPicker({ value, onPick }: { value: string; onPick: (id: string) 
               </>
             ) : (
               <>
-                <span className={`mono vc-pl-score${p.same < 60 ? " miss" : ""}`}>{p.same}/60</span>
+                <span className={`mono vc-pl-score${p.same / p.of < 0.9 ? " miss" : ""}`}>
+                  {p.same}/{p.of}
+                </span>
                 <span className="vc-pl-lat" title={`p50 ${p.p50.toFixed(2)} s, p90 ${p.p90.toFixed(2)} s`}>
                   <span className="bar" aria-hidden>
                     <i className="p90" style={{ width: `${(p.p90 / SLOWEST) * 100}%` }} />

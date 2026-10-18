@@ -46,7 +46,8 @@ export default function Marks() {
   useEffect(() => {
     const clear = () => (setStep(null), setBoard(null));
     const offs = [
-      on("command_step", (c) => (setStep(c), c.marks.length && setBoard(c))),
+      // step 0 = a fresh board only (live.rs draw_board): the numbers on screen follow the screen
+      on("command_step", (c) => (c.step === 0 && c.marks.length ? setBoard(c) : (setStep(c), c.marks.length && setBoard(c)))),
       on("command_live", (l) => (setLive(l), !isLive(l) && clear())),
       on("session_state", (s) => s.phase === "idle" && clear()),
     ];
@@ -72,6 +73,9 @@ export default function Marks() {
   const target = step && step === b ? (marks.find((m) => m.id === step.target) ?? null) : null;
   const status = step?.status ?? "thinking";
   const picks = status === "pick" && step ? step.choices.map(([id]) => id) : [];
+  // "Clicks: I choose": the choices are numbered 1..5 by place, big, with their names
+  const choose = status === "pick" && !!step?.choose;
+  const pre = choose && !!step?.preselect;
   const done = status === "done";
   const focus = status === "pick" ? picks : target && status !== "marks" && (!done || lit) ? [target.id] : [];
   const key = keysOf(settings?.hotkeys.command ?? "F2");
@@ -86,10 +90,17 @@ export default function Marks() {
       {marks.map((m, i) => {
         const pick = picks.indexOf(m.id);
         // after an action the rest stay readable: the next order may name any of them
-        const cls = focus.length ? (focus.includes(m.id) ? (pick >= 0 ? " pick" : " chosen") : done ? "" : " faded") : "";
+        const cls = focus.length ? (focus.includes(m.id) ? (pick >= 0 ? (choose ? ` choice${pre && pick === 0 ? " pre" : ""}` : " pick") : " chosen") : done ? "" : " faded") : "";
         return (
           <div key={m.id} className={`mark${cls}`} style={{ ...place(m.rect, d), ["--i" as string]: Math.min(i, 100) }}>
-            <span className="badge">{m.id}</span>
+            {choose && pick >= 0 ? (
+              <>
+                <span className="choice-n">{pick + 1}</span>
+                <span className="choice-name">{m.name || "(no name)"}</span>
+              </>
+            ) : (
+              <span className="badge">{m.id}</span>
+            )}
           </div>
         );
       })}
@@ -168,7 +179,8 @@ function Stream({ live }: { live: LiveState }) {
 
 function Hud({ step, target, cmdKey, live }: { step: CommandStep; target: Mark | null; cmdKey: string[]; live: LiveState | null }) {
   const byId = new Map(step.marks.map((m) => [m.id, m]));
-  const verb = (live && LIVE_VERB[step.status]) || (step.status === "marks" ? "LOOKING" : step.status === "pick" ? "WHICH ONE?" : (VERB[opOf(step)] ?? "ACT"));
+  const choose = step.status === "pick" && step.choose;
+  const verb = choose ? "PICK ONE" : (live && LIVE_VERB[step.status]) || (step.status === "marks" ? "LOOKING" : step.status === "pick" ? "WHICH ONE?" : (VERB[opOf(step)] ?? "ACT"));
   const ask = step.status === "pick" || isPick(live?.pending ?? null);
   const confirm = !ask && (step.status === "confirm" || !!live?.pending);
   const what = target?.name ?? step.detail;
@@ -185,7 +197,36 @@ function Hud({ step, target, cmdKey, live }: { step: CommandStep; target: Mark |
         </span>
       </div>
       {live && <Stream live={live} />}
-      {ask && step.choices.length > 0 && (
+      {choose && step.choices.length > 0 && (
+        <>
+          <ol className="hud-choices">
+            {step.choices.map(([id], i) => {
+              const m = byId.get(id);
+              return (
+                <li key={id} className={step.preselect && i === 0 ? "pre" : undefined}>
+                  <span className="choice-n">{i + 1}</span>
+                  <span className="pick-name">{m?.name || "(no name)"}</span>
+                  <span className="pick-meta">
+                    {m?.role} · {m?.region}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+          <p className="hud-foot">
+            {step.preselect ? (
+              <>
+                Say “sí” for 1, or another number. Or click it. <kbd>esc</kbd> stops
+              </>
+            ) : (
+              <>
+                Say a number: “uno”, “the second”. Or click it. <kbd>esc</kbd> stops
+              </>
+            )}
+          </p>
+        </>
+      )}
+      {!choose && ask && step.choices.length > 0 && (
         <>
           <ol className="hud-picks">
             {step.choices.slice(0, 3).map(([id, p]) => {

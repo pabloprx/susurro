@@ -10,28 +10,29 @@ use std::time::{Duration, Instant};
 
 /// The bench v2 prompt with click_mark{mark} -> click{target}, plus rest / answer / hints (vc-feedback 10, 18).
 pub const PROMPT: &str = r#"You are the planner for susurro voice control on macOS. The user speaks orders; you turn them into UI actions.
-Input (JSON): utterance (live speech so far, may be cut mid-order), final (true = the user stopped talking), memory (what susurro itself did earlier: typed text, copies, pastes, clicks), app (frontmost app), focused (role, name and current value of the focused field, read just now), marks (actionable elements on screen now, "name (role, region)"), hints (shortcuts of the frontmost app), pending (a question susurro asked the user, or null).
+Input (JSON): utterance (live speech so far, may be cut mid-order), final (true = the user stopped talking), memory (what susurro itself did earlier: typed text, copies, pastes, clicks), app (frontmost app), focused (role, name and current value of the focused field, read just now), marks (actionable elements on screen now, "[N] name (role, region)"), hints (shortcuts of the frontmost app), pending (a question susurro asked the user, or null).
 Output: strict JSON {"complete": bool, "rest": string, "answer": string|null, "say": string|null, "actions": [...]}.
 - complete=false when the utterance ends in an unfinished order ("open", "type", "create a new tab and"); then actions holds only the finished leading orders and rest = the words of the unfinished order, verbatim. complete=true: rest="".
 - final=true: the user stopped; plan what you can, complete=true, rest="".
 - Ops (unused fields = null):
   open_app{app}: launch/focus app by its real name (fix STT spelling: "Ghosty" -> "Ghostty").
   key{keys}: one shortcut, lowercase, "+"-joined, modifiers cmd/opt/ctrl/shift: "cmd+t", "return", "cmd+a", "delete", "cmd+1", "opt+shift+left". Any combo is allowed.
-  type{text, target}: insert text. text = ONLY the content to write, never the target words ("type hello onto the search input" -> text "hello", target = the search field). target=null types into the focused field. In terminals and code, commands are lowercase ("type LS" -> "ls"). Drop the period STT adds at the end.
+  type{text, target}: insert text. text = ONLY the content to write, never the target words ("type hello onto the search input" -> text "hello", target = the search field). target=null types into the focused field. In terminals and code, commands are lowercase ("type LS" -> "ls"). Drop the period STT adds at the end. Drop fillers and cut-off words ("eh", "este,", "um", "you-"): "type eh, hel- hello world" -> text "hello world".
   click{target}: press or focus an element.
   select_typed{}: select the last text susurro typed (from memory).
   delete_typed{}: delete the last text susurro typed (from memory), in one go.
   copy{target}: copy a link or the value of a field (target = that element); target=null copies the current selection.
   paste{target}: paste the clipboard; target = the field to paste into first, or null for the focused field.
   scroll{dir, target}: dir up|down. wait_user{}: do nothing, wait for more speech.
-- target: copy the mark text exactly when the element is in marks ("Share (button, toolbar)"); else a few words naming it ("Public radio button"): it may appear only after an earlier action.
+- target: copy the mark text exactly when the element is in marks ("[12] Share (button, toolbar)"); else a few words naming it ("Public radio button"): it may appear only after an earlier action.
 - type never presses return. Add key return only when the user says "run", "execute", "enter" or "X command" ("type ls" -> type only; "run ls" -> type + return).
 - "delete all the writing" = key cmd+a then key delete. "remove what you typed" = one delete_typed, never several key delete.
 - memory is only what susurro did. The screen (focused value) is the truth: if memory says susurro typed something that is no longer in the focused value, do not delete; return actions=[] and say why.
-- "search X" in a browser = key cmd+l, type X, key return. Use the app hints.
-- pending: if the utterance answers it ("yes", "sí", "no", "the second one", "7"), set answer to "yes", "no" or the number and actions=[].
+- "search X" in a browser = key cmd+l, type X, key return. Outside a browser, "search X" uses the app's own search, unless X is a website ("YouTube", "Google", "Amazon"): then open_app a browser first. Use the app hints.
+- pending: if the utterance answers it ("yes", "sí", "no", "the second one", "7"), set answer to "yes", "no" or the number in digits ("the third one" -> "3") and actions=[].
 - risky=true when the action itself sends a message, posts, deletes data or spends money.
 - Noise or filler ("voila", "um", "thank you") = complete=true, actions=[].
+- Each mark starts with [N], the number drawn on screen next to it. A spoken number ("41", "the 7") names that mark: target = that mark's text.
 - Prefer the fewest actions. No prose outside JSON."#;
 
 /// next-queue 4. Appended only when the order sounds like a spelling fix: the extra op text moved 4 of 23 unrelated
@@ -64,6 +65,9 @@ pub struct Action {
     pub target: Option<String>,
     pub dir: Option<String>,
     pub risky: bool,
+    /// The words of the order this action came from (live.rs sets it; pick mode reads it). Not in the schema.
+    #[serde(skip)]
+    pub said: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -133,7 +137,7 @@ pub struct Input {
     pub app: String,
     pub focused: Field,
     pub memory: Vec<String>,
-    /// `ax::describe` of each mark, ids dropped.
+    /// "[N] " + `ax::describe` of each mark: N = the number drawn on screen.
     pub marks: Vec<String>,
     pub pending: Option<String>,
 }
@@ -174,10 +178,61 @@ pub fn parse(content: &str) -> anyhow::Result<Plan> {
     let (Some(a), Some(b)) = (a, b) else { anyhow::bail!("planner: no JSON in {content:?}") };
     let mut p: Plan = serde_json::from_str(&content[a..=b]).map_err(|e| anyhow::anyhow!("planner: bad JSON ({e}): {content:?}"))?;
     p.actions.retain(|a| OPS.contains(&a.op.as_str()) && a.op != "wait_user");
+    for a in p.actions.iter_mut().filter(|a| a.op == "type") {
+        a.text = a.text.as_deref().map(clean_spoken);
+    }
+    // a key with no keys or a type with nothing left to type is a no-op; run, it would fail and drop the rest of
+    // the order (replay 2026-10-18: Luna sent {"op":"key","keys":null} before cmd+l)
+    let blank = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
+    p.actions.retain(|a| !((a.op == "key" && blank(&a.keys)) || (a.op == "type" && blank(&a.text))));
     if p.complete {
         p.rest.clear();
     }
     Ok(p)
+}
+
+/// Spoken fillers that never belong in typed text.
+const FILLERS: [&str; 13] = ["eh", "ehm", "em", "emm", "um", "umm", "uh", "uhm", "uhh", "mm", "mmm", "hmm", "erm"];
+
+/// The text to type without fillers ("eh", "um", "este,") and cut-off words ("you-"): live log 2026-10-18,
+/// "search for you- YouTube" typed "you- YouTube". A word is cut off when it is letters + one trailing "-";
+/// "-la", "i--" and a lone "-" stay. "este" goes only as a punctuated filler ("este,"): it is also a real word.
+pub fn clean_spoken(text: &str) -> String {
+    let keep: Vec<&str> = text
+        .split(' ')
+        .filter(|tok| {
+            let core = tok.trim_end_matches([',', '.', ';', ':', '!', '?', '…']);
+            let cut = core.strip_suffix('-').is_some_and(|w| !w.is_empty() && w.chars().all(char::is_alphabetic));
+            let n = crate::text::norm(core);
+            let filler = FILLERS.contains(&n.as_str()) || (n == "este" && core.len() < tok.len());
+            !(cut || filler)
+        })
+        .collect();
+    keep.join(" ").trim().trim_start_matches([',', ';', ' ']).trim().to_string()
+}
+
+/// Verbs whose number is content, not a mark: "type 41", "search 41", "press 4".
+const NOT_A_MARK: [&str; 13] = ["type", "write", "escribe", "escribi", "tipea", "search", "busca", "buscar", "press", "presiona", "pulsa", "scroll", "set"];
+/// Words right before a number that make it a mark: "the 41", "la 41", "mark 41".
+const MARK_WORDS: [&str; 14] = ["mark", "marca", "the", "la", "el", "number", "numero", "número", "link", "button", "boton", "botón", "en", "on"];
+/// Click verbs: "click 41", "abre 41".
+const CLICK_VERBS: [&str; 12] = ["click", "clic", "clickea", "cliquea", "clica", "open", "abre", "abrir", "select", "selecciona", "tap", "toca"];
+
+/// A spoken mark number with nothing else to plan: "41", "la 41", "mark 41", "click the 41", "open the first link, 41"
+/// (live log 2026-10-18: the planner returned no actions). The number must be the last word and a mark on screen.
+/// ponytail: word lists; an order that ends in a number for another reason ("set the volume to 50") is excluded by verb.
+pub fn mark_ref(text: &str, ids: &[u32]) -> Option<u32> {
+    let raw = text.trim().trim_end_matches(['.', '!', '?', ',']).trim();
+    let n = crate::text::norm(raw);
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let (last, before) = words.split_last()?;
+    let k: u32 = last.parse().ok()?;
+    if !ids.contains(&k) || words.len() > 8 || words.first().is_some_and(|w| NOT_A_MARK.contains(w)) {
+        return None;
+    }
+    let comma = raw.strip_suffix(*last).is_some_and(|b| b.trim_end().ends_with(','));
+    let ok = before.is_empty() || comma || before.last().is_some_and(|w| MARK_WORDS.contains(w)) || words.first().is_some_and(|w| CLICK_VERBS.contains(w));
+    ok.then_some(k)
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -327,6 +382,133 @@ mod tests {
         assert_eq!(p.actions.len(), 1, "wait_user and unknown ops are dropped");
         assert!(parse("Sure! I will open the tab.").is_err());
         assert!(parse("{not json}").is_err());
+    }
+
+    #[test]
+    fn typed_text_drops_fillers_and_cut_off_words() {
+        // live log 2026-10-18: "search for you- YouTube" typed "you- YouTube"
+        let rows = [
+            ("you- YouTube", "YouTube"),
+            ("eh, hola", "hola"),
+            ("um hello there", "hello there"),
+            ("este, mañana a las 5", "mañana a las 5"),
+            ("este mensaje es para ti", "este mensaje es para ti"),
+            ("hel- hello world", "hello world"),
+            ("ls -la", "ls -la"),
+            ("git commit -m fix", "git commit -m fix"),
+            ("cd -", "cd -"),
+            ("i-- in a loop", "i-- in a loop"),
+            ("e-mail me", "e-mail me"),
+            ("Danny Rep videos", "Danny Rep videos"),
+            ("eh", ""),
+        ];
+        for (raw, want) in rows {
+            assert_eq!(clean_spoken(raw), want, "{raw:?}");
+        }
+        let p = parse(r#"{"complete":true,"rest":"","answer":null,"say":null,"actions":[{"op":"type","text":"you- YouTube","target":null},{"op":"click","target":"you- tube"}]}"#).unwrap();
+        assert_eq!(p.actions[0].text.as_deref(), Some("YouTube"));
+        assert_eq!(p.actions[1].target.as_deref(), Some("you- tube"), "only typed text is cleaned");
+        let p = parse(r#"{"complete":true,"rest":"","actions":[{"op":"key","keys":null},{"op":"key","keys":""},{"op":"type","text":"eh,"},{"op":"key","keys":"cmd+l"}]}"#).unwrap();
+        assert_eq!(p.actions.iter().map(label).collect::<Vec<_>>(), ["⌘L"], "blank keys and empty text are dropped");
+    }
+
+    #[test]
+    fn a_spoken_mark_number_is_a_click() {
+        let ids: Vec<u32> = (1..=75).collect();
+        let rows = [
+            ("41", Some(41)),
+            ("41.", Some(41)),
+            ("la 41", Some(41)),
+            ("the 41", Some(41)),
+            ("mark 41", Some(41)),
+            ("número 7", Some(7)),
+            ("click 12", Some(12)),
+            ("abre la 3", Some(3)),
+            ("Open the first link, 41.", Some(41)),
+            ("Open the first link 41", Some(41)),
+            ("send it to ana in 5", None),
+            ("type 41", None),
+            ("search for 41", None),
+            ("set the volume to 50", None),
+            ("press cmd 1", None),
+            ("la 99", None),
+            ("open slack", None),
+            ("", None),
+        ];
+        for (t, want) in rows {
+            assert_eq!(mark_ref(t, &ids), want, "{t:?}");
+        }
+        assert!(PROMPT.contains("Each mark starts with [N]"));
+    }
+
+    /// Real API: the orders of Pablo's live session (susurro.log 2026-10-18 00:28-00:30 UTC) through the production
+    /// planner call (prompt, "[N]" marks, extras, parse + clean) on DEFAULT_PLANNER, plus the mark-number pass live.rs
+    /// runs first. Screens from `.lo/planner-bench/planner_bench3.py`. 1 call per order, ~$0.001.
+    /// `OPENROUTER_API_KEY=... cargo test replay_the_live_log -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay_the_live_log_through_the_planner() {
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY");
+        let model = std::env::var("PLANNER").unwrap_or_else(|_| crate::contract::DEFAULT_PLANNER.into());
+        let numbered = |first: u32, m: &[&str]| m.iter().enumerate().map(|(i, x)| format!("[{}] {x}", first + i as u32)).collect::<Vec<_>>();
+        let claude = numbered(1, &["New chat (button, sidebar)", "Search (button, sidebar)", "Chats (button, sidebar)", "Projects (button, sidebar)", "Artifacts (button, sidebar)",
+            "susurro voice control (link, sidebar)", "Planner bench (link, sidebar)", "Write your prompt to Claude (text area, main)", "Add files (button, main)",
+            "Opus 5.5 (pop up button, main)", "Send message (button, main, disabled)", "Settings (button, sidebar)"]);
+        let edge_new = numbered(1, &["New Tab (tab, top)", "New Tab (button, top)", "Back (button, toolbar, disabled)", "Refresh (button, toolbar)", "Address and search bar (text field, toolbar)",
+            "Favorites (button, toolbar)", "Copilot (button, toolbar)", "Settings and more (button, toolbar)", "Search the web (search field, main)",
+            "Search with your voice (button, main)", "Outlook (link, main)", "YouTube (link, main)", "LinkedIn (link, main)", "Amazon (link, main)", "Weather (link, main)"]);
+        // mark 41 = "YouTube Music", the 2nd result: the number must win over "the first link"
+        let edge_res: Vec<String> = [34, 35, 36, 37, 38, 39, 40, 42, 41, 43, 44, 45, 46].iter().zip(["YouTube - Search (tab, top)", "Back (button, toolbar)", "Address and search bar (text field, toolbar)",
+            "Search the web (search field, top)", "All (link, top)", "Videos (link, top)", "Images (link, top)", "YouTube YouTube https://www.youtube.com (link, main)", "YouTube Music (link, main)",
+            "YouTube - Apps on Google Play (link, main)", "YouTube on the App Store (link, main)", "YouTube - Wikipedia (link, main)", "Next page (link, bottom)"]).map(|(i, m)| format!("[{i}] {m}")).collect();
+        let yt = numbered(1, &["YouTube (tab, top)", "Address and search bar (text field, toolbar)", "Guide (button, top)", "YouTube Home (link, top)", "Search (search field, top)",
+            "Search (button, top)", "Search with your voice (button, top)", "Sign in (link, top)", "Home (link, left)", "Shorts (link, left)", "Subscriptions (link, left)"]);
+        let web = Field { role: "AXWebArea".into(), ..Default::default() };
+        let chat = Field { role: "AXTextArea".into(), name: "Write your prompt to Claude".into(), ..Default::default() };
+        type Check = fn(&Plan) -> bool;
+        let cases: Vec<(&str, &str, Vec<String>, Field, Option<&str>, Check)> = vec![
+            ("search for you- YouTube.", "Microsoft Edge", edge_new.clone(), web.clone(), None, |p| {
+                p.actions.iter().any(|a| a.op == "type" && a.text.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("youtube")))
+                    && p.actions.last().is_some_and(|a| a.op == "key" && a.keys.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("return")))
+            }),
+            ("Open the first link, 41.", "Microsoft Edge", edge_res.clone(), web.clone(), None, |p| {
+                p.actions.len() == 1 && p.actions[0].op == "click" && p.actions[0].target.as_deref().is_some_and(|t| t.starts_with("[41]") || t.to_lowercase().contains("youtube music"))
+            }),
+            ("Open, Microsoft Edge.", "Claude", claude.clone(), chat.clone(), None, |p| {
+                p.actions.len() == 1 && p.actions[0].op == "open_app" && p.actions[0].app.as_deref().is_some_and(|a| a.to_lowercase().contains("edge"))
+            }),
+            ("There, search for Danny Rep videos.", "Microsoft Edge", yt.clone(), web.clone(), None, |p| {
+                p.actions.iter().any(|a| a.op == "type" && a.text.as_deref().is_some_and(|t| t.to_lowercase().trim_end_matches('.') == "danny rep videos"))
+            }),
+            ("Open it and search for YouTube.", "Claude", claude.clone(), chat.clone(), None, |p| {
+                !p.actions.iter().any(|a| a.op == "click" && a.target.as_deref().is_some_and(|t| t.contains("Search (button, sidebar)")))
+            }),
+            ("Yes.", "Microsoft Edge", yt.clone(), web.clone(), Some("Click “Send”? Say yes · F11 · Esc"), |p| p.answer.as_deref().is_some_and(|a| a.eq_ignore_ascii_case("yes")) && p.actions.is_empty()),
+            ("la dos", "Microsoft Edge", yt.clone(), web.clone(), Some("Which one? 12 Danny Rep - YouTube · 15 Danny Rep Shorts · 18 Danny Rep Live"), |p| {
+                matches!(p.answer.as_deref(), Some("2" | "15")) && p.actions.is_empty()
+            }),
+            ("Okay.", "Microsoft Edge", edge_res.clone(), web.clone(), None, |p| p.actions.is_empty()),
+        ];
+        let (mut ok, mut cost) = (0, 0.0);
+        for (utt, app, marks, focused, pending, check) in &cases {
+            // live.rs runs the mark-number pass before the planner
+            let ids: Vec<u32> = marks.iter().filter_map(|m| m.strip_prefix('[')?.split(']').next()?.parse().ok()).collect();
+            if pending.is_none() && let Some(n) = mark_ref(utt, &ids) {
+                let target = marks.iter().find(|m| m.starts_with(&format!("[{n}]"))).cloned();
+                let p = Plan { complete: true, actions: vec![Action { op: "click".into(), target, ..Default::default() }], ..Default::default() };
+                let hit = check(&p);
+                ok += hit as u32;
+                println!("{:5} {utt:40} mark pass -> {:?}", if hit { "OK" } else { "MISS" }, p.actions.iter().map(label).collect::<Vec<_>>());
+            }
+            let input = Input { utterance: utt.to_string(), app: app.to_string(), focused: focused.clone(), marks: marks.clone(), pending: pending.map(String::from), ..Default::default() };
+            let (p, m) = plan_openrouter(&key, &model, &input).unwrap_or_else(|e| panic!("{utt}: {e:#}"));
+            cost += m.cost;
+            let hit = check(&p);
+            ok += hit as u32;
+            println!("{:5} {utt:40} {model} {} ms -> {:?} answer={:?}", if hit { "OK" } else { "MISS" }, m.latency_ms, p.actions.iter().map(label).collect::<Vec<_>>(), p.answer);
+        }
+        println!("{ok}/{} right, ${cost:.5}", cases.len() + 1);
+        assert!(ok as usize >= cases.len(), "{ok}/{}", cases.len() + 1);
     }
 
     #[test]

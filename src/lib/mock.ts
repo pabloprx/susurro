@@ -54,7 +54,7 @@ let settings: C.Settings = {
   overlay: { show_idle: true },
   privacy: { store_history: true, store_audio: true, audio_retention_days: 14 },
   autostart: false,
-  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-oss-120b", stt: null },
+  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-6-luna", auto_click: false, stt: null },
 };
 
 let pillRect: C.PtRect | null = null;
@@ -785,6 +785,8 @@ const cmd = (status: C.CmdStatus, extra: Partial<C.CommandStep> = {}): C.Command
   marks: [],
   target: null,
   choices: [],
+  choose: false,
+  preselect: false,
   latency_ms: 0,
   cost_usd: 0,
   message: null,
@@ -797,6 +799,9 @@ export const CMD_STATES: Record<string, C.CommandStep> = {
   marks: cmd("marks", { instruction: "open my DM with Ana", marks: MARKS }),
   aim: cmd("aim", { instruction: "open my DM with Ana", marks: MARKS, action: "click", target: 27, latency_ms: 702, cost_usd: 0.000046 }),
   pick: cmd("pick", { instruction: "open the second channel", marks: MARKS, action: "click", target: 20, choices: [[20, 0.56], [19, 0.31], [18, 0.08]] }),
+  // "Clicks: I choose": the top 3-5 by place, big; choose-pre = Jev is sure of 1, "sí" takes it
+  choose: cmd("pick", { instruction: "click “the design channel”", marks: MARKS, action: "click", choose: true, choices: [[20, 0.56], [19, 0.31], [18, 0.08], [22, 0.05]], message: "Which one? 1 # design · 2 # engineering · 3 # general · 4 # random" }),
+  "choose-pre": cmd("pick", { instruction: "click “Ana Silva”", marks: MARKS, action: "click", choose: true, preselect: true, target: 27, choices: [[27, 0.98], [26, 0.01], [28, 0.01]], message: "Which one? 1 Ana Silva · 2 Tom Becker · 3 Maria Lopez" }),
   confirm: cmd("confirm", { instruction: "send the message", step: 2, marks: MARKS, action: "click", target: 41 }),
   done: cmd("done", { instruction: "open my DM with Ana", step: 2, action: "done" }),
   stopped: cmd("stopped", { step: 2 }),
@@ -880,6 +885,10 @@ const LIVE_STATES: Record<string, { live: Partial<C.LiveState>; step?: C.Command
   "live-pick": {
     live: { queue: ["click “second channel”"], pending: "Which one? 18, 19 or 20", last_said: "open the second channel" },
     step: cmd("pick", { instruction: "open the second channel", op: "click", action: "click", marks: MARKS, target: 20, choices: [[20, 0.56], [19, 0.31], [18, 0.08]], order: 1 }),
+  },
+  "live-choose": {
+    live: { queue: ["click “the design channel”"], pending: "Which one? 1 # design · 2 # engineering · 3 # general", last_said: "open the design channel" },
+    step: cmd("pick", { instruction: "click “the design channel”", op: "click", action: "click", marks: MARKS, choose: true, choices: [[20, 0.56], [19, 0.31], [18, 0.08]], order: 1 }),
   },
   "live-paused": {
     live: { queue: ["paste"], took_over: true, paused: true, last_said: "and paste it in the search box" },
@@ -1071,6 +1080,8 @@ if (inBrowser) Object.assign(window, {
     perms: (p: Partial<C.Permissions>) => void ((perms = { ...perms, ...p }), hotkeyStatus()),
     command,
     step: (k: string) => mockEmit("command_step", CMD_STATES[k]),
+    /** live.rs draw_board: a fresh read as the board only (step 0), the first `n` marks. */
+    board: (n: number) => mockEmit("command_step", cmd("marks", { step: 0, marks: MARKS.slice(0, n) })),
     /** Voice control v2: a scripted live session; live(patch) emits command_live; takeOver() = Pablo moved the mouse. */
     liveSession,
     live,

@@ -173,7 +173,7 @@ fn overlaps(a: PtRect, b: PtRect) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
 
-fn same_rect(a: PtRect, b: PtRect) -> bool {
+pub fn same_rect(a: PtRect, b: PtRect) -> bool {
     (a.x - b.x).abs() < 2.0 && (a.y - b.y).abs() < 2.0 && (a.w - b.w).abs() < 2.0 && (a.h - b.h).abs() < 2.0
 }
 

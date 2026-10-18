@@ -1609,6 +1609,44 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
     await expect(root(page).locator(".hud.ask .hud-foot")).toHaveText("Not sure enough to act. Say the number.");
     await shot(page, "marks-live-pick");
   });
+  test("pick mode: big numbers 1..n on the choices with names, the rest dimmed, say a number", async ({ page }) => {
+    await page.goto("/marks?state=choose");
+    const choices = root(page).locator(".mark.choice");
+    await expect(choices).toHaveCount(4);
+    await expect(choices.locator(".choice-n")).toHaveText(["3", "2", "1", "4"]); // DOM order = mark ids: general, engineering, design, random
+    await expect(root(page).locator(".mark.choice", { hasText: "# design" }).locator(".choice-n")).toHaveText("1");
+    await expect(root(page).locator(".mark.faded")).toHaveCount(39);
+    await expect(root(page).locator(".mark.faded .badge").first()).toBeVisible(); // other marks keep their ids for "41"
+    const hud = root(page).locator(".hud");
+    await expect(hud).toContainText("PICK ONE");
+    await expect(hud.locator(".hud-choices li")).toHaveCount(4);
+    await expect(hud.locator(".hud-choices li").first()).toContainText("1# designlink · sidebar");
+    await expect(hud.locator(".hud-foot")).toContainText("Say a number: “uno”, “the second”. Or click it.");
+    await expect(hud.locator(".hud-foot kbd")).toHaveText("esc");
+    const n = await choices.first().locator(".choice-n").evaluate((e) => parseFloat(getComputedStyle(e).fontSize));
+    expect(n).toBeGreaterThanOrEqual(20); // readable from a distance (badges are 10 px)
+    await shot(page, "marks-choose");
+    await page.goto("/marks?state=choose-pre");
+    await expect(root(page).locator(".mark.choice.pre")).toHaveCount(1);
+    await expect(root(page).locator(".mark.choice.pre .choice-name")).toHaveText("Ana Silva");
+    await expect(root(page).locator(".hud-choices li.pre")).toContainText("1Ana Silva");
+    await expect(root(page).locator(".hud-foot")).toContainText("Say “sí” for 1, or another number.");
+    await shot(page, "marks-choose-pre");
+    await page.goto("/marks?state=live-choose");
+    await expect(root(page).locator(".mark.choice")).toHaveCount(3);
+    await expect(root(page).locator(".hud")).toContainText("LIVE");
+    await expect(root(page).locator(".hud")).toContainText("PICK ONE");
+    await shot(page, "marks-live-choose");
+  });
+  test("a board refresh (step 0) redraws the numbers and keeps the HUD", async ({ page }) => {
+    await page.goto("/marks?state=live-acting");
+    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await expect(root(page).locator(".hud")).toContainText("LIVECLICKAna Silva");
+    await page.evaluate(() => window.mock.board(10));
+    await expect(root(page).locator(".mark")).toHaveCount(10);
+    await expect(root(page).locator(".hud")).toContainText("LIVECLICKopen my DM with Ana"); // same step, its target is off this board
+    await expect(root(page).locator(".brackets")).toHaveCount(0); // the old target is not on the new board
+  });
   test("Pablo's own mouse or keys hide the marks at once; the next order shows them again", async ({ page }) => {
     await page.goto("/marks?state=live-acting");
     await expect(root(page).locator(".mark")).toHaveCount(43);
@@ -1686,25 +1724,39 @@ test.describe("voice control", () => {
     const group = page.getByRole("radiogroup", { name: "Planner model" });
     const radios = group.getByRole("radio");
     await expect(radios).toHaveCount(5);
-    await expect(radios.first()).toHaveAccessibleName("gpt-oss-120b");
-    await expect(radios.first()).toHaveAttribute("aria-checked", "true"); // contract.rs DEFAULT_PLANNER
-    await expect(radios.first()).toContainText("FASTEST");
-    await expect(radios.first()).toContainText("60/60");
-    await expect(radios.first()).toContainText("0.78 s");
-    await expect(radios.first()).toContainText("$0.45");
-    await expect(group.getByRole("radio", { name: "Claude Haiku 5.5" })).toContainText("MOST EXACTAnthropic60/602.05 s");
-    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" }).locator(".vc-pl-score.miss")).toHaveText("53/60");
+    await expect(radios.first()).toHaveAccessibleName("GPT-6 Luna");
+    await expect(radios.first()).toHaveAttribute("aria-checked", "true"); // contract.rs DEFAULT_PLANNER (bench v3)
+    await expect(radios.first()).toContainText("DEFAULT");
+    await expect(radios.first()).toContainText("14/16 on your log");
+    await expect(radios.first()).toContainText("52/54");
+    await expect(radios.first()).toContainText("1.87 s");
+    await expect(radios.first()).toContainText("$0.06");
+    await expect(group.getByRole("radio", { name: "gpt-oss-120b" })).toContainText("FASTEST");
+    await expect(group.getByRole("radio", { name: "Gemini 3.8 Flash" })).toContainText("2 of 58 over 6 s");
     await group.scrollIntoViewIfNeeded();
     await shot(page, "voice-planner");
-    await group.getByRole("radio", { name: "Claude Haiku 5.5" }).click();
-    await expect(group.getByRole("radio", { name: "Claude Haiku 5.5" })).toHaveAttribute("aria-checked", "true");
+    await group.getByRole("radio", { name: "gpt-oss-120b" }).click();
+    await expect(group.getByRole("radio", { name: "gpt-oss-120b" })).toHaveAttribute("aria-checked", "true");
     // arrow keys move the pick
-    await group.getByRole("radio", { name: "Claude Haiku 5.5" }).press("ArrowDown");
-    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" })).toHaveAttribute("aria-checked", "true");
+    await group.getByRole("radio", { name: "gpt-oss-120b" }).press("ArrowDown");
+    await expect(group.getByRole("radio", { name: "Gemini 3.8 Flash" })).toHaveAttribute("aria-checked", "true");
     await nav(page, "Home");
     await nav(page, "Voice control");
-    await expect(group.getByRole("radio", { name: "Gemini 2.5 Flash Lite" })).toHaveAttribute("aria-checked", "true");
-    expect(await page.evaluate(() => window.mock && 1)).toBe(1);
+    await expect(group.getByRole("radio", { name: "Gemini 3.8 Flash" })).toHaveAttribute("aria-checked", "true");
+  });
+  test("clicks: I choose by default, Auto saves", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    const seg = page.getByRole("radiogroup", { name: "Clicks" });
+    await expect(seg.getByRole("radio", { name: "I choose" })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByText("Shows the 3-5 best matches, numbered. Say the number, or click it.")).toBeVisible();
+    await expect(page.locator(".vc-how")).toContainText("big numbers 1-5");
+    await seg.getByRole("radio", { name: "Auto" }).click();
+    await expect(page.getByText("Clicks what Jev picks. Asks only when it is not sure.")).toBeVisible();
+    await nav(page, "Home");
+    await nav(page, "Voice control");
+    await expect(seg.getByRole("radio", { name: "Auto" })).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(".vc-how")).toContainText("Under 80% sure");
   });
   test("memory: what susurro did, newest first; clear memory empties it", async ({ page }) => {
     await open(page);

@@ -73,6 +73,10 @@ fn migrate(mut s: Settings) -> Settings {
     if s.version < 6 {
         s.paste.press_enter_command = true;
     }
+    // v7: the planner is DEFAULT_PLANNER (gpt-oss-120b on Cerebras: Pablo picked speed, `.lo/planner-bench.md`).
+    if s.version < 7 {
+        s.command.planner_model = DEFAULT_PLANNER.into();
+    }
     s.version = SETTINGS_VERSION;
     s
 }
@@ -288,7 +292,7 @@ mod tests {
         let s = load(&p);
         assert_eq!(s.hotkeys.command, "F2");
         assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
-        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), stt: None }, "opt-in, also for migrated users");
+        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None }, "opt-in, also for migrated users");
         assert_eq!(s.version, SETTINGS_VERSION);
         // A picked model is kept; a v3 user may clear it on purpose.
         std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
@@ -327,6 +331,20 @@ mod tests {
         assert!(crate::hotkey::validate(&active_hotkeys(&s)).is_err());
         s.command.model = "typesafe/jev~latest".into();
         assert_eq!(merge(&Settings::default(), s).command.model, JEV_MODEL);
+    }
+
+    #[test]
+    fn v7_sets_the_default_planner_once_and_clicks_default_to_i_choose() {
+        let p = tmp_dir("v7mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":6,"command":{"enabled":true,"planner_model":"openai/gpt-6-luna"}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!(s.command.planner_model, "openai/gpt-oss-120b");
+        assert!(!s.command.auto_click, "I choose is the default");
+        // once: a later pick of another model stays
+        let mut s2 = s.clone();
+        s2.command.planner_model = "openai/gpt-6-luna".into();
+        save(&p, &s2).unwrap();
+        assert_eq!(load(&p).command.planner_model, "openai/gpt-6-luna");
     }
 
     #[test]
