@@ -36,6 +36,24 @@ pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PICK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Jev's image limit per side.
 pub const IMG_MAX: f64 = 1568.0;
+/// A drag moves at most this far between two events (points).
+pub const DRAG_STEP_PT: f64 = 8.0;
+/// Between two drag events (ms): ~120 events/s, slow enough for a canvas app to draw each.
+pub const DRAG_EVENT_MS: u64 = 8;
+/// The agent's screenshot JPEG quality (sips formatOptions, 0-100).
+pub const AGENT_JPEG_QUALITY: u32 = 60;
+
+/// A drag path with a point every DRAG_STEP_PT at most (the first point excluded: the press is there), so a canvas
+/// sees a line, not two dots.
+pub fn drag_points(path: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = vec![];
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let n = ((b.0 - a.0).hypot(b.1 - a.1) / DRAG_STEP_PT).ceil().max(1.0) as usize;
+        out.extend((1..=n).map(|i| (a.0 + (b.0 - a.0) * i as f64 / n as f64, a.1 + (b.1 - a.1) * i as f64 / n as f64)));
+    }
+    out
+}
 /// A box center this close to an AX element snaps to it.
 const SNAP_PT: f64 = 24.0;
 /// Between the focus and the paste of a type step.
@@ -81,6 +99,8 @@ pub fn command_log() -> Vec<CommandStep> {
 // ---------- abort / confirm / pick (session.rs and live.rs set these) ----------
 
 static ABORT: AtomicBool = AtomicBool::new(false);
+/// Debug test hook only (test_hooks POST /command): every confirm answers yes.
+pub static AUTO_CONFIRM: AtomicBool = AtomicBool::new(false);
 /// The live session number. A Real desk of an older session (Esc left its thread in a Jev call) is aborted for
 /// good once a new session starts, even though `reset` clears ABORT.
 static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -404,6 +424,13 @@ const CHAT_APPS: [&str; 18] = [
     "net.whatsapp.WhatsApp", "com.apple.MobileSMS", "com.apple.mail", "com.hnc.Discord", "com.microsoft.teams2", "com.microsoft.teams",
     "ru.keepcoder.Telegram", "com.anthropic.claudefordesktop",
 ];
+
+/// cmd+delete / cmd+forward delete outside a text field moves the selection to the Trash (Finder): risky
+/// (GUI round 2: the agent trashed a folder with no confirm). In a text field it only deletes text.
+pub fn trashes(code: u16, flags: u64, f: &Field) -> bool {
+    let text = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"].contains(&f.role.as_str());
+    (code == DELETE || code == 117) && flags & crate::paste::CMD != 0 && !text
+}
 
 pub fn return_asks(f: &Field) -> bool {
     let chat = CHAT_APPS.iter().any(|a| a.eq_ignore_ascii_case(&f.app) || a.eq_ignore_ascii_case(&f.bundle));
@@ -823,6 +850,22 @@ pub enum Act {
     OpenApp(String),
     /// A real CGEvent click at the target (hit-tested): the retry when a click changed nothing (vc-feedback 21).
     RealClick(Target),
+    /// Agent mouse control (global points): the left button down at the first point, dragged through every point, up
+    /// at the last; `flags` (CGEventFlags bits) held the whole way (shift = a straight line in paint apps).
+    Drag(Vec<(f64, f64)>, u64),
+    MouseMove(f64, f64),
+    /// A raw click at a point: the right button or not, 1-3 clicks (2 = double click), modifier flags.
+    ClickAt { at: (f64, f64), right: bool, count: u8, flags: u64 },
+    /// keycode + flags, held down this long (ms).
+    KeyHold(u16, u64, u64),
+}
+
+impl Act {
+    /// The test guard (SUSURRO_TEST_PASTE_TARGET) checks the front app before this act. Not before OpenApp: that one
+    /// brings the target to the front (GUI round 1: the guard blocked "abre Slack" from another app).
+    pub fn guarded(&self) -> bool {
+        !matches!(self, Act::OpenApp(_))
+    }
 }
 
 const DELETE: u16 = 51;
@@ -843,6 +886,8 @@ pub struct Screen {
     pub kind: Kind,
     /// The web page inside a browser window (ax::web_area): the case-23 page prior.
     pub page: Option<PtRect>,
+    /// The front window's title (the page title in a browser). Empty = unknown.
+    pub title: String,
 }
 
 /// The executor's side effects. Real: `mac::Real` (AX, CGEvent, screencapture). Tests: a fake desk.
@@ -862,6 +907,10 @@ pub trait Desk {
     fn screen_ok(&mut self) -> bool;
     /// JPEG of `r` (global points). `native` = full resolution (tiles), else at most 1568 px a side.
     fn capture(&mut self, r: PtRect, native: bool) -> anyhow::Result<Vec<u8>>;
+    /// The agent's screenshot: JPEG of `r`, the long side fitted to `max_px`. Default: `capture`.
+    fn snapshot(&mut self, r: PtRect, _max_px: f64) -> anyhow::Result<Vec<u8>> {
+        self.capture(r, false)
+    }
     fn act(&mut self, a: &Act) -> anyhow::Result<()>;
     /// macOS secure input is on (a password field has the focus somewhere): no keys, no typing.
     fn secure_input(&mut self) -> bool;
@@ -871,6 +920,10 @@ pub trait Desk {
     fn sleep(&mut self, ms: u64);
     fn wait(&mut self, w: Wait, timeout: Duration) -> Answer;
     fn aborted(&self) -> bool;
+    /// Pablo pressed a key or clicked by hand (live.rs input monitor): the agent stops, the queue waits.
+    fn paused(&self) -> bool {
+        false
+    }
     /// correct_word: add `heard` as a correction of the dictionary word `word`. Err = not saved (the reason).
     fn learn_word(&mut self, _word: &str, _heard: &str) -> Result<(), String> {
         Ok(())
@@ -895,7 +948,7 @@ pub trait Desk {
 }
 
 /// Spoken name -> app name.
-const APP_ALIASES: [(&str, &str); 9] = [
+pub const APP_ALIASES: [(&str, &str); 9] = [
     ("vs code", "Visual Studio Code"), ("vscode", "Visual Studio Code"), ("visual studio", "Visual Studio Code"), ("code", "Visual Studio Code"),
     ("edge", "Microsoft Edge"), ("chrome", "Google Chrome"), ("claude", "Claude"), ("ghosty", "Ghostty"), ("ghostie", "Ghostty"),
 ];
@@ -1452,7 +1505,7 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             // Return sends in chat and mail apps, whatever the planner says; elsewhere it runs at once.
             let f = desk.focused();
             let enter = (code == 36 || code == 76) && return_asks(&f) && !after_palette(mem, &f);
-            if enter || (a.risky && cfg.confirm_risky) {
+            if enter || ((a.risky || trashes(code, flags, &f)) && cfg.confirm_risky) {
                 let (q, what) = if enter { ("Press Return? Say yes · F11 · Esc", "Return not pressed") } else { ("Do it? Say yes · F11 · Esc", "not done") };
                 if let Err(end) = r.confirm(desk, q, what) {
                     return end;
@@ -1655,6 +1708,12 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             r.done(desk, format!("scrolled {}", if down { "down" } else { "up" }))
         }
         "correct_word" => correct_word(&mut r, target, &text, desk, mem),
+        // "copia lo último" (agent::local_intent): the last transcript on the clipboard, no keys
+        "set_clipboard" => {
+            r.st.action = Some("copy".into());
+            desk.set_clipboard(&text);
+            r.done(desk, format!("copied {}", quote(&text.chars().take(40).collect::<String>())))
+        }
         op => r.fail(desk, CmdStatus::Unsure, &format!("Unknown action {op}")),
     }
 }
@@ -1912,6 +1971,10 @@ fn copy(r: &mut Run, target: Option<&str>, ask: &mut Ask, desk: &mut dyn Desk, m
 
 /// Polls the flags (50 ms): the command key or a spoken yes / no (confirm), the spoken answer (pick), Esc, the timeout.
 pub fn wait_flags(w: Wait, timeout: Duration) -> Answer {
+    // the test hook (POST /command {"auto_confirm": true}): a confirm says yes at once
+    if w == Wait::Confirm && AUTO_CONFIRM.load(Ordering::SeqCst) {
+        return Answer::Yes;
+    }
     CONFIRMED.store(false, Ordering::SeqCst);
     DENIED.store(false, Ordering::SeqCst);
     *ANSWER.lock().unwrap() = None;
@@ -2047,6 +2110,17 @@ pub mod mac {
     /// A real click went out since the last `act` began (click_at sets it; web.rs's JS fallback clicks through it too).
     static REAL_CLICKED: AtomicBool = AtomicBool::new(false);
 
+    /// The .app bundles in the usual folders (one level deep, plus Utilities).
+    pub fn installed_apps() -> Vec<String> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dirs = ["/Applications".into(), "/Applications/Utilities".into(), "/System/Applications".into(), "/System/Applications/Utilities".into(), format!("{home}/Applications")];
+        dirs.iter()
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".app").map(String::from))
+            .collect()
+    }
+
     pub fn displays() -> Vec<(PtRect, f64)> {
         CGDisplay::active_displays()
             .unwrap_or_default()
@@ -2089,6 +2163,69 @@ pub mod mac {
         Ok(())
     }
 
+    fn event_source() -> anyhow::Result<CGEventSource> {
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| anyhow::anyhow!("no event source"))
+    }
+
+    /// One mouse event, tagged as susurro's own (live.rs input monitor).
+    fn mouse(ty: CGEventType, p: (f64, f64), button: CGMouseButton, clicks: i64, flags: u64) -> anyhow::Result<()> {
+        let e = CGEvent::new_mouse_event(event_source()?, ty, CGPoint::new(p.0, p.1), button).map_err(|_| anyhow::anyhow!("mouse event"))?;
+        if clicks > 0 {
+            e.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, clicks);
+        }
+        if flags != 0 {
+            e.set_flags(core_graphics::event::CGEventFlags::from_bits_truncate(flags));
+        }
+        e.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, crate::paste::SUSURRO_TAG);
+        e.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    fn drag(path: &[(f64, f64)], flags: u64) -> anyhow::Result<()> {
+        let (Some(&first), Some(&last)) = (path.first(), path.last()) else { anyhow::bail!("an empty drag") };
+        REAL_CLICKED.store(true, Ordering::SeqCst);
+        mouse(CGEventType::MouseMoved, first, CGMouseButton::Left, 0, flags)?;
+        std::thread::sleep(Duration::from_millis(30));
+        mouse(CGEventType::LeftMouseDown, first, CGMouseButton::Left, 1, flags)?;
+        std::thread::sleep(Duration::from_millis(30));
+        for p in drag_points(path) {
+            mouse(CGEventType::LeftMouseDragged, p, CGMouseButton::Left, 1, flags)?;
+            std::thread::sleep(Duration::from_millis(DRAG_EVENT_MS));
+        }
+        mouse(CGEventType::LeftMouseUp, last, CGMouseButton::Left, 1, flags)
+    }
+
+    fn click_n(at: (f64, f64), right: bool, count: u8, flags: u64) -> anyhow::Result<()> {
+        REAL_CLICKED.store(true, Ordering::SeqCst);
+        let (down, up, b) = if right {
+            (CGEventType::RightMouseDown, CGEventType::RightMouseUp, CGMouseButton::Right)
+        } else {
+            (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp, CGMouseButton::Left)
+        };
+        mouse(CGEventType::MouseMoved, at, b, 0, flags)?;
+        std::thread::sleep(Duration::from_millis(20));
+        for n in 1..=count.clamp(1, 3) as i64 {
+            mouse(down, at, b, n, flags)?;
+            mouse(up, at, b, n, flags)?;
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        Ok(())
+    }
+
+    fn key_hold(code: u16, flags: u64, ms: u64) -> anyhow::Result<()> {
+        let src = event_source()?;
+        for down in [true, false] {
+            let e = CGEvent::new_keyboard_event(src.clone(), code, down).map_err(|_| anyhow::anyhow!("key event"))?;
+            e.set_flags(core_graphics::event::CGEventFlags::from_bits_truncate(flags));
+            e.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, crate::paste::SUSURRO_TAG);
+            e.post(CGEventTapLocation::HID);
+            if down {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        Ok(())
+    }
+
     impl Real {
         /// A browser in front: the page's DOM marks through Apple Events JS. None = not a browser, the setting is
         /// off (the one-time guide shows), or the page has nothing to act on: the AX tree reads it instead.
@@ -2125,7 +2262,8 @@ pub mod mac {
             self.els = els.clone();
             self.web = Some(web::Page { kind, bundle, scan, viewport });
             (self.web_at, self.kind, self.pid) = (None, Kind::Browser, front.pid);
-            Some(Screen { app: name, display, scale, els, kind: Kind::Browser, ..Default::default() })
+            let title = self.web.as_ref().map(|p| p.scan.title.clone()).unwrap_or_default();
+            Some(Screen { app: name, display, scale, els, kind: Kind::Browser, title, ..Default::default() })
         }
 
         /// Click / focus a DOM mark through its JS. None = not a web mark (the AX path acts). The click verify is
@@ -2159,15 +2297,8 @@ pub mod mac {
             crate::learn::add_correction(&self.app, word, heard)
         }
 
-        /// The .app bundles in the usual folders (one level deep, plus Utilities).
         fn apps(&mut self) -> Vec<String> {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let dirs = ["/Applications".into(), "/Applications/Utilities".into(), "/System/Applications".into(), "/System/Applications/Utilities".into(), format!("{home}/Applications")];
-            dirs.iter()
-                .filter_map(|d| std::fs::read_dir(d).ok())
-                .flatten()
-                .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".app").map(String::from))
-                .collect()
+            installed_apps()
         }
 
         fn read(&mut self) -> Result<Screen, String> {
@@ -2185,7 +2316,7 @@ pub mod mac {
             let app = front.name.unwrap_or_default();
             let kind = app_kind(&app, front.bundle_id.as_deref().unwrap_or(""));
             (self.handles, self.els, self.kind, self.pid) = (tree.handles, els.clone(), kind, front.pid);
-            Ok(Screen { app, display, scale, els, window: tree.window, kind, page: ax::web_area(&tree.root) })
+            Ok(Screen { app, display, scale, els, window: tree.window, kind, page: ax::web_area(&tree.root), title: tree.root.title.clone() })
         }
 
         fn focused(&mut self) -> Field {
@@ -2225,6 +2356,19 @@ pub mod mac {
             objc2_core_graphics::CGPreflightScreenCaptureAccess()
         }
 
+        /// screencapture's JPEG, then sips: the long side to `max_px` at AGENT_JPEG_QUALITY.
+        fn snapshot(&mut self, r: PtRect, max_px: f64) -> anyhow::Result<Vec<u8>> {
+            let path = std::env::temp_dir().join(format!("susurro-agent-{}-{}.jpg", std::process::id(), crate::history::now_ms()));
+            let rect = format!("-R{},{},{},{}", r.x.round(), r.y.round(), r.w.round(), r.h.round());
+            let ok = std::process::Command::new("/usr/sbin/screencapture").args(["-x", "-t", "jpg", &rect]).arg(&path).status()?.success();
+            anyhow::ensure!(ok, "screencapture failed");
+            let (px, q) = (format!("{}", max_px.round()), AGENT_JPEG_QUALITY.to_string());
+            std::process::Command::new("/usr/bin/sips").args(["-Z", px.as_str(), "-s", "formatOptions", q.as_str()]).arg(&path).output()?;
+            let b = std::fs::read(&path);
+            let _ = std::fs::remove_file(&path);
+            Ok(b?)
+        }
+
         fn capture(&mut self, r: PtRect, native: bool) -> anyhow::Result<Vec<u8>> {
             let path = std::env::temp_dir().join(format!("susurro-cmd-{}-{}.jpg", std::process::id(), crate::history::now_ms()));
             let rect = format!("-R{},{},{},{}", r.x.round(), r.y.round(), r.w.round(), r.h.round());
@@ -2240,7 +2384,7 @@ pub mod mac {
 
         fn act(&mut self, a: &Act) -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
-            if let Some(why) = crate::test_hooks::paste_blocked() {
+            if a.guarded() && let Some(why) = crate::test_hooks::paste_blocked() {
                 anyhow::bail!("test guard: {why}");
             }
             crate::live::own_input();
@@ -2276,6 +2420,10 @@ pub mod mac {
                 Act::Combo(code, flags) => crate::paste::combo(*code, *flags),
                 Act::Burst(code, flags, n) => crate::paste::burst(*code, *flags, *n),
                 Act::Scroll { down, at } => scroll(*down, at.as_ref().and_then(|t| self.point(t)))?,
+                Act::Drag(path, flags) => drag(path, *flags)?,
+                Act::MouseMove(x, y) => mouse(CGEventType::MouseMoved, (*x, *y), CGMouseButton::Left, 0, 0)?,
+                Act::ClickAt { at, right, count, flags } => click_n(*at, *right, *count, *flags)?,
+                Act::KeyHold(code, flags, ms) => key_hold(*code, *flags, *ms)?,
                 Act::OpenApp(name) => {
                     let ok = std::process::Command::new("/usr/bin/open").args(["-a", name]).status()?.success();
                     anyhow::ensure!(ok, "could not open {name}");
@@ -2361,6 +2509,10 @@ pub mod mac {
 
         fn aborted(&self) -> bool {
             ABORT.load(Ordering::SeqCst) || GEN.load(Ordering::SeqCst) != self.generation
+        }
+
+        fn paused(&self) -> bool {
+            crate::live::paused()
         }
     }
 }
@@ -2825,6 +2977,12 @@ mod tests {
     }
 
     #[test]
+    fn the_test_guard_lets_open_app_bring_the_target_up() {
+        assert!(!Act::OpenApp("Slack".into()).guarded());
+        assert!(Act::Click(Target::Mark(1)).guarded() && Act::Combo(KEY_V, CMD).guarded());
+    }
+
+    #[test]
     fn open_app_opens_and_reports_the_matched_app() {
         let mut d = FakeDesk { installed: INSTALLED.iter().map(|s| s.to_string()).collect(), ..Default::default() };
         let (mut ask, _) = script(vec![]);
@@ -2876,6 +3034,20 @@ mod tests {
 
     fn slack() -> FakeDesk {
         FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message #general", "", None)], ..Default::default() }
+    }
+
+    #[test]
+    fn cmd_delete_outside_a_text_field_asks_first() {
+        // GUI round 2: cmd+backspace in Finder moved a folder to the Trash with no confirm
+        let (mut d, mut mem) = (FakeDesk { app: "Finder".into(), fields: vec![FField::new("AXOutline", "list view", "", None)], ..Default::default() }, Memory::new());
+        d.answers = vec![Answer::No];
+        run_all(&[key("cmd+backspace")], &mut d, &mut mem);
+        assert_eq!((d.waits.as_slice(), d.acts.as_slice()), (&[Wait::Confirm][..], &[][..]), "asked, nothing trashed");
+        // in a text field it only deletes text: no confirm
+        let (mut d, mut mem) = (slack(), Memory::new());
+        run_all(&[key("cmd+backspace")], &mut d, &mut mem);
+        assert!(d.waits.is_empty());
+        assert_eq!(d.acts, [Act::Combo(DELETE, crate::paste::CMD)]);
     }
 
     #[test]

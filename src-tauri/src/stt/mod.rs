@@ -106,14 +106,22 @@ pub fn batch_for_realtime(openrouter: bool) -> SttProvider {
     if openrouter { SttProvider::OpenRouter } else { SttProvider::ElevenLabs }
 }
 
-/// The STT of voice-control commands: the explicit choice, else (auto) Scribe Realtime when the ElevenLabs key is
-/// saved, else the dictation provider.
-pub fn command_provider(s: &Settings, elevenlabs_key: bool) -> SttProvider {
+/// The STT of voice-control commands: the explicit choice, else (auto) local Whisper when its model is downloaded
+/// (Pablo 2026-10-18: "use local Whisper for the commands, it is faster"; the dictation's one instance), else Scribe
+/// Realtime when the ElevenLabs key is saved, else the dictation provider.
+pub fn command_provider(s: &Settings, elevenlabs_key: bool, whisper_ready: bool) -> SttProvider {
     match &s.command.stt {
         Some(p) => p.clone(),
+        None if whisper_ready => SttProvider::WhisperLocal,
         None if elevenlabs_key => SttProvider::ElevenLabsRealtime,
         None => s.stt.provider.clone(),
     }
+}
+
+/// `command_provider` with the real key and model checks.
+pub fn command_stt(s: &Settings, data_dir: &std::path::Path) -> SttProvider {
+    let (file, _) = whisper_local::usable(data_dir, &s.stt.whisper_model);
+    command_provider(s, secrets::get(KeyName::Elevenlabs).is_some(), whisper_local::model_path(data_dir, &file).exists())
 }
 
 /// The realtime session options of provider `p`, or None when `p` is not a realtime provider or its key is
@@ -541,5 +549,16 @@ mod ranking_tests {
         assert_eq!(ph(4), Some(0.3));
         assert!(m[0].recommended && !m[1].recommended);
         assert_eq!(m.iter().map(|m| m.keywords).collect::<Vec<_>>(), [true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn command_stt_auto_prefers_local_whisper() {
+        let mut s = Settings::default();
+        s.stt.provider = SttProvider::OpenRouter;
+        assert_eq!(command_provider(&s, true, true), SttProvider::WhisperLocal);
+        assert_eq!(command_provider(&s, true, false), SttProvider::ElevenLabsRealtime);
+        assert_eq!(command_provider(&s, false, false), SttProvider::OpenRouter);
+        s.command.stt = Some(SttProvider::ElevenLabs);
+        assert_eq!(command_provider(&s, true, true), SttProvider::ElevenLabs, "an explicit choice wins");
     }
 }

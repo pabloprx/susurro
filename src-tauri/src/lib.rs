@@ -191,6 +191,10 @@ pub fn run() {
         if let tauri::RunEvent::Reopen { .. } = event {
             show_main(app);
         }
+        // the agent's warm claude process never outlives the app
+        if let tauri::RunEvent::Exit = event {
+            agent::kill();
+        }
         let _ = (app, event);
     });
 }

@@ -1693,6 +1693,18 @@ test.describe("voice control", () => {
     await page.keyboard.press("Meta+8");
     await expect(h1(page)).toHaveText("Your screen, by voice.");
   });
+  test("agent v2: agent mode on by default, the planner only as Fast mode (beta)", async ({ page }) => {
+    await open(page);
+    await nav(page, "Voice control");
+    await expect(sw(page, "Agent mode")).toHaveAttribute("aria-checked", "true");
+    await expect(sw(page, "Fast mode (beta)")).toHaveAttribute("aria-checked", "false");
+    await expect(page.locator(".sc-row", { hasText: "Agent mode" }).first()).toContainText("Every order, except open app, new tab, scroll");
+    await expect(page.getByRole("combobox", { name: "Speech to text for commands" }).locator('option[value="auto"]')).toContainText("Local Whisper");
+    await sw(page, "Fast mode (beta)").click();
+    await expect(sw(page, "Fast mode (beta)")).toHaveAttribute("aria-checked", "true");
+    await expect(page.locator(".sc-row", { hasText: "Fast mode (beta)" })).toContainText("gets more orders wrong");
+    await expect(page.locator(".sc-row", { hasText: "Agent mode" }).first()).toContainText("“Modo agente: …”, or an order that failed twice");
+  });
   test("screen: ready rows, key, risky toggle, pinned model, last run", async ({ page }) => {
     await open(page);
     await nav(page, "Voice control");

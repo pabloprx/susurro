@@ -68,8 +68,11 @@ pub fn usable(data_dir: &Path, file: &str) -> (String, Option<String>) {
 pub fn load_in_background(app: AppHandle) {
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        let s = state.settings.read().unwrap().stt.clone();
-        if s.provider != SttProvider::WhisperLocal && !s.local_fallback {
+        let all = state.settings.read().unwrap().clone();
+        let s = all.stt.clone();
+        // the command STT uses the same instance (auto = local Whisper)
+        let commands = all.command.enabled && super::command_stt(&all, &state.data_dir) == SttProvider::WhisperLocal;
+        if s.provider != SttProvider::WhisperLocal && !s.local_fallback && !commands {
             return;
         }
         let (file, _) = usable(&state.data_dir, &s.whisper_model);

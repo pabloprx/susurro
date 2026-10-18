@@ -223,14 +223,24 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         <div className="sc-row">
           <div>
             <div className="label">Agent mode</div>
-            <div className="sub">“Modo agente: …”, or an order that failed twice</div>
+            <div className="sub">{s.command.fast_mode ? "“Modo agente: …”, or an order that failed twice" : "Every order, except open app, new tab, scroll, a key, paste last, stop"}</div>
           </div>
           <span className="small">
             {s.command.agent
-              ? `Claude Code (${s.command.agent_model || "default"}) drives the Mac with susurro's own tools. No CLI or no login: ${s.command.agent_fallback}.`
+              ? `Claude Code (${s.command.agent_model || "default"}) drives the Mac and the mouse with susurro's own tools, and remembers what it did. No CLI or no login: ${s.command.agent_fallback}.`
               : "Off. Orders go through the planner only."}
           </span>
           <Toggle label="Agent mode" on={s.command.agent} onChange={(v) => save((x) => void (x.command.agent = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Fast mode (beta)</div>
+            <div className="sub">The planner plans each order, Jev picks the targets</div>
+          </div>
+          <span className="small">
+            {s.command.fast_mode ? "On. Faster, but it gets more orders wrong." : "Off. Orders go to the agent."}
+          </span>
+          <Toggle label="Fast mode (beta)" on={s.command.fast_mode} onChange={(v) => save((x) => void (x.command.fast_mode = v))} />
         </div>
         <div className="sc-row">
           <div>
@@ -246,7 +256,7 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         <div className="sc-row">
           <div>
             <div className="label">Speech to text</div>
-            <div className="sub">Hears your commands. Scribe Realtime answers in ~0.2 s, MAI in ~0.7 s</div>
+            <div className="sub">Hears your commands. Local Whisper ~0.33 s a phrase, Scribe Realtime ~0.2 s, MAI ~0.7 s</div>
           </div>
           <select
             className="input"
@@ -254,7 +264,7 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
             value={s.command.stt ?? "auto"}
             onChange={(e) => save((x) => void (x.command.stt = e.target.value === "auto" ? null : (e.target.value as SttProvider)))}
           >
-            <option value="auto">Auto · {keys?.elevenlabs ? "Scribe Realtime" : "same as dictation"}</option>
+            <option value="auto">Auto · Local Whisper (if downloaded, else {keys?.elevenlabs ? "Scribe Realtime" : "same as dictation"})</option>
             <option value="elevenlabs_realtime">Scribe Realtime (live)</option>
             <option value="openai_realtime" disabled={!keys?.openai}>
               OpenAI Realtime (live){keys?.openai ? "" : " · add an OpenAI key in Providers"}

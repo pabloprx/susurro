@@ -178,6 +178,11 @@ fn update(app: &AppHandle, f: impl FnOnce(&mut LiveState)) {
 }
 
 /// command.rs `Real::emit`: a confirm or pick question goes to the pill; any other status clears it.
+/// The live session's pill state (GET /state).
+pub fn live_state() -> LiveState {
+    LIVE.lock().unwrap().clone()
+}
+
 pub fn step_seen(app: &AppHandle, s: &CommandStep) {
     let q = matches!(s.status, CmdStatus::Confirm | CmdStatus::Pick).then(|| s.message.clone()).flatten();
     if LIVE.lock().unwrap().pending != q {
@@ -545,6 +550,8 @@ enum Msg {
     Audio(Vec<f32>, bool),
     Rt(scribe_rt::Ev),
     Text(u32, anyhow::Result<Option<String>>),
+    /// An order as text, no STT (the test hook POST /command).
+    Heard(String),
     End(Option<Vec<f32>>),
     Abort,
     /// No message for 100 ms (the timers run).
@@ -592,6 +599,11 @@ impl Handle {
         self.ctl.speaking.store(on, Ordering::SeqCst);
     }
 
+    /// An order as if heard (no STT): the test hook.
+    pub fn heard(&self, text: String) {
+        let _ = self.tx.send(Msg::Heard(text));
+    }
+
     /// The recording stopped: the tail after the last cut, then drain the queue and end.
     pub fn end(&self, tail: Option<Vec<f32>>) {
         let _ = self.tx.send(Msg::End(tail));
@@ -600,6 +612,7 @@ impl Handle {
     /// Esc: drop the queue and end now. No wait for the requests in flight.
     pub fn abort(&self) {
         command::abort();
+        crate::agent::kill();
         self.ctl.stopped.store(true, Ordering::SeqCst);
         self.queue.clear();
         let _ = self.tx.send(Msg::Abort);
@@ -635,13 +648,16 @@ pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Ha
     let (provider, rt_opts) = {
         let st = app.state::<AppState>();
         let s = st.settings.read().unwrap().clone();
-        let el = crate::secrets::get(crate::contract::KeyName::Elevenlabs).is_some();
-        let p = crate::stt::command_provider(&s, el);
+        let p = crate::stt::command_stt(&s, &st.data_dir);
         let hints = crate::dictionary::Dictionary::new(crate::dictionary::load(&st.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
         let o = crate::stt::realtime_opts(&p, &s, rate, &with_brands(&hints), true);
         (p, o)
     };
     log::info!("live: command STT {provider:?}{}", if rt_opts.is_some() { " (streaming)" } else { "" });
+    // F11 down: the agent's claude starts now, while Pablo talks
+    if cfg.agent && !cfg.fast_mode {
+        crate::agent::prewarm(crate::agent::Opts::from(&cfg, &key, &app.state::<AppState>().data_dir));
+    }
     update(&app, |l| *l = LiveState { on: true, ..Default::default() });
     #[cfg(target_os = "macos")]
     crate::platform::macos::watch_user_input(&app, true);
@@ -688,11 +704,22 @@ fn live_loop(
     let mut rta = RtAudio { rate, ..Default::default() };
     // The release (Scribe gets RT_FINISH_MS from here) and the last new words (a held order runs HOLD_MS after).
     let (mut released, mut words_at): (Option<Instant>, Instant) = (None, Instant::now());
+    // Agent v2 (default): every order goes to the agent except the trivial ones; Fast mode (beta) = the planner.
+    let agent_first = cfg.agent && !cfg.fast_mode;
+    #[cfg(target_os = "macos")]
+    let apps = if agent_first { command::mac::installed_apps() } else { vec![] };
+    #[cfg(not(target_os = "macos"))]
+    let apps: Vec<String> = vec![];
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
         // "modo agente: <task>": the whole task goes to agent mode, no planner. Held for the next words until a pause.
         if let Some(p) = crate::agent::plan(text, last).filter(|_| cfg.agent && pending.is_none()) {
             log::info!("live: agent mode {:?}", p.actions.first().and_then(|a| a.text.as_deref()));
             return Ok(p);
+        }
+        // trivial orders run at once, no LLM ("abre Slack", "nueva pestaña", "baja", "presiona enter")
+        if let Some(a) = crate::agent::local_intent(text, &apps).filter(|_| agent_first && pending.is_none()) {
+            log::info!("live: local {text:?} -> {}", planner::label(&a));
+            return Ok(Plan { complete: true, actions: vec![a], ..Default::default() });
         }
         // "41", "la 41", "open the first link, 41": the mark Pablo reads on screen, no LLM.
         if pending.is_none() {
@@ -703,6 +730,10 @@ fn live_loop(
                 log::info!("live: mark number {text:?} -> click {target:?}");
                 return Ok(Plan { complete: true, actions: vec![Action { op: "click".into(), target: Some(target), ..Default::default() }], ..Default::default() });
             }
+        }
+        // everything else: the agent, held until a pause so the whole order is one task
+        if agent_first && pending.is_none() {
+            return Ok(crate::agent::hold_plan(text, text, last));
         }
         let (mut input, here) = context(&app);
         (input.utterance, input.last) = (text.to_string(), last);
@@ -735,6 +766,11 @@ fn live_loop(
             Msg::Tick => {}
             Msg::Chunk(a) => {
                 waiting.push_back((seq, a));
+                seq += 1;
+            }
+            Msg::Heard(t) => {
+                in_flight += 1;
+                let _ = tx.send(Msg::Text(seq, Ok(Some(t))));
                 seq += 1;
             }
             Msg::Audio(a, cut) => match &rt {
@@ -832,6 +868,12 @@ fn live_loop(
                     }
                     if paused() && resume_word(&t) {
                         resume(&app);
+                        continue;
+                    }
+                    // "stop" / "para" alone: like Esc (the agent's process dies too)
+                    if crate::agent::is_stop(&t) {
+                        log::info!("live: {t:?}: stop");
+                        let _ = app.state::<AppState>().session_tx.send(crate::session::SessionCmd::Cancel);
                         continue;
                     }
                     let question = LIVE.lock().unwrap().pending.clone().unwrap_or_default();
@@ -1019,6 +1061,7 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                     let f = crate::ax::Field { app: crate::paste::target_app().and_then(|a| a.name).unwrap_or_default(), ..Default::default() };
                     command::remember(&mut mem, MemKind::Said, &said, &f, None);
                 }
+                let action = last_transcript(&app, action);
                 let labels = queue.labels();
                 update(&app, |l| l.queue = labels);
                 BUSY.store(true, Ordering::SeqCst);
@@ -1026,8 +1069,9 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 *RUNNING.lock().unwrap() = Some(action.clone());
                 #[cfg(target_os = "macos")]
                 let end = {
+                    let data_dir = app.state::<AppState>().data_dir.clone();
                     let agent = |task: &str, desk: &mut command::mac::Real, mem: &mut Memory, ask: &mut command::Ask| {
-                        crate::agent::run(task, &crate::agent::Opts::from(&settings, &key), settings.confirm_risky, ask, desk, mem)
+                        crate::agent::run(task, &crate::agent::Opts::from(&settings, &key, &data_dir), settings.confirm_risky, ask, desk, mem)
                     };
                     let mut end = match (action.op.as_str(), action.text.as_deref()) {
                         ("agent", Some(task)) => agent(task, &mut desk, &mut mem, &mut ask),
@@ -1107,6 +1151,17 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
     finish(&app, &ctl, Ended { instruction, end, latency_ms: t0.elapsed().as_millis() as u32 });
 }
 
+/// "pega / copia lo último" (agent::local_intent): the newest dictation typed in, or left on the clipboard.
+fn last_transcript(app: &AppHandle, a: Action) -> Action {
+    let op = match a.op.as_str() {
+        "paste_last" => "type",
+        "copy_last" => "set_clipboard",
+        _ => return a,
+    };
+    let last = crate::history::latest(&app.state::<AppState>().db.lock().unwrap()).ok().flatten().map(|h| h.final_text).unwrap_or_default();
+    Action { op: op.into(), text: Some(last), ..a }
+}
+
 /// A page load after a click: the board is read again this long after the step. ponytail: a guess, not measured.
 const BOARD_AGAIN_MS: u64 = 1200;
 
@@ -1175,7 +1230,7 @@ fn chunk_text(app: &AppHandle, audio: Vec<f32>) -> anyhow::Result<Option<String>
     let state = app.state::<AppState>();
     let mut s = state.settings.read().unwrap().clone();
     // the command STT; Scribe Realtime here = its batch fallback (stt::build maps it to MAI or Scribe batch)
-    s.stt.provider = crate::stt::command_provider(&s, crate::secrets::get(crate::contract::KeyName::Elevenlabs).is_some());
+    s.stt.provider = crate::stt::command_stt(&s, &state.data_dir);
     let peak = audio.iter().fold(0f32, |m, x| m.max(x.abs()));
     let clip = crate::audio::Clip { duration_ms: (audio.len() / 16) as u32, peak_db: crate::audio::db(peak), samples: audio, device_names: vec![] };
     let stt = crate::stt::build(&s, &state)?;

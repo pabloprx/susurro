@@ -37,6 +37,8 @@ pub enum SessionCmd {
     CmdUp,
     /// The live session finished its queue (live.rs).
     CommandEnded(Box<crate::command::Ended>),
+    /// A voice-control order as if heard, no mic and no STT (debug test hook POST /command).
+    Inject(String),
     /// hotkeys.recents: open (or close) the recents list.
     Recents,
     /// 1-9 (paste) or Cmd+1-9 (copy) while the recents list is open.
@@ -374,7 +376,7 @@ fn run_pipeline_with(state: &AppState, clip: &Clip, bundle: Option<&str>, stream
 /// A voice command's text: the pipeline STT + dictionary corrections, no cleanup LLM, no spoken punctuation.
 fn command_text(state: &AppState, clip: &Clip) -> Outcome {
     let mut s = state.settings.read().unwrap().clone();
-    s.stt.provider = stt::command_provider(&s, secrets::get(KeyName::Elevenlabs).is_some());
+    s.stt.provider = stt::command_stt(&s, &state.data_dir);
     let entries = dictionary::load(&state.db.lock().unwrap()).unwrap_or_default();
     let d = Dictionary::new(entries, s.dictionary.clone());
     let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);
@@ -646,6 +648,10 @@ impl Actor {
                 self.command_ended(*e);
                 return false;
             }
+            SessionCmd::Inject(text) => {
+                self.inject(text);
+                return false;
+            }
             SessionCmd::Recents => {
                 self.toggle_recents();
                 return false;
@@ -871,7 +877,10 @@ impl Actor {
                 let st = CommandStep { instruction: instr.clone(), step: 1, status: CmdStatus::Setup, message: Some(what.into()), ..Default::default() };
                 command::publish(a, st);
             };
-            if secrets::get(KeyName::Openrouter).is_none() {
+            // the agent needs no OpenRouter key (his claude login); the planner (Fast mode) and the fallback do
+            let c = self.state().settings.read().unwrap().command.clone();
+            let agent_only = c.agent && !c.fast_mode && crate::agent::find_claude().is_some();
+            if secrets::get(KeyName::Openrouter).is_none() && !agent_only {
                 setup(&self.app, "key");
                 self.m.idle();
                 self.command = false;
@@ -1093,6 +1102,30 @@ impl Actor {
         self.set(if self.live.is_some() { Phase::Acting } else { Phase::Idle }, None);
     }
 
+    /// The test hook's order: into the running live session, else a new one with no mic that ends after it.
+    fn inject(&mut self, text: String) {
+        if let Some(l) = &self.live {
+            return l.heard(text);
+        }
+        if self.m.phase() != Phase::Idle || self.recents.is_some() {
+            return log::warn!("inject: a dictation runs, {text:?} dropped");
+        }
+        if !crate::permissions::accessibility_trusted() {
+            let st = CommandStep { instruction: text, step: 1, status: CmdStatus::Setup, message: Some("accessibility".into()), ..Default::default() };
+            return command::publish(&self.app, st);
+        }
+        let cfg = self.state().settings.read().unwrap().command.clone();
+        let key = secrets::get(KeyName::Openrouter).unwrap_or_default();
+        self.command = true;
+        self.cmd_ctx = Some(Ctx { app: paste::target_app(), started_at: history::now_ms(), device: None });
+        let l = crate::live::start(self.app.clone(), key, cfg, audio::RATE);
+        l.heard(text);
+        l.end(None);
+        self.live = Some(l);
+        log::info!("inject: command session started");
+        self.set(Phase::Acting, None);
+    }
+
     /// The live session ended: back to Idle, and a History row (kind command) when history is on and words were heard.
     fn command_ended(&mut self, e: command::Ended) {
         (self.answering, self.command) = (false, false);
@@ -1115,7 +1148,7 @@ impl Actor {
                 words: history::words(&e.instruction),
                 raw: e.instruction,
                 final_text: e.end.summary,
-                provider: format!("planner:{}", s.command.planner_model),
+                provider: if s.command.agent && !s.command.fast_mode { format!("agent:{}", s.command.agent_model) } else { format!("planner:{}", s.command.planner_model) },
                 cleanup: None,
                 duration_ms: 0,
                 latency_ms: e.latency_ms,

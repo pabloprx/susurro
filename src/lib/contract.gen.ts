@@ -45,15 +45,20 @@ planner_model: string,
  */
 auto_click: boolean, 
 /**
- * The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
- * "Latency"), else the dictation provider.
+ * The STT for commands. None = auto: local Whisper when its model is downloaded (the dictation's instance,
+ * Pablo's ask), else Scribe Realtime when an ElevenLabs key is saved, else the dictation provider.
  */
 stt: SttProvider | null, 
 /**
- * Agent mode: "modo agente: <task>", or an order that failed twice in a row, goes to the local Claude Code CLI
- * (`claude -p`, the subscription login) driving the Mac through susurro's own tools (agent.rs).
+ * Agent mode (on by default): every order goes to the local Claude Code CLI (`claude -p`, the subscription
+ * login) driving the Mac through susurro's own tools (agent.rs), except the trivial ones (agent::local_intent).
  */
 agent: boolean, 
+/**
+ * "Fast mode (beta)": the old planner path (orders go through the planner; agent mode only on "modo agente: ..."
+ * or an order that failed twice).
+ */
+fast_mode: boolean, 
 /**
  * The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
  */

@@ -113,3 +113,32 @@ Defaults from these numbers (Pablo's explicit choices stay as they are):
 - large-v3-turbo writes "en su pavase" for "en Supabase" in Spanish. The dictionary does not glue a common word ("su") to a split word, on purpose.
 - Posted hotkey chords work only on F20 on this Mac (not F13-F19).
 - If `tauri build` fails in whisper-rs-sys with "'path' is unavailable: introduced in macOS 10.15", the CMake cache is from the old deployment target. Run `cargo clean --manifest-path src-tauri/Cargo.toml -p whisper-rs-sys` once (add `--target-dir` for the e2e target dirs).
+
+## Agent v2 (voice control)
+
+Every F11 order goes to the agent (`agent.rs`): Pablo's `claude -p`, one warm stream-json process, susurro's MCP tools. Trivial orders run with no LLM (`agent::local_intent`). The planner path is the setting "Fast mode (beta)".
+
+Unit tests (in `bun run check`): a fake desk and a fake `claude` script (Python). They cover the warm process across orders, the rolling memory in a new process, the mouse tools (a JS Paint line is a drag), the take-over stop, the local intents and the v8 settings migration.
+
+Real CLI, fake desk (no clicks): `SMOKE_MODEL=sonnet cargo test --manifest-path src-tauri/Cargo.toml --lib agent::tests::smoke_real_claude -- --ignored --nocapture`.
+
+The test hook for GUI tests (debug builds, `SUSURRO_TEST_CONTROL`):
+- `POST /command {"text": "...", "auto_confirm": true}` runs an order as if heard after F11 (no mic, no STT). `auto_confirm` answers every confirm with yes.
+- `GET /state` has `command_log` (the steps), `live`, `agent` (the warm process) and `agent_memory`.
+- `SUSURRO_TEST_PASTE_TARGET` takes a list: `com.docker.docker,com.electron.dockerdesktop`.
+
+Real GUI runs, 2026-10-18, one run each (not a median), from POST /command to the session end, Spanish orders. Every run passed.
+
+| Task | sonnet | haiku |
+|------|--------|-------|
+| JS Paint: draw a line (new process) | 3.29 s | 5.55 s |
+| JS Paint: "draw the same again, moved" (same process: it remembered the first line) | 2.88 s | 5.14 s |
+| Finder: new folder in ~/susurro-tests | 4.93 s | 5.13 s |
+| Slack Automatization: type and send | 3.28 s | 3.91 s |
+| Docker Desktop: create a volume | 7.04 s | 5.59 s |
+| Total | 21.42 s | 25.32 s |
+
+The default model stays sonnet. The fake-desk smoke gave the same order: sonnet 1.8 s and 1.0 s per order, haiku 2.3 s and 7.4 s.
+An action can end the order (`done` on the action): this saved one model round trip, about 1.5 s per order (smoke: 3.2 s -> 1.8 s).
+
+Command STT: local Whisper large-v3-turbo q5_0, 6 threads, `whisper_bench` on 4 short Spanish orders (0.8-2.4 s of audio): 318-328 ms each, warm. One error: "prueba del agente" -> "prueba de la gente".

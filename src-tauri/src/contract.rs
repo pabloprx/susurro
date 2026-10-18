@@ -56,12 +56,15 @@ pub struct CommandSettings {
     /// "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
     /// choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
     pub auto_click: bool,
-    /// The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
-    /// "Latency"), else the dictation provider.
+    /// The STT for commands. None = auto: local Whisper when its model is downloaded (the dictation's instance,
+    /// Pablo's ask), else Scribe Realtime when an ElevenLabs key is saved, else the dictation provider.
     pub stt: Option<SttProvider>,
-    /// Agent mode: "modo agente: <task>", or an order that failed twice in a row, goes to the local Claude Code CLI
-    /// (`claude -p`, the subscription login) driving the Mac through susurro's own tools (agent.rs).
+    /// Agent mode (on by default): every order goes to the local Claude Code CLI (`claude -p`, the subscription
+    /// login) driving the Mac through susurro's own tools (agent.rs), except the trivial ones (agent::local_intent).
     pub agent: bool,
+    /// "Fast mode (beta)": the old planner path (orders go through the planner; agent mode only on "modo agente: ..."
+    /// or an order that failed twice).
+    pub fast_mode: bool,
     /// The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
     pub agent_model: String,
     /// The OpenRouter vision model when the claude CLI is missing or not logged in.
@@ -663,7 +666,7 @@ pub struct Navigate {
 /// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
 /// v5: hotkeys.recents ("Ctrl+" + an F-key ptt), the old 400 ms grace becomes 1000, LLM cleanup off once for MAI STT.
 /// v6: "press enter" at the end of a dictation is on by default (turned on once for older files).
-pub const SETTINGS_VERSION: u32 = 7;
+pub const SETTINGS_VERSION: u32 = 8;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
 /// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
 /// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
@@ -814,7 +817,9 @@ impl Default for SessionState {
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into() }
+        // agent_model: sonnet, measured 2026-10-18 (GUI round 1, T1-T4, one run each): sonnet 25.5 s and every part
+        // of every order; haiku 44.8 s, wandered in Finder (26.7 s) and skipped the new tab in JS Paint.
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: true, fast_mode: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into() }
     }
 }
 

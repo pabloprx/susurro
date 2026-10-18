@@ -1,12 +1,17 @@
 //! Debug-only test hooks, read from env vars. lib.rs compiles this module only with debug_assertions.
 //! - SUSURRO_DATA_DIR=<dir>: settings, db, audio, models and logs live here instead of the app data dir.
 //! - SUSURRO_TEST_AUDIO=<a.wav>[:<b.wav>...]: each recorder open streams the next file (wraps around) instead of cpal.
-//! - SUSURRO_TEST_PASTE_TARGET=<bundle id>: Cmd+V / Return only if that app is frontmost; else no paste and no clipboard write.
+//! - SUSURRO_TEST_PASTE_TARGET=<bundle id>[,<bundle id>...]: keys, clicks and pastes only if one of those apps is
+//!   frontmost; else no paste and no clipboard write (Docker Desktop is two bundles). open_app is never blocked: it
+//!   brings the target up.
 //! - SUSURRO_TEST_CONTROL=<port>: HTTP on 127.0.0.1 (GET /state, POST /settings /dict /audio /event/<name>
 //!   /mic/select /mic/priority /mic/forget /toast_action /navigate/<screen|hide>, GET /permissions,
 //!   POST /permissions/request/<microphone|accessibility|input_monitoring>,
 //!   POST /flags/<RightOption|LeftOption|...>/<down|up>: post a synthetic FlagsChanged CGEvent (never Fn),
-//!   GET /hotkey: the hotkey_status payload, POST /hotkey_capture/<on|off>).
+//!   GET /hotkey: the hotkey_status payload, POST /hotkey_capture/<on|off>,
+//!   POST /command {"text": "...", "auto_confirm": true}: a voice-control order as if heard after F11 (no mic, no
+//!   STT); auto_confirm answers every confirm yes. GET /state shows its steps (command_log), the live session and the
+//!   agent's warm process.
 
 use crate::AppState;
 use crate::contract::{DictEntryInput, Settings};
@@ -74,7 +79,7 @@ pub fn key(account: &str) -> Option<String> {
 pub fn paste_blocked() -> Option<String> {
     let target = std::env::var("SUSURRO_TEST_PASTE_TARGET").ok()?;
     let front = crate::paste::frontmost_app().and_then(|a| a.bundle_id);
-    (front.as_deref() != Some(target.as_str())).then(|| format!("frontmost is {front:?}, not {target}"))
+    (!target.split(',').any(|t| front.as_deref() == Some(t.trim()))).then(|| format!("frontmost is {front:?}, not {target}"))
 }
 
 // ---------- control endpoint ----------
@@ -139,7 +144,18 @@ fn route(app: &AppHandle, method: &str, path: &str, body: &[u8]) -> Result<Value
                 "stats": crate::history::get_stats(app.state()).ok(),
                 "mic": crate::audio::mic_state(&state),
                 "hotkey": app.try_state::<crate::hotkey::HotkeyHandle>().map(|h| h.status()),
+                "command_log": crate::command::command_log(),
+                "live": crate::live::live_state(),
+                "agent": crate::agent::status(),
+                "agent_memory": crate::agent::load_memory(&state.data_dir.join("agent-memory.json")),
             }))
+        }
+        ("POST", "/command") => {
+            let v = parse()?;
+            let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("POST /command {\"text\": \"...\"}")?.to_string();
+            crate::command::AUTO_CONFIRM.store(v["auto_confirm"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::SeqCst);
+            state.session_tx.send(SessionCmd::Inject(text)).map_err(|_| "session is not running".to_string())?;
+            Ok(json!({ "ok": true }))
         }
         ("POST", "/settings") => {
             let mut cur = serde_json::to_value(state.settings.read().unwrap().clone()).map_err(|e| e.to_string())?;

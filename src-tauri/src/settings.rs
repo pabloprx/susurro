@@ -77,6 +77,13 @@ fn migrate(mut s: Settings) -> Settings {
     if s.version < 7 {
         s.command.planner_model = DEFAULT_PLANNER.into();
     }
+    // v8 (agent v2, Pablo 2026-10-18): agent mode on for everyone, the planner only as "Fast mode (beta)"; the
+    // command STT goes back to auto (local Whisper when downloaded: "use local Whisper for the commands").
+    if s.version < 8 {
+        s.command.agent = true;
+        s.command.fast_mode = false;
+        s.command.stt = None;
+    }
     s.version = SETTINGS_VERSION;
     s
 }
@@ -345,6 +352,25 @@ mod tests {
         s2.command.planner_model = "openai/gpt-6-luna".into();
         save(&p, &s2).unwrap();
         assert_eq!(load(&p).command.planner_model, "openai/gpt-6-luna");
+    }
+
+    #[test]
+    fn v8_turns_agent_mode_on_and_the_command_stt_to_auto_once() {
+        let p = tmp_dir("v8mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":7,"command":{"enabled":true,"agent":false,"stt":"openrouter","agent_model":"sonnet","auto_click":true}}"#).unwrap();
+        let s = load(&p);
+        assert!(s.command.agent && !s.command.fast_mode);
+        assert_eq!(s.command.stt, None, "auto = local Whisper");
+        assert!(s.command.enabled && s.command.auto_click, "his other choices stay");
+        assert_eq!(s.command.agent_model, "sonnet");
+        // once: a later choice stays
+        let mut s2 = s.clone();
+        (s2.command.fast_mode, s2.command.stt) = (true, Some(SttProvider::ElevenLabsRealtime));
+        save(&p, &s2).unwrap();
+        let s3 = load(&p);
+        assert!(s3.command.fast_mode);
+        assert_eq!(s3.command.stt, Some(SttProvider::ElevenLabsRealtime));
+        assert!(Settings::default().command.agent, "new installs too");
     }
 
     #[test]
