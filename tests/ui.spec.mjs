@@ -646,6 +646,25 @@ test.describe("providers", () => {
     await expect(rt).toHaveAttribute("aria-checked", "true");
     await expect(page.locator(".prov-body")).toContainText("0.2 s after you let go");
   });
+  test("OpenAI Realtime: LIVE provider, its key unlocks the command STT option", async ({ page }) => {
+    const rt = prov(page, "OpenAI Realtime");
+    await expect(rt.locator(".badge-chip")).toHaveText("LIVE");
+    await nav(page, "Voice control");
+    const opt = page.getByRole("combobox", { name: "Speech to text for commands" }).locator('option[value="openai_realtime"]');
+    await expect(opt).toBeDisabled();
+    await nav(page, "Providers");
+    await page.getByRole("textbox", { name: "OpenAI key" }).fill("sk-proj-0123456789abcdef");
+    await page.locator(".keys .row", { hasText: "OpenAI" }).getByRole("button", { name: "Save" }).click();
+    await prov(page, "OpenAI Realtime").click();
+    await expect(page.locator(".prov-body")).toContainText("gpt-live-transcribe");
+    await expect(testBtn(page)).toBeEnabled();
+    await nav(page, "Voice control");
+    await expect(opt).toBeEnabled();
+    await page.getByRole("combobox", { name: "Speech to text for commands" }).selectOption("openai_realtime");
+    await nav(page, "Home");
+    await nav(page, "Voice control");
+    await expect(page.getByRole("combobox", { name: "Speech to text for commands" })).toHaveValue("openai_realtime");
+  });
   test("English-only model warns for other languages", async ({ page }) => {
     await page.locator(".models .row", { hasText: "base.en q5_1" }).getByRole("button", { name: "Use" }).click();
     await expect(page.getByRole("status").filter({ hasText: "only understands English" })).toContainText("other languages");

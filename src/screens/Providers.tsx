@@ -31,7 +31,7 @@ const hostOf = (u: string) => {
 const checkUrl = (v: string) => (/^https?:\/\/./i.test(v) && hostOf(v) ? null : "Enter a full URL, like http://127.0.0.1:8000/v1");
 
 // Key masks show only the last 4 characters. Older builds also stored the first 6: drop them.
-for (const n of ["openrouter", "elevenlabs", "local_stt", "local_llm"] satisfies KeyName[]) {
+for (const n of ["openrouter", "elevenlabs", "openai", "local_stt", "local_llm"] satisfies KeyName[]) {
   const k = `susurro.keymask.${n}`;
   const m = localStorage.getItem(k);
   if (m?.includes("…")) localStorage.setItem(k, `••••${m.slice(-4)}`);
@@ -54,6 +54,7 @@ export default function Providers() {
     openai_compat: lastTest.openai_compat && !lastTest.openai_compat.ok ? "not reachable" : (hostOf(s.stt.openai_compat.base_url) ?? "invalid URL"),
     elevenlabs: keys.elevenlabs ? "ready" : S.help.noKeys,
     elevenlabs_realtime: keys.elevenlabs ? "ready" : S.help.noKeys,
+    openai_realtime: keys.openai ? "ready" : S.help.noKeys,
     openrouter: !keys.openrouter ? S.help.noKeys : s.stt.openrouter_model ? "ready" : "pick a model",
   };
   const what: Record<SttProvider, [string, string]> = {
@@ -61,6 +62,7 @@ export default function Providers() {
     openai_compat: ["Local server", "OpenAI-compatible"],
     elevenlabs: ["ElevenLabs Scribe", "cloud"],
     elevenlabs_realtime: ["Scribe Realtime", "cloud · words while you speak"],
+    openai_realtime: ["OpenAI Realtime", "cloud · gpt-live-transcribe · words while you speak"],
     openrouter: ["OpenRouter", "cloud STT model"],
   };
   // An English-only (.en) Whisper model transcribes other languages as English: warn where the language is picked.
@@ -83,7 +85,7 @@ export default function Providers() {
               <button className="prov-head" role="radio" aria-checked={sel} tabIndex={sel ? 0 : -1} onClick={() => !sel && save((x) => void (x.stt.provider = id))}>
                 <span className="radio" />
                 <span className="name">{what[id][0]}</span>
-                {id === "elevenlabs_realtime" && <span className="badge-chip rec">LIVE</span>}
+                {(id === "elevenlabs_realtime" || id === "openai_realtime") && <span className="badge-chip rec">LIVE</span>}
                 <span className="small">{what[id][1]}</span>
                 <span className="what">{sel && ready ? "" : state[id]}</span>
                 <Dot tone={sel && ready ? "ok" : "idle"} />
@@ -126,6 +128,7 @@ export default function Providers() {
       <div className="card rows keys">
         <KeyRow name="openrouter" title="OpenRouter" s={s} saved={keys.openrouter} />
         <KeyRow name="elevenlabs" title="ElevenLabs" s={s} saved={keys.elevenlabs} />
+        <KeyRow name="openai" title="OpenAI" sub="OpenAI Realtime" s={s} saved={keys.openai} />
         <KeyRow name="local_stt" title="Local STT server" sub="optional bearer token" s={s} saved={keys.local_stt} />
         <KeyRow name="local_llm" title="Local LLM server" sub="optional bearer token" s={s} saved={keys.local_llm} />
       </div>
@@ -200,6 +203,19 @@ export default function Providers() {
             <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
               <span className="small">{keys!.elevenlabs ? "Key saved." : "Add your ElevenLabs key below."}</span>
               <TestButton which="stt" onResult={onTest} disabled={!keys!.elevenlabs} />
+            </div>
+          </>
+        );
+      case "openai_realtime":
+        return (
+          <>
+            <p className="small" style={{ marginTop: 0 }}>
+              Streams your voice to OpenAI&apos;s live transcription (gpt-live-transcribe) over a WebSocket. Not measured yet against Scribe Realtime.
+              If the stream fails, the clip goes to {keys!.openrouter ? "OpenRouter" : "ElevenLabs Scribe"}. Uses the OpenAI key.
+            </p>
+            <div className="inline" style={{ marginTop: 12, justifyContent: "space-between" }}>
+              <span className="small">{keys!.openai ? "Key saved." : "Add your OpenAI key below."}</span>
+              <TestButton which="stt" onResult={onTest} disabled={!keys!.openai} />
             </div>
           </>
         );
@@ -554,6 +570,10 @@ function KeyRow({ name, title, sub, s, saved }: { name: KeyName; title: string; 
       ? s.stt.provider === "elevenlabs" || s.stt.provider === "elevenlabs_realtime"
         ? "stt"
         : null
+      : name === "openai"
+        ? s.stt.provider === "openai_realtime"
+          ? "stt"
+          : null
       : name === "openrouter"
         ? s.cleanup.level !== "none" && s.cleanup.provider === "openrouter"
           ? "cleanup"

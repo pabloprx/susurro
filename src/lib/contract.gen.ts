@@ -161,9 +161,9 @@ command: string,
  */
 recents: string, };
 
-export type KeyName = "elevenlabs" | "openrouter" | "local_stt" | "local_llm";
+export type KeyName = "elevenlabs" | "openai" | "openrouter" | "local_stt" | "local_llm";
 
-export type KeyStatus = { elevenlabs: boolean, openrouter: boolean, local_stt: boolean, local_llm: boolean, };
+export type KeyStatus = { elevenlabs: boolean, openai: boolean, openrouter: boolean, local_stt: boolean, local_llm: boolean, };
 
 export type KnownDevice = { id: string, name: string, kind: DeviceKind, last_seen: number, };
 
@@ -366,7 +366,7 @@ command: CommandSettings, };
 
 export type Stats = { words_total: number, words_7d: number, sessions_7d: number, wpm: number, minutes_saved: number, daily: Array<DayStat>, };
 
-export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter" | "elevenlabs_realtime";
+export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter" | "elevenlabs_realtime" | "openai_realtime";
 
 export type SttSettings = { provider: SttProvider, whisper_model: string, openai_compat: OpenAiCompat, elevenlabs: ElevenOpts, openrouter_model: string, 
 /**

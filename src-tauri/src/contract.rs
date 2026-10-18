@@ -168,6 +168,10 @@ pub enum SttProvider {
     /// Batch paths (Retry, the fallback) use MAI when an OpenRouter key exists, else Scribe v2 batch.
     #[serde(rename = "elevenlabs_realtime")]
     ElevenLabsRealtime,
+    /// OpenAI realtime transcription (gpt-live-transcribe) over a WebSocket, the same session code as Scribe
+    /// Realtime (stt/scribe_rt.rs). Key: KeyName::Openai. Batch paths as Scribe Realtime.
+    #[serde(rename = "openai_realtime")]
+    OpenAiRealtime,
 }
 
 #[serde(default)]
@@ -420,6 +424,7 @@ pub struct ModelProgress {
 
 pub struct KeyStatus {
     pub elevenlabs: bool,
+    pub openai: bool,
     pub openrouter: bool,
     pub local_stt: bool,
     pub local_llm: bool,
@@ -429,6 +434,7 @@ pub struct KeyStatus {
 #[serde(rename_all = "snake_case")]
 pub enum KeyName {
     Elevenlabs,
+    Openai,
     Openrouter,
     LocalStt,
     LocalLlm,
@@ -649,6 +655,13 @@ pub const JEV_MODEL: &str = "typesafe/jev-1.14";
 /// `.lo/planner-bench.md` (2026-10-17): fastest of the models with every plan right (0.78 s p50, 60/60 same effect),
 /// pinned to Cerebras with reasoning low (planner.rs `extra_for`).
 pub const DEFAULT_PLANNER: &str = "openai/gpt-oss-120b";
+
+impl SttProvider {
+    /// A WebSocket provider: words while you speak (stt/scribe_rt.rs).
+    pub fn realtime(&self) -> bool {
+        matches!(self, SttProvider::ElevenLabsRealtime | SttProvider::OpenAiRealtime)
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {

@@ -329,6 +329,7 @@ fn provider_label(s: &crate::contract::Settings, fell_back: bool) -> String {
         SttProvider::ElevenLabs => format!("elevenlabs:{}", st.elevenlabs.model_id),
         SttProvider::OpenRouter => format!("openrouter:{}", st.openrouter_model),
         SttProvider::ElevenLabsRealtime => "elevenlabs:scribe_v2_realtime".into(),
+        SttProvider::OpenAiRealtime => "openai:gpt-live-transcribe".into(),
     }
 }
 
@@ -945,12 +946,12 @@ impl Actor {
     fn realtime(&self, rec: &Recorder) -> Option<(audio::Chunker, stt::scribe_rt::Live, mpsc::Receiver<stt::scribe_rt::Ev>)> {
         let state = self.state();
         let s = state.settings.read().unwrap().clone();
-        if s.stt.provider != SttProvider::ElevenLabsRealtime {
+        if !s.stt.provider.realtime() {
             return None;
         }
         let ch = rec.chunker();
         let hints = Dictionary::new(dictionary::load(&state.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
-        let o = stt::realtime_opts(&s, ch.rate(), &hints, s.stt.elevenlabs.send_keyterms)?;
+        let o = stt::realtime_opts(&s.stt.provider, &s, ch.rate(), &hints, s.stt.elevenlabs.send_keyterms)?;
         let (tx, rx) = mpsc::channel();
         Some((ch, stt::scribe_rt::Live::start(o, move |e| drop(tx.send(e))), rx))
     }

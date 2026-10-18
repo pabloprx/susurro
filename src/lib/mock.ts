@@ -58,7 +58,7 @@ let settings: C.Settings = {
 };
 
 let pillRect: C.PtRect | null = null;
-let keys: C.KeyStatus = { elevenlabs: false, openrouter: !fresh, local_stt: false, local_llm: false };
+let keys: C.KeyStatus = { elevenlabs: false, openai: false, openrouter: !fresh, local_stt: false, local_llm: false };
 
 // relaunch_app reloads the page; permissions survive it like real grants do
 const relaunched = sessionStorage.getItem("mock.perms");

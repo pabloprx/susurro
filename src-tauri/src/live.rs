@@ -539,7 +539,7 @@ pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Ha
         let el = crate::secrets::get(crate::contract::KeyName::Elevenlabs).is_some();
         let p = crate::stt::command_provider(&s, el);
         let hints = crate::dictionary::Dictionary::new(crate::dictionary::load(&st.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
-        let o = (p == crate::contract::SttProvider::ElevenLabsRealtime).then(|| crate::stt::realtime_opts(&s, rate, &with_brands(&hints), true)).flatten();
+        let o = crate::stt::realtime_opts(&p, &s, rate, &with_brands(&hints), true);
         (p, o)
     };
     log::info!("live: command STT {provider:?}{}", if rt_opts.is_some() { " (streaming)" } else { "" });
@@ -659,7 +659,7 @@ fn live_loop(
                 },
                 scribe_rt::Ev::Closed | scribe_rt::Ev::Failed(_) => {
                     if let scribe_rt::Ev::Failed(err) = &e {
-                        log::warn!("live: Scribe Realtime failed, {:?} takes the rest: {err}", crate::stt::batch_for_realtime(true));
+                        log::warn!("live: {provider:?} failed, {:?} takes the rest: {err}", crate::stt::batch_for_realtime(true));
                     }
                     rt = None;
                     for (n, a) in rta.drain(&mut seq) {
@@ -798,7 +798,7 @@ fn same_front(core: &mut Core, held_front: &mut Option<Option<i32>>) {
 const RT_FINISH_MS: u64 = 1500;
 
 fn realtime_mode(p: &crate::contract::SttProvider) -> bool {
-    *p == crate::contract::SttProvider::ElevenLabsRealtime
+    p.realtime()
 }
 
 fn resume(app: &AppHandle) {

@@ -223,6 +223,9 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
           >
             <option value="auto">Auto · {keys?.elevenlabs ? "Scribe Realtime" : "same as dictation"}</option>
             <option value="elevenlabs_realtime">Scribe Realtime (live)</option>
+            <option value="openai_realtime" disabled={!keys?.openai}>
+              OpenAI Realtime (live){keys?.openai ? "" : " · add an OpenAI key in Providers"}
+            </option>
             <option value="openrouter">OpenRouter</option>
             <option value="elevenlabs">ElevenLabs Scribe</option>
             <option value="whisper_local">Local Whisper</option>
