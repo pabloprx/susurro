@@ -116,14 +116,19 @@ pub fn extra_for(model: &str) -> Value {
 }
 
 /// Light per-app shortcuts for the planner (vc-feedback 18): data, not code branches.
-const APP_HINTS: [(&[&str], &str); 7] = [
+/// Electron apps: keyboard first (next-build 6): a palette + the name + return beats a click on a row.
+const APP_HINTS: [(&[&str], &str); 11] = [
     (&["Google Chrome", "Safari", "Arc", "Firefox", "Brave Browser", "Microsoft Edge", "Dia"], "cmd+l address bar (type a URL or a search, then return), cmd+f find in page, cmd+t new tab, cmd+w close tab, cmd+1..9 tab N, cmd+[ back"),
-    (&["Slack"], "cmd+k jump to a channel or person, cmd+f search, cmd+n new message, return sends"),
+    (&["Slack"], "open a channel or DM: key cmd+k, type its name, key return (better than a click); cmd+f search, cmd+n new message, return in the message box sends"),
+    (&["Discord"], "open a channel or DM: key cmd+k, type its name, key return (better than a click); return in the message box sends"),
+    (&["Claude"], "cmd+k search chats (type the title, key return), cmd+n new chat, return in the prompt box sends"),
+    (&["Notion"], "cmd+p find a page (type its title, key return), cmd+n new page"),
+    (&["Linear"], "cmd+k command menu (type the command or issue, key return), c new issue"),
     (&["Ghostty", "Terminal", "iTerm2", "Warp", "WezTerm", "kitty", "Alacritty"], "cmd+t new tab, cmd+1..9 tab N, commands are typed lowercase, ctrl+c stops a command, no text selection"),
     (&["Finder"], "cmd+shift+g go to folder, cmd+f search, cmd+n new window"),
-    (&["Cursor", "Code", "Visual Studio Code", "Zed"], "cmd+p open a file, cmd+shift+p command palette, cmd+f find"),
+    (&["Cursor", "Code", "Visual Studio Code", "Zed"], "cmd+p open a file (type its name, key return), cmd+shift+p command palette, cmd+f find"),
     (&["WhatsApp", "Messages", "Telegram"], "cmd+f search chats, return sends"),
-    (&["Notes", "TextEdit", "Notion", "Obsidian"], "cmd+a select all, cmd+z undo"),
+    (&["Notes", "TextEdit", "Obsidian"], "cmd+a select all, cmd+z undo"),
 ];
 
 pub fn hints_for(app: &str) -> Option<&'static str> {
@@ -186,6 +191,14 @@ pub fn parse(content: &str) -> anyhow::Result<Plan> {
     // the order (replay 2026-10-18: Luna sent {"op":"key","keys":null} before cmd+l)
     let blank = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
     p.actions.retain(|a| !((a.op == "key" && blank(&a.keys)) || (a.op == "type" && blank(&a.text))));
+    // gpt-oss-120b on Cerebras (2026-10-18, 3 runs out of 3) answers "Run LS." with [return, type ls]: the Return
+    // would hit an empty prompt. A plan that is only those two runs the text first.
+    // ponytail: only this exact two-action shape; a real "press enter, then type X" order is then swapped too.
+    if let [k, t] = p.actions.as_slice() {
+        if k.op == "key" && k.keys.as_deref().is_some_and(|s| matches!(s.trim(), "return" | "enter")) && t.op == "type" {
+            p.actions.swap(0, 1);
+        }
+    }
     if p.complete {
         p.rest.clear();
     }
@@ -383,6 +396,16 @@ mod tests {
         assert_eq!(p.actions.len(), 1, "wait_user and unknown ops are dropped");
         assert!(parse("Sure! I will open the tab.").is_err());
         assert!(parse("{not json}").is_err());
+    }
+
+    #[test]
+    fn return_before_the_only_type_runs_after_it() {
+        let ops = |s: &str| parse(s).unwrap().actions.iter().map(|a| a.op.clone()).collect::<Vec<_>>();
+        let a = r#"{"complete":true,"rest":"","answer":null,"say":null,"actions":["#;
+        assert_eq!(ops(&format!(r#"{a}{{"op":"key","keys":"return"}},{{"op":"type","text":"ls"}}]}}"#)), ["type", "key"]);
+        assert_eq!(ops(&format!(r#"{a}{{"op":"type","text":"ls"}},{{"op":"key","keys":"return"}}]}}"#)), ["type", "key"]);
+        // longer plans keep their order
+        assert_eq!(ops(&format!(r#"{a}{{"op":"key","keys":"cmd+t"}},{{"op":"key","keys":"return"}},{{"op":"type","text":"ls"}}]}}"#)), ["key", "key", "type"]);
     }
 
     #[test]

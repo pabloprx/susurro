@@ -75,6 +75,18 @@ pub fn spawn_hit_test(app: &AppHandle) {
         .expect("spawn overlay-hit");
 }
 
+/// The pill in CG global points (top-left origin, y down). None = no pill. OCR drops the text it reads there: the
+/// pill shows Pablo's own words ("click “Comercial X”"), never a target.
+pub fn pill_rect() -> Option<PtRect> {
+    let (win, pill) = ((*OVERLAY_FRAME.lock().unwrap())?, (*PILL.lock().unwrap())?);
+    Some(pill_cg(win, pill, core_graphics::display::CGDisplay::main().bounds().size.height))
+}
+
+/// Pure: the pill (page rect, y down from the window top) in a Cocoa window frame `win` -> CG global points.
+pub fn pill_cg(win: PtRect, pill: PtRect, main_h: f64) -> PtRect {
+    PtRect { x: win.x + pill.x, y: main_h - (win.y + win.h) + pill.y, w: pill.w, h: pill.h }
+}
+
 /// CG global rect (top-left origin, y down) -> Cocoa frame (bottom-left origin of the main screen, y up).
 pub fn cg_to_cocoa(r: PtRect, main_h: f64) -> PtRect {
     PtRect { x: r.x, y: main_h - (r.y + r.h), w: r.w, h: r.h }
@@ -232,6 +244,14 @@ mod tests {
 
     const WIN: PtRect = PtRect { x: 500.0, y: 40.0, w: 360.0, h: 64.0 }; // Cocoa: bottom edge 40 pt above the screen bottom
     const PILL: PtRect = PtRect { x: 80.0, y: 10.0, w: 200.0, h: 36.0 }; // page px, from the window top
+
+    #[test]
+    fn pill_in_cg_points() {
+        // main screen 900 pt tall: the window top is at Cocoa y 104 = CG y 796; the pill starts 10 pt below it
+        assert_eq!(pill_cg(WIN, PILL, 900.0), PtRect { x: 580.0, y: 806.0, w: 200.0, h: 36.0 });
+        // the same pill seen by over_pill (Cocoa y 58..94) = CG y 806..842
+        assert!(over_pill((680.0, 900.0 - 824.0), WIN, PILL));
+    }
 
     #[test]
     fn hit_only_on_the_pill() {

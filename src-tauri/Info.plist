@@ -4,5 +4,7 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>susurro listens only while you hold the dictation key, to turn your speech into text.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>susurro reads the buttons and links of the page in your browser and clicks them when you ask by voice.</string>
 </dict>
 </plist>

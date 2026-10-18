@@ -1526,14 +1526,19 @@ test.describe("onboarding", () => {
 
 test.describe("marks window", () => {
   const root = (page) => page.locator(".marks-root");
-  test("marks: a numbered badge per AX element and a tint per region", async ({ page }) => {
+  test("marks: nothing drawn by default; 'muestra los números' shows a badge per AX element and a tint per region", async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/marks?state=marks");
     await expect(root(page)).toHaveClass(/\bs-marks\b/);
+    // vc-feedback 22: no numbered marks over the screen unless asked
+    await expect(root(page).locator(".mark, .region")).toHaveCount(0);
+    await expect(root(page).locator(".hud")).toContainText("LOOKING");
+    await page.goto("/marks?state=live-acting");
+    await expect(root(page).locator(".mark")).toHaveCount(1); // the target only
+    await page.evaluate(() => window.mock.live({ numbers: true }));
     await expect(root(page).locator(".mark")).toHaveCount(43);
     await expect(root(page).locator(".mark .badge").first()).toHaveText("1");
     await expect(root(page).locator(".region")).toHaveCount(5);
-    await expect(root(page).locator(".hud")).toContainText("STEP 1/6LOOKINGopen my DM with Anaesc stops");
     // badges sit on the element: mark 41 (Send now) is at the composer's bottom-right
     const b = await root(page).locator(".mark").nth(40).boundingBox();
     expect(b.x).toBeGreaterThan(1300);
@@ -1544,7 +1549,7 @@ test.describe("marks window", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/marks?state=aim");
     await expect(root(page).locator(".mark.chosen .badge")).toHaveText("27");
-    await expect(root(page).locator(".mark.faded")).toHaveCount(42);
+    await expect(root(page).locator(".mark")).toHaveCount(1); // no other marks, nothing dimmed
     await expect(root(page).locator(".brackets .cross")).toHaveCount(1);
     await expect(root(page).locator(".brackets.warn")).toHaveCount(0);
     await expect(root(page).locator(".hud")).toContainText("CLICK");
@@ -1574,8 +1579,8 @@ test.describe("marks window", () => {
     await page.goto("/marks?state=done");
     await expect(root(page)).toBeAttached();
     await expect(root(page).locator(".mark")).toHaveCount(0);
-    await page.goto("/marks?state=marks");
-    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await page.goto("/marks?state=aim");
+    await expect(root(page).locator(".mark")).toHaveCount(1);
     await page.evaluate(() => window.mock.phase("idle"));
     await expect(root(page).locator(".mark")).toHaveCount(0);
   });
@@ -1586,8 +1591,8 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
   test.beforeEach(({ page }) => page.setViewportSize({ width: 1440, height: 900 }));
   test("marks stay through the whole session; the target brackets fade after 1 s", async ({ page }) => {
     await page.goto("/marks?state=live-session");
-    await expect(root(page).locator(".mark")).toHaveCount(43);
     await expect(root(page).locator(".mark.chosen .badge")).toHaveText("27"); // aim on Ana Silva
+    await expect(root(page).locator(".mark")).toHaveCount(1); // the target only (vc-feedback 22)
     await expect(root(page).locator(".hud")).toContainText("LIVE");
     // the click is done: brackets linger, nobody is faded, the badges stay
     await expect(root(page)).toHaveClass(/\bs-done\b/);
@@ -1595,7 +1600,7 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
     await expect(root(page).locator(".mark.faded")).toHaveCount(0);
     await shot(page, "marks-live-done-linger");
     await expect(root(page).locator(".brackets")).toHaveCount(0, { timeout: 1500 });
-    await expect(root(page).locator(".mark")).toHaveCount(43);
+    await expect(root(page).locator(".mark")).toHaveCount(0); // the highlight is gone with it
     // the next order (type into the composer) aims on the same, fresh board
     await expect(root(page).locator(".mark.chosen .badge")).toHaveText("36", { timeout: 3000 });
     await expect(root(page).locator(".hud")).toContainText("TYPE");
@@ -1633,9 +1638,9 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
     const choices = root(page).locator(".mark.choice");
     await expect(choices).toHaveCount(4);
     await expect(choices.locator(".choice-n")).toHaveText(["3", "2", "1", "4"]); // DOM order = mark ids: general, engineering, design, random
-    await expect(root(page).locator(".mark.choice", { hasText: "# design" }).locator(".choice-n")).toHaveText("1");
-    await expect(root(page).locator(".mark.faded")).toHaveCount(39);
-    await expect(root(page).locator(".mark.faded .badge").first()).toBeVisible(); // other marks keep their ids for "41"
+    await expect(choices.nth(2).locator(".choice-n")).toHaveText("1"); // # design, Jev's #1
+    await expect(root(page).locator(".mark")).toHaveCount(4); // boxes on the candidates only, no dimming
+    await expect(choices.locator(".choice-name")).toHaveText(["sidebar", "sidebar", "sidebar", "sidebar"]); // short labels: number + region
     const hud = root(page).locator(".hud");
     await expect(hud).toContainText("PICK ONE");
     await expect(hud.locator(".hud-choices li")).toHaveCount(4);
@@ -1647,7 +1652,7 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
     await shot(page, "marks-choose");
     await page.goto("/marks?state=choose-pre");
     await expect(root(page).locator(".mark.choice.pre")).toHaveCount(1);
-    await expect(root(page).locator(".mark.choice.pre .choice-name")).toHaveText("Ana Silva");
+    await expect(root(page).locator(".mark.choice.pre .choice-name")).toHaveText("sidebar");
     await expect(root(page).locator(".hud-choices li.pre")).toContainText("1Ana Silva");
     await expect(root(page).locator(".hud-foot")).toContainText("Say “sí” for 1, or another number.");
     await shot(page, "marks-choose-pre");
@@ -1659,6 +1664,8 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
   });
   test("a board refresh (step 0) redraws the numbers and keeps the HUD", async ({ page }) => {
     await page.goto("/marks?state=live-acting");
+    await expect(root(page).locator(".mark")).toHaveCount(1); // the target only, until numbers are asked for
+    await page.evaluate(() => window.mock.live({ numbers: true }));
     await expect(root(page).locator(".mark")).toHaveCount(43);
     await expect(root(page).locator(".hud")).toContainText("LIVECLICKAna Silva");
     await page.evaluate(() => window.mock.board(10));
@@ -1668,6 +1675,8 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
   });
   test("Pablo's own mouse or keys hide the marks at once; the next order shows them again", async ({ page }) => {
     await page.goto("/marks?state=live-acting");
+    await expect(root(page).locator(".mark")).toHaveCount(1); // the target only, until numbers are asked for
+    await page.evaluate(() => window.mock.live({ numbers: true }));
     await expect(root(page).locator(".mark")).toHaveCount(43);
     await page.evaluate(() => window.mock.takeOver());
     await expect(root(page)).toHaveClass(/\btook-over\b/);

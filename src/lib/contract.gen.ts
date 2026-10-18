@@ -211,7 +211,12 @@ paused: boolean,
 /**
  * The last chunk of text heard.
  */
-last_said: string, };
+last_said: string, 
+/**
+ * "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
+ * candidates are drawn.
+ */
+numbers: boolean, };
 
 export type LlmProvider = "openrouter" | "local";
 

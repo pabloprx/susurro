@@ -1,6 +1,7 @@
 // Voice control: the full-screen, click-through marks window (one per command, on the display it acts on).
-// It draws what Jev chooses from: a numbered badge on every actionable AX element, a faint tint per region, then the
-// chosen target (registration brackets + crosshair), the "Which one?" top 3, or the risky-action confirm.
+// By default it draws only what matters now (vc-feedback 22): the chosen target (registration brackets + crosshair),
+// the 2-3 tied candidates as numbered boxes labeled by region, or the risky-action confirm. Every mark's number and the
+// region tints show only on demand ("muestra los números": LiveState.numbers).
 // Live session (VOICE_CONTROL_V2 3): the marks stay up for the whole session (Rust owns the window's visibility), the
 // target keeps its brackets HIGHLIGHT_MS after the action, and Pablo's own mouse or keys (took_over) empty the window at
 // once until the next order. The HUD shows what it heard, what it does and what is queued.
@@ -79,15 +80,18 @@ export default function Marks() {
   const done = status === "done";
   const focus = status === "pick" ? picks : target && status !== "marks" && (!done || lit) ? [target.id] : [];
   const key = keysOf(settings?.hotkeys.command ?? "F2");
+  // numbers on demand: else only the target and the candidates are drawn, no tints, nothing dimmed
+  const all = liveOn && live.numbers;
+  const drawn = all ? marks : marks.filter((m) => focus.includes(m.id));
 
   return (
     <div className={`marks-root s-${status}${liveOn ? " live" : ""}`}>
-      {regionsOf(marks).map(([name, r]) => (
+      {all && regionsOf(marks).map(([name, r]) => (
         <div key={name} className="region" style={place(r, d)}>
           {r.w >= 120 && r.h >= 60 && <span className="region-name">{name}</span>}
         </div>
       ))}
-      {marks.map((m, i) => {
+      {drawn.map((m, i) => {
         const pick = picks.indexOf(m.id);
         // after an action the rest stay readable: the next order may name any of them
         const cls = focus.length ? (focus.includes(m.id) ? (pick >= 0 ? (choose ? ` choice${pre && pick === 0 ? " pre" : ""}` : " pick") : " chosen") : done ? "" : " faded") : "";
@@ -96,7 +100,7 @@ export default function Marks() {
             {choose && pick >= 0 ? (
               <>
                 <span className="choice-n">{pick + 1}</span>
-                <span className="choice-name">{m.name || "(no name)"}</span>
+                <span className="choice-name">{m.region}</span>
               </>
             ) : (
               <span className="badge">{m.id}</span>

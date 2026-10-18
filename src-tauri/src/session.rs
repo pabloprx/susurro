@@ -682,7 +682,7 @@ impl Actor {
                 }
             }
             SessionCmd::ToastAction { toast_id, action_id } => {
-                if audio::handle_toast_action(&self.app, &toast_id, &action_id) || crate::learn::handle_toast_action(&self.app, &toast_id, &action_id) {
+                if audio::handle_toast_action(&self.app, &toast_id, &action_id) || crate::learn::handle_toast_action(&self.app, &toast_id, &action_id) || crate::web::handle_toast_action(&toast_id, &action_id) {
                     return false;
                 }
                 match (toast_id.as_str(), action_id.as_str()) {

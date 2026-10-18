@@ -7,7 +7,10 @@
       "marks": ["Back (button, toolbar)", "Share (button, toolbar)", "Search (search field, toolbar)", "https://chatgpt.com/share/6a1f (text field, main)",
                 "Copy link (button, main)", "Public (radio button, main, off)", "Message (text area, bottom)", "Share (button, main)", "Send (button, bottom)"]},
     "whatsapp": {"app": "WhatsApp", "focused": {"role": "AXTextArea", "name": "Type a message", "value": ""},
-      "marks": ["Chats (button, sidebar)", "Archived (button, sidebar)", "coding vibes (row, sidebar)", "Type a message (text area, bottom)", "Send (button, bottom)"]}
+      "marks": ["Chats (button, sidebar)", "Archived (button, sidebar)", "coding vibes (row, sidebar)", "Type a message (text area, bottom)", "Send (button, bottom)"]},
+    "slack": {"app": "Slack", "focused": {"role": "AXTextArea", "name": "Message #general", "value": ""},
+      "marks": ["Home (button, sidebar)", "DMs (button, sidebar)", "# general (link, sidebar)", "Comercial X (link, sidebar)", "Pablo (tú) (row, sidebar)",
+                "Search (button, toolbar)", "Message #general (text area, bottom)", "Send now (button, bottom)"]}
   },
   "cases": [
     {"id": "type_ls", "case": 1, "utterance": "Type LS.", "screen": "ghostty",
@@ -67,6 +70,11 @@
     {"id": "confirm_answer", "case": 2, "utterance": "Yeah, go ahead.", "screen": "ghostty", "pending": "Press Return? Say yes · F11 · Esc",
      "accept": [{"complete": true, "actions": [], "answer": "yes"}]},
     {"id": "noise", "case": 10, "utterance": "Voilà.", "screen": "ghostty",
-     "accept": [{"complete": true, "actions": []}]}
+     "accept": [{"complete": true, "actions": []}]},
+    {"id": "slack_named_sidebar", "case": 22, "utterance": "En la sidebar abre Comercial X.", "screen": "slack",
+     "accept": [{"complete": true, "actions": [{"op": "click", "target": ["comercial x"]}]},
+                {"complete": true, "actions": [{"op": "key", "keys": "cmd+k"}, {"op": "type", "text_ci": "Comercial X"}, {"op": "key", "keys": "return"}]}]},
+    {"id": "slack_dm_keyboard", "case": 26, "utterance": "Abre el DM con Ana Silva.", "screen": "slack",
+     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+k"}, {"op": "type", "text_ci": "Ana Silva"}, {"op": "key", "keys": "return"}]}]}
   ]
 }

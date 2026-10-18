@@ -845,7 +845,7 @@ async function command(instruction = "open my DM with Ana", risky = false) {
 }
 
 // ---------------- voice control v2: live session (VOICE_CONTROL_V2 1, 3) ----------------
-const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, paused: false, last_said: "" };
+const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, paused: false, last_said: "", numbers: false };
 let liveNow: C.LiveState = LIVE_OFF;
 const live = (p: Partial<C.LiveState>) => mockEmit("command_live", (liveNow = { ...liveNow, on: true, ...p }));
 const ago = (ms: number) => T0 - ms;

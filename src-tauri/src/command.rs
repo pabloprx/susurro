@@ -235,26 +235,6 @@ const NUMBERS: [(&str, u32); 42] = [
     ("diecinueve", 19), ("veinte", 20), ("un", 1),
 ];
 
-/// The spoken answer to "Which one?" -> a mark id. A number names a mark ("20", "twenty"); an ordinal names a
-/// place in the pick list ("the second one").
-/// ponytail: number words up to 20 (EN/ES); STT writes digits for larger ones.
-pub fn parse_pick(text: &str, choices: &[(u32, f32)], ids: &[u32]) -> Option<u32> {
-    let l = text.to_lowercase();
-    let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    let nth = |k: usize| choices.get(k).map(|c| c.0);
-    for w in &words {
-        if let Ok(n) = w.parse::<u32>() {
-            return ids.contains(&n).then_some(n);
-        }
-        let ord = [("first", 0), ("primer", 0), ("second", 1), ("segund", 1), ("third", 2), ("tercer", 2)];
-        if let Some((_, k)) = ord.iter().find(|(o, _)| w.starts_with(o)) {
-            return nth(*k);
-        }
-    }
-    let n = words.iter().find_map(|w| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1))?;
-    ids.contains(&n).then_some(n)
-}
-
 /// The pick list of a "Which one? 4 #general · 7 #design" question: (mark id, name).
 pub fn pick_options(question: &str) -> Vec<(u32, String)> {
     let list = question.split_once('?').map_or(question, |(_, r)| r);
@@ -295,7 +275,7 @@ const ORDINALS: [(&str, usize); 10] =
     [("first", 0), ("primer", 0), ("second", 1), ("segund", 1), ("third", 2), ("tercer", 2), ("fourth", 3), ("cuart", 3), ("fifth", 4), ("quint", 4)];
 /// Words around a pick answer that name nothing ("click on the second one", "go with two", "en la segunda").
 /// No verb that acts on its own ("type 5", "open 2" stay orders).
-const PICK_AROUND: [&str; 17] = ["click", "clic", "pick", "choose", "elige", "option", "opcion", "on", "en", "a", "to", "go", "with", "take", "quiero", "now", "ahora"];
+const PICK_AROUND: [&str; 18] = ["click", "clic", "pick", "choose", "elige", "option", "opcion", "on", "en", "a", "to", "go", "with", "take", "quiero", "now", "ahora", "in"];
 
 /// The spoken text answers "Which one?": a shown option number ("2", "dos", "number 4"), an ordinal ("la segunda",
 /// "the last one"), "sí / ese / that one", or a shown option name; every other word is filler. Anything else is a new
@@ -318,6 +298,10 @@ pub fn looks_like_pick(text: &str, question: &str) -> bool {
     if core.is_empty() {
         // "One.", "the one": the filler "one" is the answer
         return words.contains(&"one") && shown(1);
+    }
+    // "la de la izquierda", "the top one", "la de la sidebar" (vc-feedback 22)
+    if spatial_only(&core) {
+        return true;
     }
     core.iter().all(|w| match digits(w).or_else(|| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1)) {
         Some(k) => shown(k),
@@ -428,21 +412,222 @@ pub fn return_asks(f: &Field) -> bool {
     chat && !search
 }
 
+/// A Return right after a jump palette (Slack / Discord / Claude cmd+k) opens what was typed; it sends nothing, so it
+/// needs no confirm. `mem` newest last: [.., key <palette>, typed <name>]. All in the field `f` focused now: the same
+/// app with a palette, the same pid, the value susurro left (nothing typed by hand since), under PALETTE_AGE_MS old.
+/// Anything else (the cmd+k went to WhatsApp, Pablo typed a message himself) asks as usual.
+pub fn after_palette(mem: &Memory, f: &Field) -> bool {
+    const PALETTE: [&str; 3] = ["cmd+k", "cmd+p", "cmd+shift+p"];
+    const APPS: [&str; 6] = ["Slack", "Discord", "Claude", "com.tinyspeck.slackmacgap", "com.hnc.Discord", "com.anthropic.claudefordesktop"];
+    const PALETTE_AGE_MS: i64 = 30_000;
+    let palette_app = APPS.iter().any(|a| a.eq_ignore_ascii_case(&f.app) || a.eq_ignore_ascii_case(&f.bundle));
+    let mut it = mem.iter().rev().filter(|e| e.e.kind != MemKind::Said);
+    let (Some(t), Some(k)) = (it.next(), it.next()) else { return false };
+    palette_app
+        && t.e.kind == MemKind::Typed
+        && k.e.kind == MemKind::Key
+        && PALETTE.contains(&k.e.text.as_str())
+        && t.pid == f.pid
+        && k.pid == f.pid
+        && t.value_after == f.value
+        && crate::history::now_ms() - t.e.at < PALETTE_AGE_MS
+}
+
+// ---------- per-app strategy (next-build 6): data, not branches ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Kind {
+    /// Cocoa (Finder, Mail, Notes, Settings, WhatsApp here: research 3): the AX tree, AXPress on leaves.
+    #[default]
+    Native,
+    /// web.rs DOM marks first; the AX tree when JS from Apple Events is off.
+    Browser,
+    /// AXManualAccessibility (ax::mac::read sets it), keyboard first (planner hints), real clicks on rows and links.
+    Electron,
+    /// Keys and typing only.
+    Terminal,
+}
+
+/// Bundle ids and names. Unknown = Native. ponytail: a fixed list; add an app when it shows up.
+const APP_KINDS: [(&str, Kind); 26] = [
+    ("com.google.Chrome", Kind::Browser), ("com.microsoft.edgemac", Kind::Browser), ("com.apple.Safari", Kind::Browser),
+    ("company.thebrowser.Browser", Kind::Browser), ("com.brave.Browser", Kind::Browser), ("company.thebrowser.dia", Kind::Browser),
+    ("Google Chrome", Kind::Browser), ("Microsoft Edge", Kind::Browser), ("Safari", Kind::Browser), ("Arc", Kind::Browser),
+    ("Brave Browser", Kind::Browser), ("com.tinyspeck.slackmacgap", Kind::Electron), ("com.hnc.Discord", Kind::Electron),
+    ("com.todesktop.230313mzl4w4u92", Kind::Electron), ("com.microsoft.VSCode", Kind::Electron), ("com.anthropic.claudefordesktop", Kind::Electron),
+    ("notion.id", Kind::Electron), ("com.linear", Kind::Electron), ("com.figma.Desktop", Kind::Electron), ("Slack", Kind::Electron),
+    ("Discord", Kind::Electron), ("Cursor", Kind::Electron), ("Visual Studio Code", Kind::Electron), ("Claude", Kind::Electron),
+    ("Notion", Kind::Electron), ("Linear", Kind::Electron),
+];
+
+pub fn app_kind(app: &str, bundle: &str) -> Kind {
+    let is = |a: &str| a.eq_ignore_ascii_case(app) || a.eq_ignore_ascii_case(bundle);
+    if TERMINALS.iter().any(|t| is(t)) {
+        return Kind::Terminal;
+    }
+    APP_KINDS.iter().find(|(a, _)| is(a)).map_or(Kind::Native, |k| k.1)
+}
+
+/// Electron rows, cells and links ignore AXPress (vc-feedback 21: the Slack DM row "clicked", nothing opened):
+/// a real click at the leaf from the start.
+pub fn real_click_first(kind: Kind, role: &str) -> bool {
+    kind == Kind::Electron && matches!(role, "row" | "link" | "tab" | "menu item")
+}
+
+// ---------- ambiguity: context priors, then 2-3 candidates with spatial answers (vc-feedback 22, 23) ----------
+
+/// #2 within this of #1 = a real tie (case 23: act on #1 otherwise). ponytail: a first guess, not measured.
+pub const TIE_GAP: f32 = 0.15;
+
+/// The candidates tied with #1 (at most 3), from an on-screen ranking (`choices`). One = act on it.
+pub fn tied(c: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let Some(top) = c.first().map(|x| x.1) else { return vec![] };
+    c.iter().take(3).filter(|x| top - x.1 <= TIE_GAP).copied().collect()
+}
+
+/// Region words in an order or an answer -> the mark region they name.
+const REGION_WORDS: [(&[&str], &str); 3] = [
+    (&["sidebar", "lateral"], "sidebar"),
+    (&["toolbar", "barra", "pestaña", "pestana", "tab"], "toolbar"),
+    (&["principal", "main", "contenido", "content", "pagina", "page", "resultado", "result"], "main"),
+];
+/// Words that name the browser's own chrome: then the page prior is off.
+const CHROME_WORDS: [&str; 10] = ["tab", "pestaña", "pestana", "sidebar", "lateral", "barra", "toolbar", "address", "direcciones", "url"];
+
+fn said_words(text: &str) -> Vec<String> {
+    crate::text::norm(text).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
+}
+
+fn says(words: &[String], stems: &[&str]) -> bool {
+    words.iter().any(|w| stems.iter().any(|s| w.starts_with(&crate::text::norm(s))))
+}
+
+/// "la de la izquierda", "the top one", "la de la sidebar", "the one in the header": a candidate by place. A region
+/// word names the only candidate in that region; left / right / top / bottom compare the candidates' centers (8 pt
+/// apart at least). None = no such word, or no single answer.
+pub fn spatial_choice(text: &str, cands: &[(PtRect, &str)]) -> Option<usize> {
+    let w = said_words(text);
+    for (stems, region) in REGION_WORDS {
+        let m: Vec<usize> = (0..cands.len()).filter(|&i| cands[i].1 == region).collect();
+        if says(&w, stems) && m.len() == 1 {
+            return Some(m[0]);
+        }
+    }
+    let ends: [(&[&str], fn((f64, f64)) -> f64, bool); 4] = [
+        (&["izquierd", "left"], |p| p.0, false),
+        (&["derech", "right"], |p| p.0, true),
+        (&["arriba", "top", "header", "encabezado", "superior", "above"], |p| p.1, false),
+        (&["abajo", "bottom", "inferior", "below", "under", "debajo"], |p| p.1, true),
+    ];
+    let (_, key, max) = ends.iter().find(|(stems, _, _)| says(&w, stems))?;
+    let mut v: Vec<(usize, f64)> = cands.iter().enumerate().map(|(i, c)| (i, key(center(c.0)))).collect();
+    v.sort_by(|a, b| if *max { b.1.total_cmp(&a.1) } else { a.1.total_cmp(&b.1) });
+    match v.as_slice() {
+        [a, b, ..] if (a.1 - b.1).abs() < 8.0 => None,
+        [a, ..] => Some(a.0),
+        [] => None,
+    }
+}
+
+/// Words that only place a candidate (an answer made of them is a pick, not an order).
+pub fn spatial_only(words: &[&str]) -> bool {
+    const W: [&str; 26] = [
+        "izquierd", "left", "derech", "right", "arriba", "top", "header", "encabezado", "superior", "above", "abajo", "bottom",
+        "inferior", "below", "under", "debajo", "sidebar", "lateral", "toolbar", "barra", "principal", "main", "contenido",
+        "pagina", "page", "medio",
+    ];
+    !words.is_empty() && words.iter().all(|w| W.iter().any(|s| w.starts_with(s)))
+}
+
+/// Context priors before asking (case 23), on the tied candidates: the region Pablo named in the order, his place
+/// words ("the left one"), then on a browser page the page content over the browser's own chrome unless he names
+/// the chrome (tab / pestaña / sidebar / barra). Each prior applies only when it keeps at least one candidate.
+pub fn prior(c: &[u32], els: &[El], order: &str, page: Option<PtRect>) -> Vec<u32> {
+    let el = |id: &u32| els.iter().find(|e| e.mark.id == *id);
+    let mut c: Vec<u32> = c.iter().copied().filter(|id| el(id).is_some()).collect();
+    let w = said_words(order);
+    let keep = |c: &mut Vec<u32>, f: &dyn Fn(&El) -> bool| {
+        let k: Vec<u32> = c.iter().copied().filter(|id| el(id).is_some_and(f)).collect();
+        if !k.is_empty() {
+            *c = k;
+        }
+    };
+    for (stems, region) in REGION_WORDS {
+        if says(&w, stems) {
+            keep(&mut c, &|e| e.mark.region == region);
+        }
+    }
+    if c.len() > 1 {
+        let places: Vec<(PtRect, &str)> = c.iter().filter_map(el).map(|e| (e.mark.rect, e.mark.region.as_str())).collect();
+        if let Some(i) = spatial_choice(order, &places) {
+            c = vec![c[i]];
+        }
+    }
+    if let Some(p) = page.filter(|_| c.len() > 1 && !says(&w, &CHROME_WORDS)) {
+        let inside = |r: PtRect| {
+            let (x, y) = center(r);
+            x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h
+        };
+        keep(&mut c, &|e| inside(e.mark.rect));
+    }
+    c
+}
+
+/// Case 24 + research 5: where to click `r` so the element there is the target. Probes the center, then the
+/// centers of its left and right thirds and its top and bottom halves; `hit(p)` = Some(true) the element at p is the
+/// target or inside it, Some(false) something else covers it, None no AX answer (the center then). None = every probe
+/// hit something else: do not click.
+pub fn aim_point(r: PtRect, hit: &mut dyn FnMut((f64, f64)) -> Option<bool>) -> Option<(f64, f64)> {
+    let c = center(r);
+    let probes = [c, ((r.x + r.w / 6.0).round(), c.1), ((r.x + r.w * 5.0 / 6.0).round(), c.1), (c.0, (r.y + r.h / 4.0).round()), (c.0, (r.y + r.h * 3.0 / 4.0).round())];
+    for (i, p) in probes.into_iter().enumerate() {
+        match hit(p) {
+            Some(true) => return Some(p),
+            None if i == 0 => return Some(p),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Vision lines (ocr::Line) of a capture of `win` -> marks, reading order (role "text", region by geometry).
+pub fn ocr_els(lines: &[crate::ocr::Line], win: PtRect) -> Vec<El> {
+    let mut out: Vec<El> = lines
+        .iter()
+        .filter(|l| !l.0.trim().is_empty())
+        .map(|(t, b)| {
+            let rect = crate::ocr::to_points(*b, win);
+            El { mark: Mark { id: 0, rect, name: t.trim().chars().take(60).collect(), role: "text".into(), region: ax::region_of(rect, win).into() }, state: None, h: usize::MAX, url: None, value: None }
+        })
+        .take(ax::MAX_MARKS)
+        .collect();
+    out.sort_by(|a, b| ((a.mark.rect.y / 4.0).round(), a.mark.rect.x).partial_cmp(&((b.mark.rect.y / 4.0).round(), b.mark.rect.x)).unwrap());
+    for (i, e) in out.iter_mut().enumerate() {
+        e.mark.id = i as u32 + 1;
+    }
+    out
+}
+
 /// The text of "type hello in the search field", "write 'meet in the lobby'", "busca gatos".
 /// ponytail: verb + cut at "in the / into / en el"; an LLM would read odd phrasings (quotes always work).
 
-/// Tiles of `d` (global points) that are each at most 1568 px a side at native resolution, row by row.
-pub fn tiles(d: PtRect, scale: f64) -> Vec<PtRect> {
-    let cols = (d.w * scale / IMG_MAX).ceil().max(1.0);
-    let rows = (d.h * scale / IMG_MAX).ceil().max(1.0);
-    let (w, h) = (d.w / cols, d.h / rows);
-    let mut out = vec![];
-    for r in 0..rows as usize {
-        for c in 0..cols as usize {
-            out.push(PtRect { x: d.x + c as f64 * w, y: d.y + r as f64 * h, w, h });
-        }
-    }
-    out
+/// The second box pass crops this many native px a side at least (research 6: 448-640 px; Jev's minimum is 280).
+/// ponytail: the research's pick, not measured on a real icon yet.
+pub const CROP_MIN_PX: f64 = 448.0;
+
+/// Coarse-to-fine (next-build 4): the crop for the second Jev box, around the first box `b` on an image of `img`
+/// (global points): 3x the box, never under CROP_MIN_PX native px, at most IMG_MAX px, kept inside `img`.
+pub fn refine_crop(b: Bbox, img: PtRect, scale: f64) -> PtRect {
+    let s = scale.max(1.0);
+    let side = |v: f64, max: f64| (3.0 * v).max(CROP_MIN_PX / s).min(IMG_MAX / s).min(max);
+    let (w, h) = (side((b.right - b.left) * img.w, img.w), side((b.bottom - b.top) * img.h, img.h));
+    let (cx, cy) = box_point(b, img);
+    PtRect { x: (cx - w / 2.0).clamp(img.x, img.x + img.w - w), y: (cy - h / 2.0).clamp(img.y, img.y + img.h - h), w, h }
+}
+
+/// The rect of box `b` on an image of `img` (global points).
+pub fn box_rect(b: Bbox, img: PtRect) -> PtRect {
+    PtRect { x: img.x + b.left * img.w, y: img.y + b.top * img.h, w: (b.right - b.left) * img.w, h: (b.bottom - b.top) * img.h }
 }
 
 /// Box fractions of an image that shows `img` (global points) -> the center, in global points. The pixel size of
@@ -502,21 +687,18 @@ pub fn marks_request(instr: &str, app: &str, els: &[El], image: Option<&Value>) 
     (Value::Array(state), q)
 }
 
-/// Box fallback: the tiles in `state` by name, a tile choice, one box and one visible noul per tile.
-pub fn box_request(instr: &str, app: &str, imgs: &[Value]) -> (Value, Value) {
-    let mut state = Map::new();
-    state.insert("app".into(), json!(app));
-    let mut tile_c = Map::new();
-    let mut q = json!({ "risky": risky_q(instr) });
-    for (i, img) in imgs.iter().enumerate() {
-        let t = format!("tile_{i}");
-        state.insert(t.clone(), img.clone());
-        tile_c.insert(t.clone(), json!(format!("`{t}`, part {} of the screen (row by row)", i + 1)));
-        q[format!("box_{i}")] = json!({ "type": "box", "instructions": format!("The element to click to do this: \"{instr}\", in `{t}`.") });
-        q[format!("visible_{i}")] = json!({ "type": "noul", "instructions": format!("Is the element to click for \"{instr}\" visible in `{t}`?") });
+/// One Jev box pass on one image (`screen`): the box, the "is it visible" gate, and risky on the first pass.
+pub fn box_request(instr: &str, app: &str, img: &Value, first: bool) -> (Value, Value) {
+    let what = if first { "the frontmost app's window" } else { "a zoomed part of the frontmost app's window" };
+    let state = json!({ "app": app, "about": format!("`screen` is {what}."), "screen": img });
+    let mut q = json!({
+        "box": { "type": "box", "instructions": format!("The element to click to do this: \"{instr}\", in `screen`.") },
+        "visible": { "type": "noul", "instructions": format!("Is the element to click for \"{instr}\" visible in `screen`?") },
+    });
+    if first {
+        q["risky"] = risky_q(instr);
     }
-    q["tile"] = json!({ "type": "choice", "instructions": format!("Which tile shows the element to click to do this: \"{instr}\"?"), "criteria": tile_c });
-    (Value::Object(state), q)
+    (state, q)
 }
 
 /// The answers of one grounding.
@@ -616,6 +798,8 @@ pub enum Act {
     Burst(u16, u64, u32),
     Scroll { down: bool, at: Option<Target> },
     OpenApp(String),
+    /// A real CGEvent click at the target (hit-tested): the retry when a click changed nothing (vc-feedback 21).
+    RealClick(Target),
 }
 
 const DELETE: u16 = 51;
@@ -631,6 +815,11 @@ pub struct Screen {
     pub display: PtRect,
     pub scale: f64,
     pub els: Vec<El>,
+    /// The front window (global points). Zero = unknown (the display stands in).
+    pub window: PtRect,
+    pub kind: Kind,
+    /// The web page inside a browser window (ax::web_area): the case-23 page prior.
+    pub page: Option<PtRect>,
 }
 
 /// The executor's side effects. Real: `mac::Real` (AX, CGEvent, screencapture). Tests: a fake desk.
@@ -670,6 +859,15 @@ pub trait Desk {
     /// The installed app names (open_app matches the spoken name against them). Empty = open the name as said.
     fn apps(&mut self) -> Vec<String> {
         vec![]
+    }
+    /// What the screen shows, hashed (focused element, window title, URL, AX tree): equal before and after a click =
+    /// nothing changed. None = cannot tell (no verify).
+    fn sig(&mut self) -> Option<u64> {
+        None
+    }
+    /// Vision text lines of `r` (global points). Empty = none or no OCR.
+    fn ocr(&mut self, _r: PtRect) -> anyhow::Result<Vec<crate::ocr::Line>> {
+        Ok(vec![])
     }
 }
 
@@ -797,6 +995,8 @@ struct Run {
     choose: bool,
     /// The words of the order (Action::said).
     said: String,
+    /// The front app's kind, from the last screen read.
+    kind: Kind,
 }
 
 impl Run {
@@ -856,6 +1056,7 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
         Err(e) if e == "accessibility" => return Err(r.fail(desk, CmdStatus::Setup, "accessibility")),
         Err(e) => return Err(r.fail(desk, CmdStatus::Unsure, &e)),
     };
+    r.kind = scr.kind;
     // the marks Pablo read a number from, before this read replaces them on screen
     let board = desk.board();
     r.st.display = scr.display;
@@ -880,7 +1081,7 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
     let words = split_mark(words).1;
     let instr = format!("{verb} {words}");
     if scr.els.len() < MIN_AX {
-        return box_ground(r, &instr, &scr, ask, desk);
+        return ocr_ground(r, &instr, words, &scr, ask, desk);
     }
     if pick_mode {
         let instr = if r.said.trim().is_empty() { instr } else { format!("{instr} (the user said: \"{}\")", r.said.trim()) };
@@ -906,30 +1107,29 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
     if d.need_screen && conf < CONF_MIN {
         return Err(r.fail(desk, CmdStatus::Setup, "screen_recording"));
     }
-    let mut id = d.target.choice.parse::<u32>().ok();
-    match gate(conf, 0.0, false) {
-        Gate::Unsure => return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
-        Gate::Pick => {
-            r.st.choices = d.target.ranked.iter().filter_map(|(k, p)| k.parse::<u32>().ok().map(|k| (k, *p))).take(3).collect();
-            r.st.status = CmdStatus::Pick;
-            let names: Vec<String> = r.st.choices.iter().filter_map(|(id, _)| scr.els.iter().find(|e| e.mark.id == *id).map(|e| format!("{id} {}", e.mark.name))).collect();
-            r.st.message = Some(format!("Which one? {}", names.join(" · ")));
-            desk.emit(&r.st);
-            let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
-            id = match desk.wait(Wait::Pick, PICK_TIMEOUT) {
-                Answer::Text(t) => match parse_pick(&t, &r.st.choices, &ids).or_else(|| pick_by_name(&t, &pick_options(r.st.message.as_deref().unwrap_or("")))) {
-                    Some(id) => Some(id),
-                    None => return Err(r.fail(desk, CmdStatus::Unsure, "Didn't catch a number. Say it again.")),
-                },
-                _ => return Err(r.end(desk, CmdStatus::Stopped, None, String::new())),
-            };
-            r.st.choices.clear();
-            r.st.message = None;
-        }
-        _ => {}
+    if gate(conf, 0.0, false) == Gate::Unsure {
+        return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE));
     }
-    let Some(e) = id.and_then(|id| scr.els.iter().find(|e| e.mark.id == id)) else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
-    Ok(Hit::of(e, d.risky))
+    // Auto (case 23): #1 unless #1 and #2 truly tie and the context priors cannot break the tie; then only the 2-3
+    // tied candidates get boxes and Pablo answers by number, place or name (case 22).
+    let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
+    let mut ranked = choices(&d.target.ranked, &ids, None);
+    if ranked.is_empty() {
+        // no probabilities in the answer: the choice alone
+        ranked.extend(d.target.choice.parse::<u32>().ok().filter(|id| ids.contains(id)).map(|id| (id, conf)));
+    }
+    let c = tied(&ranked);
+    let order = format!("{words} {}", r.said);
+    let keep = prior(&c.iter().map(|x| x.0).collect::<Vec<_>>(), &scr.els, &order, scr.page);
+    let el = |id: u32| scr.els.iter().find(|e| e.mark.id == id);
+    match keep.as_slice() {
+        [one] => el(*one).map(|e| Hit::of(e, d.risky)).ok_or_else(|| r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
+        [] => Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
+        many => {
+            let c: Vec<(u32, f32)> = c.into_iter().filter(|x| many.contains(&x.0)).collect();
+            ask_pick(r, c, &scr, d.risky, desk)
+        }
+    }
 }
 
 /// Choices shown in pick mode.
@@ -1003,7 +1203,17 @@ fn choose(r: &mut Run, instr: &str, scr: &Screen, local: Option<u32>, ask: &mut 
         flash(r, desk, &h);
         return Ok(h);
     }
+    ask_pick(r, c, scr, d.risky, desk)
+}
+
+/// The numbered choices on screen (boxes on the candidates only, labeled 1.. + region) -> Pablo answers by voice:
+/// "dos", "the second", the name, "41", "la de la izquierda", "the top one", "la de la sidebar"; or "sí" / the command
+/// key for #1, or clicks one himself. A new order drops it (live.rs).
+fn ask_pick(r: &mut Run, c: Vec<(u32, f32)>, scr: &Screen, risky: f32, desk: &mut dyn Desk) -> Result<Hit, End> {
+    let el = |id: u32| scr.els.iter().find(|e| e.mark.id == id);
+    let ids: Vec<u32> = scr.els.iter().map(|e| e.mark.id).collect();
     let names: Vec<String> = c.iter().map(|(id, _)| el(*id).map(|e| e.mark.name.clone()).unwrap_or_default()).collect();
+    let places: Vec<(PtRect, &str)> = c.iter().filter_map(|(id, _)| el(*id).map(|e| (e.mark.rect, e.mark.region.as_str()))).collect();
     let list = names.iter().enumerate().map(|(i, n)| format!("{} {}", i + 1, if n.is_empty() { "(no name)" } else { n })).collect::<Vec<_>>().join(" · ");
     (r.st.choices, r.st.choose, r.st.preselect, r.st.status) = (c.clone(), true, false, CmdStatus::Pick);
     r.st.target = None;
@@ -1013,7 +1223,7 @@ fn choose(r: &mut Run, instr: &str, scr: &Screen, local: Option<u32>, ask: &mut 
     let got = loop {
         let left = until.saturating_duration_since(std::time::Instant::now());
         match desk.wait(Wait::Pick, left) {
-            Answer::Text(t) => match parse_choice(&t, &names, &ids) {
+            Answer::Text(t) => match parse_choice(&t, &names, &ids).or_else(|| spatial_choice(&t, &places).map(Picked::Nth)) {
                 Some(Picked::Nth(i)) => break (c[i].0, false),
                 Some(Picked::Mark(n)) => break (n, false),
                 // not an answer: the list stays up, the time keeps running
@@ -1028,48 +1238,89 @@ fn choose(r: &mut Run, instr: &str, scr: &Screen, local: Option<u32>, ask: &mut 
     };
     (r.st.choices, r.st.choose, r.st.preselect, r.st.message) = (vec![], false, false, None);
     let Some(e) = el(got.0) else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
-    Ok(Hit { picked: true, by_user: got.1, ..Hit::of(e, d.risky) })
+    Ok(Hit { picked: true, by_user: got.1, ..Hit::of(e, risky) })
 }
 
-/// The box fallback (an app with < 5 AX elements): full-resolution tiles, Jev box per tile, the visible noul.
+/// Thin tree (canvas, games, custom UIs; next-build 4 and 6): the Vision text lines of the window become marks ->
+/// the exact name, else Jev's text-only choice over them -> the line's center. No text fits (an icon): the Jev box.
+fn ocr_ground(r: &mut Run, instr: &str, words: &str, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
+    if !desk.screen_ok() {
+        return Err(r.fail(desk, CmdStatus::Setup, "screen_recording"));
+    }
+    let win = if scr.window.w > 0.0 { scr.window } else { scr.display };
+    let lines = desk.ocr(win).unwrap_or_else(|e| {
+        log::warn!("ocr: {e:#}");
+        vec![]
+    });
+    let els = ocr_els(&lines, win);
+    if els.is_empty() {
+        return box_ground(r, instr, scr, ask, desk);
+    }
+    r.st.marks = els.iter().map(|e| e.mark.clone()).collect();
+    desk.emit(&r.st);
+    let found = match local_match(words, &els) {
+        Some(e) => Some((e, if risky_name(&e.mark.name) { 1.0 } else { 0.0 })),
+        None => {
+            let d = decide(instr, &scr.app, &els, ask, &mut || None).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+            (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + d.latency_ms, r.st.cost_usd + d.cost);
+            let id = d.target.choice.parse::<u32>().ok().filter(|_| d.target.confidence >= UNSURE_MIN);
+            id.and_then(|id| els.iter().find(|e| e.mark.id == id)).map(|e| (e, d.risky))
+        }
+    };
+    if desk.aborted() {
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
+    }
+    match found {
+        Some((e, risky)) => {
+            let (x, y) = center(e.mark.rect);
+            Ok(Hit { target: Target::Point(x, y), mark: e.mark.clone(), url: None, value: None, risky, picked: false, by_user: false })
+        }
+        None => box_ground(r, instr, scr, ask, desk),
+    }
+}
+
+/// The last resort (no AX, no text): Jev box coarse-to-fine. Box on the window (at most 1568 px a side), then on a
+/// native-resolution crop around that box (`refine_crop`), mapped back. Each pass has the "is it visible" gate;
+/// a failed second pass keeps the first box.
 fn box_ground(r: &mut Run, instr: &str, scr: &Screen, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
     if !desk.screen_ok() {
         return Err(r.fail(desk, CmdStatus::Setup, "screen_recording"));
     }
-    let ts = tiles(scr.display, scr.scale.max(1.0));
-    let mut imgs = vec![];
-    for t in &ts {
-        match desk.capture(*t, true) {
-            Ok(b) => imgs.push(jev::image(&b, "image/jpeg")),
-            Err(e) => return Err(r.fail(desk, CmdStatus::Error, &format!("screenshot: {e:#}"))),
-        }
-    }
-    let (s, q) = box_request(instr, &scr.app, &imgs);
-    let rep = ask(&s, &q).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
-    (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + rep.latency_ms, r.st.cost_usd + rep.cost);
+    let win = if scr.window.w > 0.0 { scr.window } else { scr.display };
+    // never click on a weak or broken box
+    let Some((b1, risky)) = box_pass(r, instr, &scr.app, win, true, ask, desk)? else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
     if desk.aborted() {
         return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
     }
-    let a = &rep.answers;
-    let risky = jev::noul(a, "risky").unwrap_or(1.0);
-    // The tile, its box, and the visible gate: never click on a weak or broken box.
-    let found = (|| {
-        let i: usize = jev::choice(a, "tile")?.choice.strip_prefix("tile_")?.parse().ok()?;
-        let b = jev::bbox(a, &format!("box_{i}")).filter(|b| sane(*b))?;
-        (jev::noul(a, &format!("visible_{i}")).unwrap_or(0.0) >= VISIBLE_MIN).then_some(())?;
-        Some((b, *ts.get(i)?))
-    })();
-    let Some((b, tile)) = found else { return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)) };
-    let p = box_point(b, tile);
-    let rect = PtRect { x: tile.x + b.left * tile.w, y: tile.y + b.top * tile.h, w: (b.right - b.left) * tile.w, h: (b.bottom - b.top) * tile.h };
+    let crop = refine_crop(b1, win, scr.scale);
+    let rect = match box_pass(r, instr, &scr.app, crop, false, ask, desk)? {
+        Some((b2, _)) => box_rect(b2, crop),
+        None => box_rect(b1, win),
+    };
+    if desk.aborted() {
+        return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
+    }
+    let p = center(rect);
     Ok(match snap(p, &scr.els) {
         Some(e) => Hit::of(e, risky),
         None => {
             let mark = Mark { id: 1, rect, name: String::new(), role: "box".into(), region: "screen".into() };
             r.st.marks = vec![mark.clone()];
-            Hit { target: Target::Point(p.0.round(), p.1.round()), mark, url: None, value: None, risky, picked: false, by_user: false }
+            Hit { target: Target::Point(p.0, p.1), mark, url: None, value: None, risky, picked: false, by_user: false }
         }
     })
+}
+
+/// One box pass on `img`: the first on the whole window (downscaled, with risky), the second on a crop at native
+/// resolution. None = no sane, visible box.
+fn box_pass(r: &mut Run, instr: &str, app: &str, img: PtRect, first: bool, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Option<(Bbox, f32)>, End> {
+    let b = desk.capture(img, !first).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("screenshot: {e:#}")))?;
+    let (s, q) = box_request(instr, app, &jev::image(&b, "image/jpeg"), first);
+    let rep = ask(&s, &q).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
+    (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + rep.latency_ms, r.st.cost_usd + rep.cost);
+    let a = &rep.answers;
+    let visible = jev::noul(a, "visible").unwrap_or(0.0) >= VISIBLE_MIN;
+    Ok(jev::bbox(a, "box").filter(|b| sane(*b) && visible).map(|b| (b, jev::noul(a, "risky").unwrap_or(1.0))))
 }
 
 /// Shows the target (marks window brackets) right before the event.
@@ -1101,7 +1352,7 @@ fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) ->
 /// Runs one planner action. `step` numbers the action in the session, `order` the planner reply it came from.
 pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
     let st = CommandStep { instruction: crate::planner::label(a), step, max: 0, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
-    let mut r = Run { st, choose: cfg.choose, said: a.said.clone() };
+    let mut r = Run { st, choose: cfg.choose, said: a.said.clone(), kind: Kind::Native };
     if desk.aborted() {
         return r.end(desk, CmdStatus::Stopped, None, String::new());
     }
@@ -1123,7 +1374,7 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             }
             // Return sends in chat and mail apps, whatever the planner says; elsewhere it runs at once.
             let f = desk.focused();
-            let enter = (code == 36 || code == 76) && return_asks(&f);
+            let enter = (code == 36 || code == 76) && return_asks(&f) && !after_palette(mem, &f);
             if enter || (a.risky && cfg.confirm_risky) {
                 let (q, what) = if enter { ("Press Return? Say yes · F11 · Esc", "Return not pressed") } else { ("Do it? Say yes · F11 · Esc", "not done") };
                 if let Err(end) = r.confirm(desk, q, what) {
@@ -1201,11 +1452,24 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
                 return r.end(desk, CmdStatus::Stopped, None, String::new());
             }
             let f = desk.focused();
+            // Verify (vc-feedback 21): the screen must change. No change -> one real click at the hit-tested leaf
+            // (unless the first click was real), still no change -> say so, and the planner reads it as failed.
+            let before = desk.sig();
             if let Err(e) = desk.act(&Act::Click(h.target.clone())) {
                 return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
             }
-            remember(mem, MemKind::Clicked, &h.mark.name, &f, None);
             desk.sleep(SETTLE_MS);
+            if before.is_some() && desk.sig() == before {
+                log::info!("click on {} changed nothing: a real click", h.mark.name);
+                if let Err(e) = desk.act(&Act::RealClick(h.target.clone())) {
+                    return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
+                }
+                desk.sleep(SETTLE_MS);
+                if desk.sig() == before {
+                    return r.fail(desk, CmdStatus::Unsure, &format!("Clicked {} but nothing changed", quote(&h.mark.name)));
+                }
+            }
+            remember(mem, MemKind::Clicked, &h.mark.name, &f, None);
             r.done(desk, format!("clicked {} ({})", quote(&h.mark.name), h.mark.role))
         }
         "open_app" => {
@@ -1588,11 +1852,18 @@ pub mod mac {
         focus: Option<CFType>,
         /// The live session this desk belongs to.
         generation: u64,
+        /// The marks came from a browser page (web.rs): `El::h` is a DOM id, acts go through its JS.
+        web: Option<crate::web::Page>,
+        /// Where the last web act found its element (screen points, after its scroll into view): a real click goes there.
+        web_at: Option<(f64, f64)>,
+        /// The front app's kind and pid (last read).
+        kind: Kind,
+        pid: i32,
     }
 
     impl Real {
         pub fn new(app: AppHandle) -> Self {
-            Self { app, handles: vec![], els: vec![], focus: None, generation: GEN.load(Ordering::SeqCst) }
+            Self { app, handles: vec![], els: vec![], focus: None, generation: GEN.load(Ordering::SeqCst), web: None, web_at: None, kind: Kind::Native, pid: 0 }
         }
 
         fn point(&self, t: &Target) -> Option<(f64, f64)> {
@@ -1604,9 +1875,55 @@ pub mod mac {
 
         fn handle(&self, t: &Target) -> Option<&CFType> {
             let Target::Mark(id) = t else { return None };
+            if self.web.is_some() {
+                return None;
+            }
             self.els.iter().find(|e| e.mark.id == *id).and_then(|e| self.handles.get(e.h))
         }
+
+        /// A real click on the target (research 5): hit-test the point first so the click lands on the target or
+        /// inside it, never on what covers it. susurro's own marks window can answer the hit-test: it hides, and
+        /// the test runs again.
+        fn real_click(&self, t: &Target) -> anyhow::Result<()> {
+            let (rect, name, target) = match t {
+                Target::Point(x, y) => (PtRect { x: *x, y: *y, w: 0.0, h: 0.0 }, String::new(), None),
+                Target::Mark(id) => {
+                    let e = self.els.iter().find(|e| e.mark.id == *id).ok_or_else(|| anyhow::anyhow!("the element is gone"))?;
+                    // a web element may have scrolled into view: its fresh rect, else the scanned one
+                    let rect = match self.web_at.filter(|_| self.web.is_some()) {
+                        Some((x, y)) => PtRect { x, y, w: 0.0, h: 0.0 },
+                        None => e.mark.rect,
+                    };
+                    (rect, e.mark.name.clone(), self.handle(t))
+                }
+            };
+            let own = std::process::id() as i32;
+            let mut hid = false;
+            let mut hit = |p: (f64, f64)| {
+                let mut got = ax::mac::element_at(p);
+                if got.as_ref().is_some_and(|g| g.1 == own) && !hid {
+                    crate::platform::macos::show_marks(&self.app, None);
+                    std::thread::sleep(Duration::from_millis(60));
+                    hid = true;
+                    got = ax::mac::element_at(p);
+                }
+                match got {
+                    // susurro's pill is there (the marks window hid already): covered, never a click on our own window
+                    Some((_, pid)) if pid == own => Some(false),
+                    Some((el, pid)) if pid == self.pid => Some(target.is_none_or(|t| ax::mac::within(&el, t))),
+                    // no AX handle (web, OCR, box): any element of another app is fine
+                    Some(_) if target.is_none() => Some(true),
+                    Some(_) => Some(false),
+                    None => None,
+                }
+            };
+            let p = aim_point(rect, &mut hit).ok_or_else(|| anyhow::anyhow!("something covers {}", quote(&name)))?;
+            click_at(p)
+        }
     }
+
+    /// A real click went out since the last `act` began (click_at sets it; web.rs's JS fallback clicks through it too).
+    static REAL_CLICKED: AtomicBool = AtomicBool::new(false);
 
     pub fn displays() -> Vec<(PtRect, f64)> {
         CGDisplay::active_displays()
@@ -1622,6 +1939,7 @@ pub mod mac {
     }
 
     fn click_at(p: (f64, f64)) -> anyhow::Result<()> {
+        REAL_CLICKED.store(true, Ordering::SeqCst);
         let src = || CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| anyhow::anyhow!("no event source"));
         let pt = CGPoint::new(p.0, p.1);
         for (ty, click) in [(CGEventType::MouseMoved, false), (CGEventType::LeftMouseDown, true), (CGEventType::LeftMouseUp, true)] {
@@ -1649,6 +1967,71 @@ pub mod mac {
         Ok(())
     }
 
+    impl Real {
+        /// A browser in front: the page's DOM marks through Apple Events JS. None = not a browser, the setting is
+        /// off (the one-time guide shows), or the page has nothing to act on: the AX tree reads it instead.
+        fn read_web(&mut self, front: &crate::paste::AppRef) -> Option<Screen> {
+            use crate::web;
+            let bundle = front.bundle_id.clone()?;
+            let kind = web::kind(&bundle)?;
+            let name = front.name.clone().unwrap_or_default();
+            let allowed = web::js_allowed(&bundle);
+            if allowed == Some(false) {
+                web::guide(&self.app, &bundle, &name, &web::Error::Off);
+                return None;
+            }
+            let scan = match web::call(kind, &bundle, &serde_json::json!({ "op": "scan" })).and_then(|v| web::parse(v).map_err(web::Error::Other)) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::info!("web scan in {name}: {e:?}, AX instead");
+                    // the prefs say on: a failure is something else (no window, a closing tab), never the "turn it on" guide
+                    if e == web::Error::Denied || (e == web::Error::Off && allowed != Some(true)) {
+                        web::guide(&self.app, &bundle, &name, &e);
+                    }
+                    return None;
+                }
+            };
+            if scan.els.is_empty() || scan.frames > 0 {
+                return None;
+            }
+            let guess = web::guess_viewport(&scan);
+            let viewport = ax::mac::web_area_at(front.pid, center(guess)).unwrap_or(guess);
+            let els = web::els(&scan, viewport);
+            let (display, scale) = display_for(center(viewport), &displays()).unwrap_or((viewport, 1.0));
+            log::info!("web marks in {name}: {} ({})", els.len(), scan.url);
+            self.handles.clear();
+            self.els = els.clone();
+            self.web = Some(web::Page { kind, bundle, scan, viewport });
+            (self.web_at, self.kind, self.pid) = (None, Kind::Browser, front.pid);
+            Some(Screen { app: name, display, scale, els, kind: Kind::Browser, ..Default::default() })
+        }
+
+        /// Click / focus a DOM mark through its JS. None = not a web mark (the AX path acts). The click verify is
+        /// exec's, on the page signature (`sig`); a real click goes to `web_at`.
+        fn act_web(&mut self, a: &Act) -> Option<anyhow::Result<()>> {
+            let (op, t) = match a {
+                Act::Click(t) => ("click", t),
+                Act::Focus(t) => ("focus", t),
+                _ => return None,
+            };
+            let page = self.web.as_ref()?;
+            let Target::Mark(id) = t else { return None };
+            let e = self.els.iter().find(|e| e.mark.id == *id)?;
+            let (dom, name, rect) = (e.h, e.mark.name.clone(), e.mark.rect);
+            Some(match page.act(op, dom, &name) {
+                Ok((at, keys)) => {
+                    self.web_at = at;
+                    // the address bar kept the keys: a real click puts them in the field (typing follows)
+                    if op == "focus" && !keys { click_at(at.unwrap_or_else(|| center(rect))) } else { Ok(()) }
+                }
+                // the page navigated away under the script: the click went out, exec's verify reads the new page
+                Err(crate::web::Error::Timeout) if op == "click" => Ok(()),
+                Err(crate::web::Error::Other(g)) if g == "gone" => Err(anyhow::anyhow!("{} changed on the page; say it again", quote(&name))),
+                Err(e) => Err(anyhow::anyhow!("web {op}: {e:?}")),
+            })
+        }
+    }
+
     impl Desk for Real {
         fn learn_word(&mut self, word: &str, heard: &str) -> Result<(), String> {
             crate::learn::add_correction(&self.app, word, heard)
@@ -1670,12 +2053,17 @@ pub mod mac {
                 return Err("accessibility".into());
             }
             let front = crate::paste::target_app().ok_or("No app in front")?;
+            self.web = None;
+            if let Some(scr) = self.read_web(&front) {
+                return Ok(scr);
+            }
             let tree = ax::mac::read(front.pid).ok_or_else(|| format!("{} has no window to act on", front.name.clone().unwrap_or_default()))?;
             let els = ax::collect(&tree.root, tree.window);
             let (display, scale) = display_for(center(tree.window), &displays()).unwrap_or((tree.window, 1.0));
-            self.handles = tree.handles;
-            self.els = els.clone();
-            Ok(Screen { app: front.name.unwrap_or_default(), display, scale, els })
+            let app = front.name.unwrap_or_default();
+            let kind = app_kind(&app, front.bundle_id.as_deref().unwrap_or(""));
+            (self.handles, self.els, self.kind, self.pid) = (tree.handles, els.clone(), kind, front.pid);
+            Ok(Screen { app, display, scale, els, window: tree.window, kind, page: ax::web_area(&tree.root) })
         }
 
         fn focused(&mut self) -> Field {
@@ -1734,12 +2122,30 @@ pub mod mac {
                 anyhow::bail!("test guard: {why}");
             }
             crate::live::own_input();
+            let was_real = REAL_CLICKED.swap(false, Ordering::SeqCst);
+            if let Act::RealClick(t) = a {
+                // the click that changed nothing was a real one already: never the same click twice
+                return if was_real { Ok(()) } else { self.real_click(t) };
+            }
+            if let Some(r) = self.act_web(a) {
+                return r;
+            }
             match a {
                 Act::Click(t) => {
-                    if !self.handle(t).is_some_and(ax::mac::press) {
-                        click_at(self.point(t).ok_or_else(|| anyhow::anyhow!("the element is gone"))?)?;
+                    let role = match t {
+                        Target::Mark(id) => self.els.iter().find(|e| e.mark.id == *id).map(|e| e.mark.role.as_str()).unwrap_or(""),
+                        Target::Point(..) => "",
+                    };
+                    match self.handle(t) {
+                        Some(h) if !real_click_first(self.kind, role) => match ax::mac::press_code(h) {
+                            // CannotComplete can still mean pressed: the verify step decides (research 5)
+                            0 | ax::mac::CANNOT_COMPLETE => {}
+                            _ => self.real_click(t)?,
+                        },
+                        _ => self.real_click(t)?,
                     }
                 }
+                Act::RealClick(_) => unreachable!("handled above"),
                 Act::Focus(t) => {
                     if !self.handle(t).is_some_and(ax::mac::focus) {
                         click_at(self.point(t).ok_or_else(|| anyhow::anyhow!("the element is gone"))?)?;
@@ -1765,6 +2171,41 @@ pub mod mac {
 
         fn secure_input(&mut self) -> bool {
             unsafe { IsSecureEventInputEnabled() != 0 }
+        }
+
+        /// One more AX read of the front window + the focused element (title, value size, URL), hashed.
+        /// ponytail: a full tree read per click (the cost is not measured); an AXObserver would be cheaper.
+        fn sig(&mut self) -> Option<u64> {
+            use std::hash::{Hash, Hasher};
+            if let Some(p) = &self.web {
+                // + the front app: a link that opened another app (a Slack deep link) changed the screen too
+                let front = crate::paste::target_app().map(|f| f.pid);
+                return p.sig().map(|s| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (s, front).hash(&mut h);
+                    h.finish()
+                });
+            }
+            let front = crate::paste::target_app()?;
+            let tree = ax::mac::read(front.pid)?;
+            let f = ax::mac::focused().map(|(f, _)| (f.role, f.name, f.value.map(|v| v.len()), f.url, f.sel));
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (front.pid, ax::tree_hash(&tree.root), f).hash(&mut h);
+            Some(h.finish())
+        }
+
+        fn ocr(&mut self, r: PtRect) -> anyhow::Result<Vec<crate::ocr::Line>> {
+            let img = self.capture(r, true)?;
+            let t = std::time::Instant::now();
+            let mut lines = crate::ocr::recognize(&img)?;
+            if let Some(pill) = crate::platform::macos::pill_rect() {
+                lines.retain(|l| {
+                    let (x, y) = center(crate::ocr::to_points(l.1, r));
+                    !(x >= pill.x && x <= pill.x + pill.w && y >= pill.y && y <= pill.y + pill.h)
+                });
+            }
+            log::info!("ocr: {} lines in {} ms", lines.len(), t.elapsed().as_millis());
+            Ok(lines)
         }
 
         fn secure_at(&mut self, p: (f64, f64)) -> bool {
@@ -1841,15 +2282,6 @@ mod tests {
 
     #[test]
     fn pick_answers() {
-        let choices = [(20, 0.56), (19, 0.31), (18, 0.08)];
-        let ids: Vec<u32> = (1..=43).collect();
-        assert_eq!(parse_pick("19", &choices, &ids), Some(19));
-        assert_eq!(parse_pick("Number 20.", &choices, &ids), Some(20));
-        assert_eq!(parse_pick("twenty", &choices, &ids), Some(20));
-        assert_eq!(parse_pick("the second one", &choices, &ids), Some(19), "an ordinal is a place in the list, not 'one'");
-        assert_eq!(parse_pick("el tercero", &choices, &ids), Some(18));
-        assert_eq!(parse_pick("dos", &choices, &ids), Some(2));
-        assert_eq!(parse_pick("99", &choices, &ids), None, "not a mark");
         // names of the shown options (open risk c)
         let q = "Which one? 4 #general · 7 #design · 9 #random-stuff";
         let opts = pick_options(q);
@@ -1862,33 +2294,46 @@ mod tests {
         assert!(!looks_like_pick("20", q), "20 is not shown: a new order (a mark number goes to the planner)");
         assert!(!looks_like_pick("open slack and search for design reviews", q), "a full order");
         assert!(!looks_like_pick("type hello", q));
-        assert_eq!(parse_pick("never mind", &choices, &ids), None);
     }
 
     const RETINA: PtRect = PtRect { x: 0.0, y: 0.0, w: 1512.0, h: 982.0 };
 
     #[test]
-    fn tiles_and_box_points() {
-        // Retina 1512x982 pt @2 = 3024x1964 px -> 2x2 tiles of 756x491 pt (1512x982 px, under 1568)
-        let t = tiles(RETINA, 2.0);
-        assert_eq!(t.len(), 4);
-        assert_eq!(t[3], PtRect { x: 756.0, y: 491.0, w: 756.0, h: 491.0 });
+    fn coarse_to_fine_box_math() {
         let mid = Bbox { top: 0.5, bottom: 0.5, left: 0.5, right: 0.5 };
-        assert_eq!(box_point(mid, t[3]), (1134.0, 736.5));
         assert_eq!(box_point(mid, RETINA), (756.0, 491.0), "full display, any image size");
-        // non-Retina 1920x1080 left of the main display: 2x1 tiles, negative x
+        // non-Retina display left of the main one: negative x; a display above: negative y
         let left = PtRect { x: -1920.0, y: 0.0, w: 1920.0, h: 1080.0 };
-        let t = tiles(left, 1.0);
-        assert_eq!(t.len(), 2);
-        let p = box_point(Bbox { top: 0.1, bottom: 0.2, left: 0.1, right: 0.2 }, t[0]);
-        assert!(p.0 < 0.0 && (p.0 - (-1920.0 + 0.15 * 960.0)).abs() < 1e-9, "{p:?}");
-        // a display above the main one: negative y
-        let above = PtRect { x: 0.0, y: -1080.0, w: 1920.0, h: 1080.0 };
-        assert!(box_point(mid, above).1 < 0.0);
-        // the research ultrawide 5092x2132 px @1: every tile <= 1568 px and >= 280 px a side
-        for t in tiles(PtRect { x: 0.0, y: 0.0, w: 5092.0, h: 2132.0 }, 1.0) {
-            assert!(t.w <= 1568.0 && t.h <= 1568.0 && t.w >= 280.0 && t.h >= 280.0, "{t:?}");
-        }
+        let p = box_point(Bbox { top: 0.1, bottom: 0.2, left: 0.1, right: 0.2 }, left);
+        assert!(p.0 < 0.0 && (p.0 - (-1920.0 + 0.15 * 1920.0)).abs() < 1e-9, "{p:?}");
+        assert!(box_point(mid, PtRect { x: 0.0, y: -1080.0, w: 1920.0, h: 1080.0 }).1 < 0.0);
+        // the crop: a 20 pt icon on a Retina window -> 448 px native (224 pt) a side, centered on the box
+        let win = PtRect { x: 100.0, y: 50.0, w: 1200.0, h: 800.0 };
+        let icon = Bbox { top: 0.5, bottom: 0.525, left: 0.5, right: 0.5 + 20.0 / 1200.0 };
+        let c = refine_crop(icon, win, 2.0);
+        assert!((c.w - 224.0).abs() < 1e-9 && (c.h - 224.0).abs() < 1e-9, "{c:?}");
+        let (cx, cy) = box_point(icon, win);
+        assert!((c.x + c.w / 2.0 - cx).abs() < 1e-9 && (c.y + c.h / 2.0 - cy).abs() < 1e-9);
+        // a big box: 3x, at most 1568 px native; near the corner: kept inside the window
+        let big = refine_crop(Bbox { top: 0.0, bottom: 0.4, left: 0.0, right: 0.4 }, win, 2.0);
+        assert!(big.w <= 784.0 && big.x >= win.x && big.y >= win.y, "{big:?}");
+        let corner = refine_crop(Bbox { top: 0.97, bottom: 0.99, left: 0.97, right: 0.99 }, win, 1.0);
+        assert!(corner.x + corner.w <= win.x + win.w + 1e-9 && corner.y + corner.h <= win.y + win.h + 1e-9, "{corner:?}");
+        // the round trip with Jev's two-decimal edges (research 6): a target at (731.3, 467.7) on the window.
+        // pass 1 alone misses by up to 0.005 x 1200 pt; pass 2 inside the 224 pt crop by up to 0.005 x 224 pt.
+        let truth = (731.3, 467.7);
+        let r2 = |v: f64| (v * 100.0).round() / 100.0;
+        let edges = |img: PtRect| {
+            let (fx, fy) = ((truth.0 - img.x) / img.w, (truth.1 - img.y) / img.h);
+            Bbox { top: r2(fy - 0.004), bottom: r2(fy + 0.004), left: r2(fx - 0.004), right: r2(fx + 0.004) }
+        };
+        let b1 = edges(win);
+        let crop = refine_crop(b1, win, 2.0);
+        let p2 = box_point(edges(crop), crop);
+        let err = |p: (f64, f64)| ((p.0 - truth.0).powi(2) + (p.1 - truth.1).powi(2)).sqrt();
+        assert!(err(p2) < 2.0, "fine {:.2} pt", err(p2));
+        assert!(err(p2) < err(box_point(b1, win)), "the second pass is closer");
+        assert_eq!(box_rect(Bbox { top: 0.25, bottom: 0.5, left: 0.5, right: 0.75 }, win), PtRect { x: 700.0, y: 250.0, w: 300.0, h: 200.0 });
     }
 
     #[test]
@@ -1986,6 +2431,10 @@ mod tests {
         abort_after_acts: Option<usize>,
         installed: Vec<String>,
         board: Vec<El>,
+        /// The screen signatures `sig` returns, in order (empty = no verify).
+        sigs: VecDeque<u64>,
+        /// What OCR reads.
+        lines: Vec<crate::ocr::Line>,
     }
 
     impl FakeDesk {
@@ -2133,6 +2582,12 @@ mod tests {
         fn board(&mut self) -> Vec<El> {
             self.board.clone()
         }
+        fn sig(&mut self) -> Option<u64> {
+            self.sigs.pop_front()
+        }
+        fn ocr(&mut self, _: PtRect) -> anyhow::Result<Vec<crate::ocr::Line>> {
+            Ok(self.lines.clone())
+        }
     }
 
     fn mk(id: u32, name: &str, role: &str, region: &str, url: Option<&str>, value: Option<&str>) -> El {
@@ -2155,7 +2610,7 @@ mod tests {
             mk(8, "Share", "button", "main", None, None),
             mk(9, "Send", "button", "bottom", None, None),
         ];
-        Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els }
+        Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els, ..Default::default() }
     }
 
     fn chrome_desk() -> FakeDesk {
@@ -2719,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn words_off_screen_go_to_jev_and_a_weak_answer_asks_which_one() {
+    fn words_off_screen_go_to_jev_and_a_weak_but_clear_answer_acts() {
         // "the share button in the top header": not an exact label -> Jev, text only
         let (mut ask, seen) = script(vec![jev_target("2", 0.93, 0.05)]);
         let mut d = chrome_desk();
@@ -2729,17 +3184,297 @@ mod tests {
         let q = &seen.lock().unwrap()[0].1;
         assert_eq!(q["target"]["criteria"]["8"], "Share (button, main)");
         assert!(q.get("action").is_none(), "grounding asks only target + risky");
-        // weak: the screenshot retry (screen ok), still weak -> pick by voice "la dos" -> mark 2
+        // case 23: weak (0.55) but #2 is far (0.2): the screenshot retry, then #1, no question
         let (mut ask, seen) = script(vec![jev_target("8", 0.5, 0.0), jev_target("8", 0.55, 0.0)]);
         let mut d = chrome_desk();
         d.screen_ok = true;
-        d.answers = vec![Answer::Text("el segundo".into())];
         let e = exec(&on("click", "the share one"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
         assert_eq!(seen.lock().unwrap().len(), 2);
-        assert_eq!(d.waits, [Wait::Pick]);
+        assert_eq!((e.status, d.waits.len()), (CmdStatus::Done, 0));
+        assert_eq!(d.acts, [Act::Click(Target::Mark(8))]);
+    }
+
+    /// Case 23: a real tie is broken by context before anyone is asked; case 22: else boxes on the tied 2-3 only,
+    /// answered by place.
+    #[test]
+    fn ties_break_by_context_then_ask_with_places() {
+        let tie = || ranking(&[("2", 0.46), ("8", 0.42), ("1", 0.05)]);
+        // a browser page: the page's Share (main, inside the web area) beats the toolbar's
+        let page = PtRect { x: 0.0, y: 40.0, w: 1440.0, h: 860.0 };
+        let mut on_page = chrome();
+        on_page.els[1].mark.rect.y = 5.0; // the toolbar Share sits above the page (center y 17)
+        on_page.page = Some(page);
+        let (mut ask, _) = script(vec![tie(), tie()]);
+        let mut d = FakeDesk { screens: vec![on_page.clone()], screen_ok: true, ..chrome_desk() };
+        let e = exec(&said(on("click", "share"), "dale a share"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice(), d.waits.len()), (CmdStatus::Done, &[Act::Click(Target::Mark(8))][..], 0));
+        // he names the toolbar: the chrome wins
+        let (mut ask, _) = script(vec![tie(), tie()]);
+        let mut d = FakeDesk { screens: vec![on_page], screen_ok: true, ..chrome_desk() };
+        let _ = exec(&said(on("click", "share"), "share en la barra"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
+        // no page, no region word: 2 boxes, labeled by place, "la de la derecha" = mark 8 (x 800 > x 200)
+        let (mut ask, _) = script(vec![tie(), tie()]);
+        let mut d = pick_desk(vec![Answer::Text("la de la derecha".into())]);
+        let e = exec(&on("click", "share"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.waits.as_slice()), (CmdStatus::Done, &[Wait::Pick][..]));
+        let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).unwrap();
+        assert!(pick.choose, "numbered boxes on the candidates, not all marks");
+        assert_eq!(pick.choices.iter().map(|c| c.0).collect::<Vec<_>>(), [2, 8], "only the tied ones");
+        assert_eq!(d.acts, [Act::Click(Target::Mark(8))]);
+        assert!(looks_like_pick("la de la derecha", pick.message.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn spatial_answers_table() {
+        // three candidates: sidebar left, main middle-top, main right-bottom
+        let a = PtRect { x: 20.0, y: 300.0, w: 200.0, h: 24.0 };
+        let b = PtRect { x: 600.0, y: 100.0, w: 200.0, h: 24.0 };
+        let c = PtRect { x: 1100.0, y: 700.0, w: 200.0, h: 24.0 };
+        let cands = [(a, "sidebar"), (b, "main"), (c, "main")];
+        let rows: [(&str, Option<usize>); 14] = [
+            ("la de la izquierda", Some(0)), ("the left one", Some(0)), ("la de la derecha", Some(2)), ("the right one", Some(2)),
+            ("la de arriba", Some(1)), ("the top one", Some(1)), ("the one in the header", Some(1)), ("la de abajo", Some(2)),
+            ("la de la sidebar", Some(0)), ("the one in the sidebar", Some(0)), ("la barra lateral", Some(0)),
+            ("la principal", None), // two in main: no single answer
+            ("la segunda", None), // an ordinal is parse_choice's
+            ("hmm", None),
+        ];
+        for (t, want) in rows {
+            assert_eq!(spatial_choice(t, &cands), want, "{t:?}");
+        }
+        // two side by side within 8 pt: left/right says nothing
+        let near = [(PtRect { x: 100.0, ..a }, "main"), (PtRect { x: 104.0, y: 500.0, ..a }, "main")];
+        assert_eq!(spatial_choice("the left one", &near), None);
+        assert_eq!(spatial_choice("the top one", &near), Some(0));
+        let q = "Which one? 1 Pablo (tú) · 2 Pablo";
+        for t in ["la de la izquierda", "the left one", "the one in the header", "la de arriba", "la de la sidebar"] {
+            assert!(looks_like_pick(t, q), "{t:?}");
+        }
+        for t in ["abre la de la izquierda", "open slack", "abre Slack y en la sidebar abre Comercial X"] {
+            assert!(!looks_like_pick(t, q), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn tie_and_prior_tables() {
+        assert_eq!(tied(&[(1, 0.6), (2, 0.3)]), [(1, 0.6)], "15 points apart is no tie");
+        assert_eq!(tied(&[(1, 0.45), (2, 0.4), (3, 0.31), (4, 0.3)]), [(1, 0.45), (2, 0.4), (3, 0.31)], "3 at most");
+        assert_eq!(tied(&[]), []);
+        let els = vec![mk(1, "Docs", "tab", "toolbar", None, None), mk(2, "Docs", "link", "main", None, None), mk(3, "Docs", "link", "sidebar", None, None)];
+        let page = Some(PtRect { x: 150.0, y: 0.0, w: 300.0, h: 900.0 }); // marks 2 (x 200..280) inside, 1 (x 100..180) out
+        assert_eq!(prior(&[1, 2], &els, "abre docs", page), [2], "the page beats the browser's tab");
+        assert_eq!(prior(&[1, 2], &els, "la pestaña docs", page), [1], "he named the tab");
+        assert_eq!(prior(&[1, 2, 3], &els, "docs en la sidebar", None), [3]);
+        assert_eq!(prior(&[1, 2, 3], &els, "docs", None), [1, 2, 3], "nothing to go on: ask");
+        assert_eq!(prior(&[2, 3], &els, "el docs de la derecha", None), [3], "his place words (x 300 > 200)");
+        assert_eq!(prior(&[1, 2], &els, "docs del footer", page), [2], "an unknown word changes nothing");
+    }
+
+    #[test]
+    fn per_app_table() {
+        let rows = [
+            ("Slack", "com.tinyspeck.slackmacgap", Kind::Electron), ("", "com.microsoft.VSCode", Kind::Electron), ("Cursor", "", Kind::Electron),
+            ("Claude", "com.anthropic.claudefordesktop", Kind::Electron), ("Discord", "", Kind::Electron), ("Notion", "", Kind::Electron),
+            ("WhatsApp", "net.whatsapp.WhatsApp", Kind::Native), ("Finder", "com.apple.finder", Kind::Native), ("Notes", "", Kind::Native),
+            ("Microsoft Edge", "com.microsoft.edgemac", Kind::Browser), ("Safari", "", Kind::Browser), ("Arc", "", Kind::Browser),
+            ("Ghostty", "com.mitchellh.ghostty", Kind::Terminal), ("Terminal", "", Kind::Terminal), ("Photoshop", "", Kind::Native),
+        ];
+        for (app, bundle, want) in rows {
+            assert_eq!(app_kind(app, bundle), want, "{app} {bundle}");
+        }
+        assert!(real_click_first(Kind::Electron, "row") && real_click_first(Kind::Electron, "link"));
+        assert!(!real_click_first(Kind::Electron, "button") && !real_click_first(Kind::Native, "row") && !real_click_first(Kind::Browser, "link"));
+        // keyboard first: every Electron app has planner hints with its palette key
+        for app in ["Slack", "Discord", "Cursor", "Visual Studio Code", "Claude", "Notion", "Linear"] {
+            let h = crate::planner::hints_for(app).unwrap_or_else(|| panic!("{app}: no hints"));
+            assert!(h.contains("cmd+k") || h.contains("cmd+p"), "{app}: {h}");
+        }
+    }
+
+    #[test]
+    fn aim_point_table() {
+        let r = PtRect { x: 100.0, y: 100.0, w: 300.0, h: 40.0 };
+        // the center is the target (or inside it): the center
+        assert_eq!(aim_point(r, &mut |_| Some(true)), Some((250.0, 120.0)));
+        // no AX answer at the center: the center
+        assert_eq!(aim_point(r, &mut |_| None), Some((250.0, 120.0)));
+        // a hover button covers the center of a Slack row's link: the left third
+        assert_eq!(aim_point(r, &mut |p| Some(p.0 < 200.0)), Some((150.0, 120.0)));
+        // only the right end is free
+        assert_eq!(aim_point(r, &mut |p| Some(p.0 > 300.0)), Some((350.0, 120.0)));
+        // a sheet covers it all: no click
+        assert_eq!(aim_point(r, &mut |_| Some(false)), None);
+    }
+
+    fn sigs(v: &[u64]) -> VecDeque<u64> {
+        v.iter().copied().collect()
+    }
+
+    /// vc-feedback 21: "[104] Pablo (tú) (row, sidebar)" in Slack was AXPressed, reported Done, nothing opened.
+    #[test]
+    fn a_click_that_changes_nothing_gets_a_real_click_then_says_so() {
+        let slack_scr = || Screen { app: "Slack".into(), kind: Kind::Electron, els: vec![mk(1, "Pablo (tú)", "row", "sidebar", None, None), mk(2, "Comercial X", "link", "sidebar", None, None),
+            mk(3, "Huddle", "button", "toolbar", None, None), mk(4, "Message", "text area", "bottom", None, None), mk(5, "Search", "button", "toolbar", None, None)], ..chrome() };
+        let desk = |s: &[u64]| FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message", "", Some(4))], screens: vec![slack_scr()], sigs: sigs(s), ..Default::default() };
+        // the screen changed: one click, done
+        let (mut d, mut mem) = (desk(&[1, 2]), Memory::new());
+        let e = exec(&on("click", "Pablo (tú) (row, sidebar)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(1))][..]));
+        // unchanged after the click, changed after the real click
+        let mut d = desk(&[1, 1, 2]);
+        let e = exec(&on("click", "Pablo (tú) (row, sidebar)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(1)), Act::RealClick(Target::Mark(1))][..]));
+        // unchanged twice: not Done; the pill and the planner read "nothing changed"
+        let (mut d, mut mem) = (desk(&[1, 1, 1]), Memory::new());
+        let e = exec(&on("click", "Pablo (tú) (row, sidebar)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, e.message.as_deref()), (CmdStatus::Unsure, Some("Clicked “Pablo (tú)” but nothing changed")));
+        assert_eq!(d.acts.len(), 2, "one real retry, never a third click");
+        assert!(mem.iter().all(|m| m.e.kind != MemKind::Clicked), "no 'clicked' memory for a no-op");
+        // no signature (cannot tell): one click, done
+        let mut d = desk(&[]);
+        assert_eq!(exec(&on("click", "Comercial X (link, sidebar)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut Memory::new()).status, CmdStatus::Done);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
+    }
+
+    /// Replay of Pablo's log sessions on the new paths (the 01:53 / 01:58 UTC lines, rebuilt from vc-feedback 21 + 23:
+    /// the log file has rotated). Slack: "104" picked the DM row by number, AXPress did nothing, Done was reported, and
+    /// "open it" repeated the no-op twice. Edge: "click the pricing" asked "this or that?" while Jev's #1 was right.
+    #[test]
+    fn replay_0153_slack_and_0158_edge_on_the_new_paths() {
+        // ---- 01:53 Slack: the row by its number; the first click changes nothing ----
+        let mut els: Vec<El> = (1..=110).map(|i| mk(i, &format!("channel {i}"), "row", "sidebar", None, None)).collect();
+        els[103].mark.name = "Pablo (tú)".into();
+        els[89].mark.name = "Comercial X".into();
+        let slack_scr = Screen { app: "Slack".into(), kind: Kind::Electron, els, ..chrome() };
+        let desk = |s: &[u64]| FakeDesk { app: "Slack".into(), fields: vec![FField::new("AXTextArea", "Message", "", None)], screens: vec![slack_scr.clone()], sigs: sigs(s), ..Default::default() };
+        let row = on("click", "[104] Pablo (tú) (row, sidebar)");
+        // the real click opens the DM: Done after the retry, no Jev, no pick
+        let (mut d, mut mem) = (desk(&[7, 7, 8]), Memory::new());
+        let e = exec(&said(row.clone(), "104"), 1, 1, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, d.acts.as_slice(), d.waits.len()), (CmdStatus::Done, &[Act::Click(Target::Mark(104)), Act::RealClick(Target::Mark(104))][..], 0));
+        assert!(real_click_first(Kind::Electron, "row"), "the real desk makes the first click real already for a Slack row");
+        // nothing opens even then: not Done, the pill says so, and no "clicked" memory for the planner to build on
+        let (mut d, mut mem) = (desk(&[7, 7, 7]), Memory::new());
+        let e = exec(&said(row, "open it"), 2, 2, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, e.message.as_deref()), (CmdStatus::Unsure, Some("Clicked “Pablo (tú)” but nothing changed")));
+        assert_eq!(d.acts.len(), 2, "one retry, never a third click");
+        assert!(mem.iter().all(|m| m.e.kind != MemKind::Clicked));
+        // "Click 90": the number he said is his choice, straight to mark 90
+        let mut d = desk(&[1, 2]);
+        let e = exec(&said(on("click", "[90] Comercial X (row, sidebar)"), "Click 90"), 3, 3, &CFG, &mut no_jev, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(90))][..]));
+
+        // ---- 01:58 Edge, web path: the page's DOM marks (no browser tabs among them) ----
+        let scan = crate::web::parse(json!({
+            "url": "https://acme.com/", "title": "Acme", "iw": 1440.0, "ih": 812.0, "sx": 0.0, "sy": 0.0, "ow": 1440.0, "oh": 900.0,
+            "els": [
+                {"id": 3, "role": "link", "name": "Pricing", "href": "https://acme.com/pricing", "state": null, "x": 900.0, "y": 20.0, "w": 70.0, "h": 20.0},
+                {"id": 4, "role": "link", "name": "Docs", "href": "https://acme.com/docs", "state": null, "x": 990.0, "y": 20.0, "w": 50.0, "h": 20.0},
+                {"id": 8, "role": "button", "name": "See all pricing plans", "state": null, "x": 600.0, "y": 500.0, "w": 200.0, "h": 40.0},
+                {"id": 9, "role": "link", "name": "Sign in", "href": "https://acme.com/login", "state": null, "x": 1300.0, "y": 20.0, "w": 60.0, "h": 20.0},
+                {"id": 12, "role": "text field", "name": "Email", "state": null, "x": 600.0, "y": 600.0, "w": 240.0, "h": 30.0}
+            ]
+        })).unwrap();
+        let vp = crate::web::guess_viewport(&scan);
+        let web_els = crate::web::els(&scan, vp);
+        assert_eq!((web_els[0].mark.name.as_str(), web_els[0].mark.region.as_str()), ("Pricing", "header"), "a page header, not browser chrome");
+        let edge_web = Screen { app: "Microsoft Edge".into(), kind: Kind::Browser, els: web_els, ..chrome() };
+        let edge = |scr: &Screen| FakeDesk { app: "Microsoft Edge".into(), fields: vec![FField::new("AXWebArea", "", "", None)], screens: vec![scr.clone()], screen_ok: true, sigs: sigs(&[1, 2]), ..Default::default() };
+        // Jev's #1 is clear: act on it, no "this or that?"
+        let (mut ask, _) = script(vec![ranking(&[("1", 0.71), ("3", 0.22), ("2", 0.03)]), ranking(&[("1", 0.71), ("3", 0.22), ("2", 0.03)])]);
+        let mut d = edge(&edge_web);
+        let e = exec(&said(on("click", "the pricing"), "click the pricing"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice(), d.waits.len()), (CmdStatus::Done, &[Act::Click(Target::Mark(1))][..], 0), "{:?}", e.message);
+        // ---- 01:58 Edge, AX path (JS from Apple Events off): the tab "Pricing | Acme" ties with the page link ----
+        let page = PtRect { x: 0.0, y: 88.0, w: 1440.0, h: 812.0 };
+        let mut tab = mk(1, "Pricing | Acme", "tab", "toolbar", None, None);
+        tab.mark.rect.y = 10.0;
+        let mut link = mk(2, "Pricing", "link", "main", Some("https://acme.com/pricing"), None);
+        link.mark.rect.y = 120.0;
+        let edge_ax = Screen { app: "Microsoft Edge".into(), kind: Kind::Browser, page: Some(page), els: vec![tab, link, mk(3, "Docs", "link", "main", None, None), mk(4, "Sign in", "link", "main", None, None), mk(5, "Email", "text field", "main", None, None)], ..chrome() };
+        let (mut ask, _) = script(vec![ranking(&[("1", 0.48), ("2", 0.44), ("3", 0.02)]), ranking(&[("1", 0.48), ("2", 0.44), ("3", 0.02)])]);
+        let mut d = edge(&edge_ax);
+        let e = exec(&said(on("click", "the pricing"), "click the pricing"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice(), d.waits.len()), (CmdStatus::Done, &[Act::Click(Target::Mark(2))][..], 0), "the page beats the tab strip");
+        // he says pestaña: the tab
+        let (mut ask, _) = script(vec![ranking(&[("1", 0.48), ("2", 0.44), ("3", 0.02)]), ranking(&[("1", 0.48), ("2", 0.44), ("3", 0.02)])]);
+        let mut d = edge(&edge_ax);
+        exec(&said(on("click", "the pricing"), "la pestaña de pricing"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(d.acts, [Act::Click(Target::Mark(1))]);
+    }
+
+    /// Thin tree (a canvas app): OCR lines become marks; the box only when no text fits (an icon).
+    #[test]
+    fn thin_tree_uses_ocr_then_the_box() {
+        let win = PtRect { x: 100.0, y: 50.0, w: 800.0, h: 500.0 };
+        let canvas = Screen { app: "Figma".into(), display: chrome().display, scale: 2.0, window: win, els: vec![mk(1, "Close", "button", "toolbar", None, None)], ..Default::default() };
+        let lines: Vec<crate::ocr::Line> = vec![("Comercial X".into(), (0.05, 0.85, 0.125, 0.03)), ("Enviar factura".into(), (0.56, 0.35, 0.14, 0.03))];
+        let desk = || FakeDesk { app: "Figma".into(), fields: vec![FField::new("AXGroup", "", "", None)], screens: vec![canvas.clone()], screen_ok: true, lines: lines.clone(), ..Default::default() };
+        // the exact text: no Jev, a click at the line's center (bottom-left Vision box -> top-left points)
+        let mut d = desk();
+        let e = exec(&on("click", "Comercial X"), 1, 1, &CFG, &mut no_jev, &mut d, &mut Memory::new());
         assert_eq!(e.status, CmdStatus::Done);
-        assert!(d.steps.iter().any(|s| s.status == CmdStatus::Pick && s.choices.len() == 3));
-        assert_eq!(d.acts, [Act::Click(Target::Mark(6))], "the 2nd of the ranked list (8, 6, 1)");
+        assert_eq!(d.acts, [Act::Click(Target::Point(190.0, 118.0))], "x 100 + 0.1125 * 800, y 50 + (1 - 0.865) * 500");
+        // not exact: Jev's text choice over the OCR marks (ids in reading order: Comercial X = 1, Enviar factura = 2)
+        let (mut ask, seen) = script(vec![jev_target("2", 0.9, 0.1)]);
+        let mut d = desk();
+        let e = exec(&on("click", "la factura"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
+        assert_eq!(d.acts, [Act::Click(Target::Point(604.0, 368.0))]);
+        assert_eq!(seen.lock().unwrap()[0].1["target"]["criteria"]["2"], "Enviar factura (text, main)");
+        // no text fits (an icon): Jev box on the window, then on the crop; the point maps back from the crop
+        let (mut ask, seen) = script(vec![
+            jev_target("none", 0.9, 0.0),
+            json!({ "box": { "box": { "top": 0.5, "bottom": 0.54, "left": 0.5, "right": 0.53 } }, "visible": { "noul": 0.9 }, "risky": { "noul": 0.0 } }),
+            json!({ "box": { "box": { "top": 0.4, "bottom": 0.6, "left": 0.4, "right": 0.6 } }, "visible": { "noul": 0.9 } }),
+        ]);
+        let mut d = desk();
+        let e = exec(&on("click", "the gear icon"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done, "{e:?}");
+        let crop = refine_crop(Bbox { top: 0.5, bottom: 0.54, left: 0.5, right: 0.53 }, win, 2.0);
+        assert_eq!(d.acts, [Act::Click(Target::Point(center(crop).0, center(crop).1))]);
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].1.get("risky").is_some() && calls[2].1.get("risky").is_none(), "risky once, on the first pass");
+        drop(calls);
+        // an invisible box never clicks
+        let (mut ask, _) = script(vec![jev_target("none", 0.9, 0.0), json!({ "box": { "box": { "top": 0.5, "bottom": 0.54, "left": 0.5, "right": 0.53 } }, "visible": { "noul": 0.1 }, "risky": { "noul": 0.0 } })]);
+        let mut d = desk();
+        assert_eq!(exec(&on("click", "the gear icon"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new()).status, CmdStatus::Unsure);
+        assert!(d.acts.is_empty());
+    }
+
+    /// Keyboard first in Electron (next-build 6): cmd+k, the name, Return opens the channel; that Return sends
+    /// nothing, so no confirm. A Return in the message box still asks.
+    #[test]
+    fn return_after_a_palette_needs_no_confirm() {
+        let mut d = slack();
+        let mut mem = Memory::new();
+        let e = run_all(&[key("cmd+k"), typ("Comercial X", None), key("return")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Done, CmdStatus::Done]);
+        assert!(d.waits.is_empty());
+        let mut d = slack();
+        let e = run_all(&[typ("hola", None), key("return")], &mut d, &mut Memory::new());
+        assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Stopped]);
+        assert_eq!(d.waits, [Wait::Confirm]);
+        // the cmd+k went to WhatsApp (no palette there): "Ana" sits in the message box, Return would send it
+        let mut d = FakeDesk { app: "WhatsApp".into(), fields: vec![FField::new("AXTextArea", "Escribe un mensaje", "", None)], ..Default::default() };
+        let e = run_all(&[key("cmd+k"), typ("Ana", None), key("return")], &mut d, &mut Memory::new());
+        assert_eq!((statuses(&e)[2].clone(), d.waits.as_slice()), (CmdStatus::Stopped, &[Wait::Confirm][..]));
+        // Pablo typed by hand after the palette (the field no longer holds what susurro typed): ask
+        let (mut d, mut mem) = (slack(), Memory::new());
+        run_all(&[key("cmd+k"), typ("Comercial X", None)], &mut d, &mut mem);
+        d.f().insert(" hola equipo");
+        let e = run_all(&[key("return")], &mut d, &mut mem);
+        assert_eq!((e[0].status.clone(), d.waits.as_slice()), (CmdStatus::Stopped, &[Wait::Confirm][..]));
+        // a stale palette (over 30 s ago): ask
+        let (mut d, mut mem) = (slack(), Memory::new());
+        run_all(&[key("cmd+k"), typ("Comercial X", None)], &mut d, &mut mem);
+        for m in mem.iter_mut() {
+            m.e.at -= 31_000;
+        }
+        assert_eq!(run_all(&[key("return")], &mut d, &mut mem)[0].status, CmdStatus::Stopped);
     }
 
     /// A Jev ranking: (mark id, probability), best first.
@@ -2806,7 +3541,7 @@ mod tests {
             mk(5, "Buscar con la voz", "button", "main", None, None),
             mk(6, "Ultra Music Festival", "link", "main", None, None),
         ];
-        let yt = Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els };
+        let yt = Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els, ..Default::default() };
         let mut d = FakeDesk {
             app: "Google Chrome".into(),
             fields: vec![FField::new("AXWebArea", "", "", None), FField::new("AXComboBox", "Buscar", "", Some(3))],
@@ -3049,13 +3784,13 @@ mod tests {
         let model = model.as_str();
         let claude = Screen { app: "Claude".into(), display: chrome().display, scale: 2.0, els: vec![
             mk(1, "New chat", "button", "sidebar", None, None), mk(2, "Search", "button", "sidebar", None, None),
-            mk(3, "Write your prompt to Claude", "text area", "main", None, None), mk(4, "Send message", "button", "main", None, None)] };
+            mk(3, "Write your prompt to Claude", "text area", "main", None, None), mk(4, "Send message", "button", "main", None, None)], ..Default::default() };
         let edge_new = Screen { app: "Microsoft Edge".into(), display: chrome().display, scale: 2.0, els: vec![
             mk(1, "New Tab", "tab", "top", None, None), mk(2, "Address and search bar", "text field", "toolbar", None, None),
-            mk(3, "Search the web", "search field", "main", None, None), mk(4, "YouTube", "link", "main", None, None)] };
+            mk(3, "Search the web", "search field", "main", None, None), mk(4, "YouTube", "link", "main", None, None)], ..Default::default() };
         let res: Vec<El> = [(34, "Address and search bar", "text field", "toolbar"), (35, "Videos", "link", "top"), (40, "YouTube YouTube https://www.youtube.com", "link", "main"),
             (41, "YouTube Music", "link", "main"), (42, "YouTube - Wikipedia", "link", "main")].iter().map(|(i, n, r, g)| mk(*i, n, r, g, None, None)).collect();
-        let edge_res = Screen { app: "Microsoft Edge".into(), display: chrome().display, scale: 2.0, els: res };
+        let edge_res = Screen { app: "Microsoft Edge".into(), display: chrome().display, scale: 2.0, els: res, ..Default::default() };
         let fields = |app: &str| match app {
             "Claude" => vec![FField::new("AXTextArea", "Write your prompt to Claude", "", Some(3))],
             _ => vec![FField::new("AXTextField", "Address and search bar", "", Some(2)), FField::new("AXWebArea", "", "", None)],

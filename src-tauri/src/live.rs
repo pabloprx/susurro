@@ -121,6 +121,11 @@ pub fn user_input(app: &AppHandle, hard: bool, click: Option<(f64, f64)>) {
         log::info!("live: Pablo clicked a pick choice himself");
         return;
     }
+    if hard {
+        // a waiting "Press Return?" or "Which one?" never fires over what he does by hand (02:27 log: the Return
+        // confirm kept waiting 10 s after he took over)
+        drop_wait();
+    }
     let pause = hard && !PAUSED.swap(true, Ordering::SeqCst);
     if pause {
         log::info!("live: Pablo pressed a key or clicked, the queue pauses until his next order");
@@ -205,6 +210,8 @@ pub enum Heard {
     Confirm(bool),
     /// The spoken answer to "Which one?" (command::parse_pick reads it).
     Pick(String),
+    /// "muestra los números" (true) / "oculta los números" (false).
+    Numbers(bool),
     /// A planned order: its number, the actions, and what to say.
     Order(u32, Vec<Action>, Option<String>),
     Error(String),
@@ -252,6 +259,9 @@ impl Core {
         let text = text.trim();
         if !text.is_empty() {
             self.said.push(text.into());
+        }
+        if let Some(on) = numbers_toggle(text) {
+            return Heard::Numbers(on);
         }
         match pending.map(|p| (p.wait, p.question, p.said)) {
             // Only a shown number, an ordinal, "ese" or a shown name answers "Which one?" (command::looks_like_pick).
@@ -890,9 +900,11 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
         Heard::Confirm(true) => command::confirm(),
         Heard::Confirm(false) => command::deny(),
         Heard::Pick(t) => command::answer(t),
+        Heard::Numbers(on) => update(app, |l| l.numbers = on),
         Heard::Order(order, actions, say) => {
-            // A new order while "Which one?" waits (a held one too): Pablo moved on, the queue must not wait 20 s.
-            drop_pick();
+            // A new order while "Which one?" or a confirm ("Press Return?") waits: Pablo moved on, the queue must not
+            // wait 20 s / 10 s.
+            drop_wait();
             let said = core.said.last().cloned().unwrap_or_default();
             for mut a in actions {
                 a.said = said.clone();
@@ -924,10 +936,26 @@ pub fn search_click(a: &Action) -> bool {
     a.op == "click" && (["text field", "text area", "combo box", "search field"].iter().any(|r| t.contains(&format!("({r}"))) || ["search", "busca"].iter().any(|w| t.contains(w)))
 }
 
-fn drop_pick() {
-    if command::waiting() == Some(Wait::Pick) {
-        log::info!("live: a new order while \"Which one?\" waits: the pick is dropped");
+fn drop_wait() {
+    if let Some(w) = command::waiting() {
+        log::info!("live: a new order while {w:?} waits: it is dropped");
         command::deny();
+    }
+}
+
+/// "muestra los números" / "show numbers", said alone: every mark's number for the rest of the session (vc-feedback
+/// 22; LiveState::numbers, a new session starts without). None = not a toggle.
+pub fn numbers_toggle(text: &str) -> Option<bool> {
+    let t = crate::text::norm(text);
+    let t = t.trim_matches(|c: char| !c.is_alphanumeric());
+    let on = ["muestra los numeros", "muestrame los numeros", "ensena los numeros", "pon los numeros", "show numbers", "show the numbers", "numeros"];
+    let off = ["oculta los numeros", "quita los numeros", "esconde los numeros", "hide numbers", "hide the numbers", "sin numeros"];
+    if on.contains(&t) {
+        Some(true)
+    } else if off.contains(&t) {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -989,7 +1017,12 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                         crate::session::toast(&app, Some("overlay"), "live-step", crate::contract::ToastKind::Warn, m.to_string(), &[], 5000);
                     }
                     (worst, message) = (end.status.clone(), end.message.clone());
-                    command::remember(&mut mem, MemKind::Failed, &planner::label(&action), &crate::ax::Field::default(), None);
+                    // "click “X”: Clicked “X” but nothing changed": the planner must not repeat a no-op (vc-feedback 21b)
+                    let what = match end.message.as_deref() {
+                        Some(m) => format!("{}: {m}", planner::label(&action)),
+                        None => planner::label(&action),
+                    };
+                    command::remember(&mut mem, MemKind::Failed, &what, &crate::ax::Field::default(), None);
                 } else {
                     summary.push(end.summary);
                 }
@@ -1393,6 +1426,39 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(c.hear("la dos", false, pend(Wait::Pick, "Which one? 1 A · 2 B"), &mut p), Heard::Pick("la dos".into()));
         assert_eq!(c.buffer, "", "answers never enter the order buffer");
+    }
+
+    /// The 10 s Return confirm must not block the queue: a new order during it is an order, and `drop_wait`
+    /// answers the confirm "no" at once (same rule as picks).
+    #[test]
+    fn a_new_order_during_a_confirm_drops_the_confirm() {
+        let mut c = Core::default();
+        let mut p = |t: &str, _: bool, q: Option<&str>| {
+            assert_eq!(q, Some("Press Return?"));
+            Ok(if t.contains("Slack") { Plan { complete: true, actions: vec![a("open_app")], ..Default::default() } } else { Plan { complete: true, ..Default::default() } })
+        };
+        assert!(matches!(c.hear("abre Slack", false, pend(Wait::Confirm, "Press Return?"), &mut p), Heard::Order(1, ..)));
+        assert_eq!(c.hear("eh", false, pend(Wait::Confirm, "Press Return?"), &mut p), Heard::Nothing, "noise keeps the confirm");
+        // the executor side: a confirm that waits gets its "no" from drop_wait, long before the 10 s
+        let t = std::thread::spawn(|| command::wait_flags(Wait::Confirm, Duration::from_secs(10)));
+        let t0 = Instant::now();
+        while command::waiting() != Some(Wait::Confirm) && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop_wait();
+        assert_eq!(t.join().unwrap(), command::Answer::No);
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn numbers_on_demand() {
+        let mut c = Core::default();
+        let mut p = |_: &str, _: bool, _: Option<&str>| -> anyhow::Result<Plan> { panic!("a toggle is local") };
+        assert_eq!(c.hear("Muestra los números.", false, None, &mut p), Heard::Numbers(true));
+        assert_eq!(c.hear("show numbers", false, None, &mut p), Heard::Numbers(true));
+        assert_eq!(c.hear("oculta los números", false, None, &mut p), Heard::Numbers(false));
+        assert_eq!(numbers_toggle("abre el número 4"), None);
+        assert_eq!(c.buffer, "");
     }
 
     fn pend(wait: Wait, question: &str) -> Option<Pending<'_>> {

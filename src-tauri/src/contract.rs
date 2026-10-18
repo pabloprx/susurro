@@ -598,6 +598,9 @@ pub struct LiveState {
     pub paused: bool,
     /// The last chunk of text heard.
     pub last_said: String,
+    /// "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
+    /// candidates are drawn.
+    pub numbers: bool,
 }
 
 /// One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.

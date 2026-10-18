@@ -14,6 +14,7 @@ pub mod jev;
 pub mod learn;
 pub mod live;
 pub mod models;
+pub mod ocr;
 pub mod paste;
 pub mod permissions;
 pub mod pipeline;
@@ -27,6 +28,7 @@ pub mod stt;
 pub mod test_hooks;
 pub mod text;
 pub mod tray;
+pub mod web;
 pub mod platform {
     #[cfg(target_os = "macos")]
     pub mod macos;
