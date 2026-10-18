@@ -54,7 +54,7 @@ let settings: C.Settings = {
   overlay: { show_idle: true },
   privacy: { store_history: true, store_audio: true, audio_retention_days: 14 },
   autostart: false,
-  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-6-luna", auto_click: false, stt: null },
+  command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-6-luna", auto_click: false, stt: null, agent: false, agent_model: "sonnet", agent_fallback: "google/gemini-3.5-flash-lite" },
 };
 
 let pillRect: C.PtRect | null = null;

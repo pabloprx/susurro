@@ -222,6 +222,18 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
         <div className="sc-row">
           <div>
+            <div className="label">Agent mode</div>
+            <div className="sub">“Modo agente: …”, or an order that failed twice</div>
+          </div>
+          <span className="small">
+            {s.command.agent
+              ? `Claude Code (${s.command.agent_model || "default"}) drives the Mac with susurro's own tools. No CLI or no login: ${s.command.agent_fallback}.`
+              : "Off. Orders go through the planner only."}
+          </span>
+          <Toggle label="Agent mode" on={s.command.agent} onChange={(v) => save((x) => void (x.command.agent = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
             <div className="label">Target model</div>
             <div className="sub">Picks the button you named</div>
           </div>

@@ -1,6 +1,7 @@
 //! Tauri builder, plugins, AppState, windows, invoke_handler. Written once in WP0 (PLAN 1.1).
 //! Later WPs edit only the bodies of their own modules. WP5 adds its setup calls (marked below).
 
+pub mod agent;
 pub mod audio;
 pub mod ax;
 pub mod cleanup;

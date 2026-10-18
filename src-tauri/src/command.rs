@@ -31,11 +31,11 @@ pub const MIN_AX: usize = 5;
 /// an AX-change wait would be faster.
 pub const SETTLE_MS: u64 = 250;
 /// The marks window draws before the screenshot is taken.
-const MARKS_DRAW_MS: u64 = 250;
+pub const MARKS_DRAW_MS: u64 = 250;
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PICK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Jev's image limit per side.
-const IMG_MAX: f64 = 1568.0;
+pub const IMG_MAX: f64 = 1568.0;
 /// A box center this close to an AX element snaps to it.
 const SNAP_PT: f64 = 24.0;
 /// Between the focus and the paste of a type step.
@@ -908,6 +908,8 @@ pub struct Cfg {
     pub confirm_risky: bool,
     /// "Clicks: I choose": every click target shows numbered choices and waits for Pablo's pick.
     pub choose: bool,
+    /// Agent mode: the step cap (the pill shows "step N: ..."). 0 = a live session.
+    pub max: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1351,7 +1353,9 @@ fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) ->
 
 /// Runs one planner action. `step` numbers the action in the session, `order` the planner reply it came from.
 pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
-    let st = CommandStep { instruction: crate::planner::label(a), step, max: 0, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
+    let label = crate::planner::label(a);
+    let instruction = if cfg.max > 0 { format!("step {step}: {label}") } else { label };
+    let st = CommandStep { instruction, step, max: cfg.max, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
     let mut r = Run { st, choose: cfg.choose, said: a.said.clone(), kind: Kind::Native };
     if desk.aborted() {
         return r.end(desk, CmdStatus::Stopped, None, String::new());
@@ -2641,8 +2645,8 @@ mod tests {
         Action { op: op.into(), target: Some(target.into()), ..Default::default() }
     }
 
-    const CFG: Cfg = Cfg { confirm_risky: true, choose: false };
-    const CHOOSE: Cfg = Cfg { confirm_risky: true, choose: true };
+    const CFG: Cfg = Cfg { confirm_risky: true, choose: false, max: 0 };
+    const CHOOSE: Cfg = Cfg { confirm_risky: true, choose: true, max: 0 };
 
     const INSTALLED: [&str; 12] = [
         "Microsoft Edge", "Google Chrome", "Chrome Remote Desktop", "Ghostty", "Claude", "Safari", "Slack", "Notes",

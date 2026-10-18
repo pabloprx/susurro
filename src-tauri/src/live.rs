@@ -669,6 +669,11 @@ fn live_loop(
     // The release (Scribe gets RT_FINISH_MS from here) and the last new words (a held order runs HOLD_MS after).
     let (mut released, mut words_at): (Option<Instant>, Instant) = (None, Instant::now());
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
+        // "modo agente: <task>": the whole task goes to agent mode, no planner. Held for the next words until a pause.
+        if let Some(p) = crate::agent::plan(text, last).filter(|_| cfg.agent && pending.is_none()) {
+            log::info!("live: agent mode {:?}", p.actions.first().and_then(|a| a.text.as_deref()));
+            return Ok(p);
+        }
         // "41", "la 41", "open the first link, 41": the mark Pablo reads on screen, no LLM.
         if pending.is_none() {
             let shown = board();
@@ -961,10 +966,12 @@ pub fn numbers_toggle(text: &str) -> Option<bool> {
 
 fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSettings, ctl: Arc<Ctl>) {
     let t0 = Instant::now();
-    let cfg = Cfg { confirm_risky: settings.confirm_risky, choose: !settings.auto_click };
+    let cfg = Cfg { confirm_risky: settings.confirm_risky, choose: !settings.auto_click, max: 0 };
     let mut ask = |s: &serde_json::Value, q: &serde_json::Value| crate::jev::ask(crate::jev::DECISIONS_URL, &key, &settings.model, s, q);
     let (mut step, mut summary, mut worst, mut message) = (0u32, vec![], CmdStatus::Done, None);
     let mut skip: Option<u32> = None;
+    // Orders in a row whose fast path failed (agent mode escalates at 2).
+    let mut fails = 0u32;
     let mut last_order = 0;
     #[cfg(target_os = "macos")]
     let mut desk = command::mac::Real::new(app.clone());
@@ -997,7 +1004,27 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 STEPS.fetch_add(1, Ordering::SeqCst);
                 *RUNNING.lock().unwrap() = Some(action.clone());
                 #[cfg(target_os = "macos")]
-                let end = command::exec(&action, step, order, &cfg, &mut ask, &mut desk, &mut mem);
+                let end = {
+                    let agent = |task: &str, desk: &mut command::mac::Real, mem: &mut Memory, ask: &mut command::Ask| {
+                        crate::agent::run(task, &crate::agent::Opts::from(&settings, &key), settings.confirm_risky, ask, desk, mem)
+                    };
+                    let mut end = match (action.op.as_str(), action.text.as_deref()) {
+                        ("agent", Some(task)) => agent(task, &mut desk, &mut mem, &mut ask),
+                        _ => command::exec(&action, step, order, &cfg, &mut ask, &mut desk, &mut mem),
+                    };
+                    // The fast path failed on two orders in a row: agent mode takes the second one (spec 9b).
+                    if settings.agent && action.op != "agent" && matches!(end.status, CmdStatus::Unsure | CmdStatus::Error) {
+                        fails += 1;
+                        if fails >= 2 && !stopped() && !said.trim().is_empty() {
+                            fails = 0;
+                            log::info!("live: the fast path failed twice, agent mode takes {said:?}");
+                            end = agent(&said, &mut desk, &mut mem, &mut ask);
+                        }
+                    } else if end.status == CmdStatus::Done {
+                        fails = 0;
+                    }
+                    end
+                };
                 *RUNNING.lock().unwrap() = None;
                 BUSY.store(false, Ordering::SeqCst);
                 #[cfg(not(target_os = "macos"))]
