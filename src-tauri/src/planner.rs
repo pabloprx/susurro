@@ -48,11 +48,43 @@ const CORRECTION_WORDS: &[&str] = &[
     "is not", "isn't", "es con", "wrong word", "mal",
 ];
 
-pub fn system_for(utterance: &str) -> String {
+/// Case 27: appended only with a `previous` and an order that sounds like "no, not that": the same text on every
+/// order moved 2 of 25 unrelated cases ("LS command." lost its Return; gpt-oss-120b, 2026-10-18, 2 runs each).
+const RETRY: &str = "\n- previous (in the input): the user's last order, the actions susurro ran for it and what each did.\n- One more op, retry{target, text}: the last click hit the wrong element; click again. target = the words inside previous's click “...” (what the user wanted), never the element it hit; text = the user's constraint (\"bottom\", \"left\", \"the other one\"). susurro never hits the same element twice.\n- A correction is about previous, never a new order: \"no, on the bottom, not the top\", \"not that one\", \"the other one\", \"no, la de abajo\", \"I said X\" = one retry (previous \"click “red”: clicked “Colors”\" + \"no, on the bottom\" -> retry{target \"red\", text \"bottom, not the top\"}). Never click a mark the correction does not name (\"New Tab\", \"Back\").\n- \"no\" / \"no, bro\" / \"stop\" alone = complete=true, actions=[] (susurro stops), never a click.";
+
+/// Case 26: appended only when the order names a color (a paint palette has no marks for its swatches). Same reason
+/// as RETRY: global text moves unrelated cases.
+const OFF_MARKS: &str = "\n- A color, a swatch or a tool icon that is not in marks is drawn on the page (a paint palette): still one click on its words, with the place the user said (\"change the color to red on the bottom\" -> click{target \"red\"}). Never a click on a menu with a similar name (\"Colors\") and never type the color name.";
+
+/// Color words. ponytail: a list; a color missing here only means the planner sees the base prompt.
+const COLOR_WORDS: &[&str] = &[
+    "color", "colour", "colors", "colours", "red", "blue", "green", "yellow", "black", "white", "orange", "purple", "pink", "gray",
+    "grey", "brown", "rojo", "roja", "azul", "verde", "amarillo", "negro", "blanco", "naranja", "morado", "rosado", "gris", "cafe",
+];
+
+/// Words of a "no, not that" correction. ponytail: a keyword list, like CORRECTION_WORDS.
+const RETRY_WORDS: &[&str] = &["no", "not", "other", "another", "wrong", "didn't", "didnt", "otra", "otro", "esa no", "eso no", "mal", "stop", "nope"];
+
+fn has_word(utterance: &str, list: &[&str]) -> bool {
     let u = format!(" {} ", crate::text::norm(utterance).replace(|c: char| !c.is_alphanumeric() && c != '\'', " "));
     let u = u.split_whitespace().collect::<Vec<_>>().join(" ");
-    let fix = CORRECTION_WORDS.iter().any(|w| format!(" {u} ").contains(&format!(" {w} ")));
-    if fix { format!("{PROMPT}{CORRECT_WORD}") } else { PROMPT.to_string() }
+    list.iter().any(|w| format!(" {u} ").contains(&format!(" {w} ")))
+}
+
+/// The prompt for one call: PROMPT, + correct_word for a spelling fix, + the off-marks click for a color, + retry for
+/// a correction of `previous`.
+pub fn system_for(utterance: &str, previous: bool) -> String {
+    let mut s = PROMPT.to_string();
+    if has_word(utterance, CORRECTION_WORDS) {
+        s.push_str(CORRECT_WORD);
+    }
+    if has_word(utterance, COLOR_WORDS) {
+        s.push_str(OFF_MARKS);
+    }
+    if previous && has_word(utterance, RETRY_WORDS) {
+        s.push_str(RETRY);
+    }
+    s
 }
 
 /// One planner action. Flat on purpose: it is the strict schema 1:1 (unused fields null).
@@ -85,7 +117,7 @@ pub struct Plan {
     pub type_here: bool,
 }
 
-pub const OPS: [&str; 11] = ["open_app", "key", "type", "click", "select_typed", "delete_typed", "copy", "paste", "scroll", "wait_user", "correct_word"];
+pub const OPS: [&str; 12] = ["open_app", "key", "type", "click", "select_typed", "delete_typed", "copy", "paste", "scroll", "wait_user", "correct_word", "retry"];
 
 pub fn schema() -> Value {
     let s = json!({"type": ["string", "null"]});
@@ -146,6 +178,13 @@ pub struct Input {
     /// "[N] " + `ax::describe` of each mark: N = the number drawn on screen.
     pub marks: Vec<String>,
     pub pending: Option<String>,
+    /// The last order, its actions and their results (live.rs `previous_line`): corrections refer to it (case 27).
+    pub previous: Option<String>,
+}
+
+/// `previous`, unless a question waits: then "no, bro" answers it ("Press Return?"), never retries the last click.
+fn previous(i: &Input) -> Option<&String> {
+    i.previous.as_ref().filter(|_| i.pending.is_none())
 }
 
 /// The user message. A secure field is `{"role": "secure"}`: no value, ever.
@@ -156,10 +195,15 @@ pub fn user_message(i: &Input) -> Value {
     } else {
         json!({"role": f.role.trim_start_matches("AX"), "name": f.name, "value": f.tail(), "selected": f.selected.as_deref().unwrap_or("")})
     };
-    json!({
+    let mut u = json!({
         "utterance": i.utterance, "final": i.last, "memory": i.memory, "app": i.app, "focused": focused,
         "marks": i.marks, "hints": hints_for(&i.app), "pending": i.pending,
-    })
+    });
+    // only when there is one: the bench input stays byte for byte otherwise
+    if let Some(p) = previous(i) {
+        u["previous"] = json!(p);
+    }
+    u
 }
 
 pub fn request(model: &str, user: &Value) -> Value {
@@ -203,6 +247,17 @@ pub fn parse(content: &str) -> anyhow::Result<Plan> {
         p.rest.clear();
     }
     Ok(p)
+}
+
+/// "LS command." = type + Return (vc-feedback 2): gpt-oss-120b dropped the Return 3 of 3 runs on 2026-10-18 with
+/// the prompt rule in place, and a prompt example moved 3 other cases. A plan that ends in a type for an order
+/// ending in "command" / "comando" gets the Return (the executor still asks before Return where it must).
+/// ponytail: only the last word; "the ls command, please" keeps the planner's answer.
+pub fn command_return(utterance: &str, p: &mut Plan) {
+    let last = crate::text::norm(utterance).trim_end_matches(|c: char| !c.is_alphanumeric()).rsplit(' ').next().unwrap_or("").to_string();
+    if matches!(last.as_str(), "command" | "comando") && p.actions.last().is_some_and(|a| a.op == "type") {
+        p.actions.push(Action { op: "key".into(), keys: Some("return".into()), ..Default::default() });
+    }
 }
 
 /// Spoken fillers that never belong in typed text.
@@ -266,13 +321,14 @@ pub fn plan(base: &str, key: &str, model: &str, input: &Input) -> anyhow::Result
         .header("HTTP-Referer", "https://susurro.app")
         .header("X-Title", "susurro")
         .timeout(TIMEOUT)
-        .json(&request_with(model, &system_for(&input.utterance), &user_message(input)));
+        .json(&request_with(model, &system_for(&input.utterance, previous(input).is_some()), &user_message(input)));
     let v = send_json(rb, "Planner")?;
     if let Some(e) = v.get("error") {
         anyhow::bail!("Planner: {}", e["message"].as_str().unwrap_or("error"));
     }
     let content = v["choices"][0]["message"]["content"].as_str().ok_or_else(|| anyhow::anyhow!("Planner: no message in the response"))?;
-    let p = parse(content)?;
+    let mut p = parse(content)?;
+    command_return(&input.utterance, &mut p);
     Ok((p, Meta { latency_ms: t.elapsed().as_millis() as u32, cost: v["usage"]["cost"].as_f64().unwrap_or(0.0) }))
 }
 
@@ -305,6 +361,7 @@ pub fn label(a: &Action) -> String {
         }
         "type" => format!("type {}", q(&a.text)),
         "click" => format!("click {}", q(&a.target)),
+        "retry" => format!("retry {} ({})", q(&a.target), a.text.as_deref().unwrap_or("")),
         "open_app" => format!("open {}", a.app.as_deref().unwrap_or("")),
         "select_typed" => "select typed".into(),
         "delete_typed" => "delete typed".into(),
@@ -335,10 +392,15 @@ mod tests {
     #[test]
     fn correct_word_prompt_only_for_spelling_fixes() {
         for u in ["Corrige: Jeff es Jev, J E V.", "The last thing you wrote, GAB must be Jev.", "No es Jeff, es jota e ve.", "fix the word type safe"] {
-            assert!(system_for(u).contains("correct_word{target, text}"), "{u}");
+            assert!(system_for(u, false).contains("correct_word{target, text}"), "{u}");
         }
         for u in ["Type hello there.", "LS command.", "Remove what you typed.", "Onto the top header, click the share button."] {
-            assert_eq!(system_for(u), PROMPT, "{u}");
+            assert_eq!(system_for(u, false), PROMPT, "{u}");
+            assert_eq!(system_for(u, true), PROMPT, "{u}: no correction, no retry text");
+        }
+        for u in ["No, on the bottom, not the top.", "No.", "The other one.", "I didn't say new tab, I say bottom bar.", "No, la otra."] {
+            assert!(system_for(u, true).contains("retry{target, text}"), "{u}");
+            assert!(!system_for(u, false).contains("retry{target, text}"), "{u}: no previous, no retry");
         }
     }
 
@@ -364,6 +426,29 @@ mod tests {
         assert_eq!(p.actions.iter().map(|a| a.op.as_str()).collect::<Vec<_>>(), ["key", "type", "key"]);
         assert_eq!(p.actions[1].text.as_deref(), Some("ls"));
         assert_eq!(meta.cost, 0.00045);
+    }
+
+    #[test]
+    fn command_return_only_after_a_final_command_word() {
+        let t = |u: &str, ops: &[(&str, Option<&str>)]| {
+            let mut p = Plan { actions: ops.iter().map(|(op, k)| Action { op: (*op).into(), keys: k.map(String::from), ..Default::default() }).collect(), ..Default::default() };
+            command_return(u, &mut p);
+            p.actions.iter().map(|a| a.op.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(t("LS command.", &[("type", None)]), ["type", "key"]);
+        assert_eq!(t("git status comando", &[("type", None)]), ["type", "key"]);
+        assert_eq!(t("LS command.", &[("type", None), ("key", Some("return"))]), ["type", "key"], "no second Return");
+        assert_eq!(t("Type LS.", &[("type", None)]), ["type"]);
+        assert_eq!(t("command", &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn previous_goes_out_only_when_no_question_waits() {
+        let i = Input { utterance: "No, bro.".into(), previous: Some("“click red” -> click “red”: clicked “Colors”".into()), ..Default::default() };
+        assert!(user_message(&i).get("previous").is_some());
+        let i = Input { pending: Some("Press Return in Ghostty?".into()), ..i };
+        assert!(user_message(&i).get("previous").is_none(), "a waiting confirm: no retry context");
+        assert!(!system_for(&i.utterance, previous(&i).is_some()).contains("retry{target, text}"));
     }
 
     #[test]

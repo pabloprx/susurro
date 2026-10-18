@@ -18,6 +18,26 @@ use tauri::{AppHandle, Emitter, Manager};
 /// What susurro did (and what Pablo asked), across sessions while the app runs. RAM only.
 /// ponytail: memory in RAM only; persist it if Pablo wants "undo what you did yesterday".
 pub static MEMORY: Mutex<Memory> = Mutex::new(VecDeque::new());
+/// The last order and what its actions did (case 27): (order number, the planner line). RAM only.
+static PREVIOUS: Mutex<Option<(u32, String)>> = Mutex::new(None);
+/// Bumped once per order the executor starts, across sessions (each session numbers its orders from 1), and when.
+static ORDER_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PREVIOUS_AT: AtomicI64 = AtomicI64::new(0);
+
+/// The planner's `previous` line, one action at a time: "“change the color to red” -> click “red”: clicked “Colors”
+/// (menu item, toolbar), not sure it is “red”". A new order starts a new line.
+pub fn previous_line(prev: Option<(u32, String)>, order: u32, said: &str, action: &str, end: &End) -> (u32, String) {
+    let what = match (&end.status, end.message.as_deref()) {
+        (CmdStatus::Done, _) => end.summary.clone(),
+        (s, Some(m)) => format!("{s:?}: {m}"),
+        (s, None) => format!("{s:?}"),
+    };
+    match prev {
+        Some((o, line)) if o == order => (o, format!("{line}; {action}: {what}")),
+        _ => (order, format!("“{}” -> {action}: {what}", said.trim())),
+    }
+}
+
 /// Entries older than this do not go to the planner.
 const MEMORY_FOR_PLANNER_MS: i64 = 10 * 60 * 1000;
 /// MAI requests in flight at once.
@@ -988,6 +1008,7 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 let mut mem = MEMORY.lock().unwrap().clone();
                 if order != last_order {
                     last_order = order;
+                    ORDER_KEY.fetch_add(1, Ordering::SeqCst);
                     let f = crate::ax::Field { app: crate::paste::target_app().and_then(|a| a.name).unwrap_or_default(), ..Default::default() };
                     command::remember(&mut mem, MemKind::Said, &said, &f, None);
                 }
@@ -1008,6 +1029,11 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 log::info!("live: step {step} (order {order}) {}: {:?} {} {:?}", planner::label(&action), end.status, end.summary, end.message);
                 if ctl.stopped.load(Ordering::SeqCst) {
                     continue; // Esc already ended the session: a new one may own the marks and the pill now
+                }
+                {
+                    let mut p = PREVIOUS.lock().unwrap();
+                    *p = Some(previous_line(p.take(), ORDER_KEY.load(Ordering::SeqCst), &said, &planner::label(&action), &end));
+                    PREVIOUS_AT.store(crate::history::now_ms(), Ordering::SeqCst);
                 }
                 if end.status != CmdStatus::Done {
                     // The rest of this order depends on this action.
@@ -1061,7 +1087,9 @@ const BOARD_AGAIN_MS: u64 = 1200;
 fn context(app: &AppHandle) -> (planner::Input, bool) {
     let _ = app;
     let t = Instant::now();
-    let mut input = planner::Input { memory: memory_lines(&MEMORY.lock().unwrap(), crate::history::now_ms()), ..Default::default() };
+    let fresh = crate::history::now_ms() - PREVIOUS_AT.load(Ordering::SeqCst) < MEMORY_FOR_PLANNER_MS;
+    let previous = PREVIOUS.lock().unwrap().as_ref().filter(|_| fresh).map(|p| p.1.clone());
+    let mut input = planner::Input { memory: memory_lines(&MEMORY.lock().unwrap(), crate::history::now_ms()), previous, ..Default::default() };
     let mut inputs = 0;
     #[cfg(target_os = "macos")]
     if crate::permissions::accessibility_trusted() {
@@ -1569,11 +1597,23 @@ mod tests {
 
     #[test]
     fn memory_lines_skip_old_and_said() {
-        let e = |at, kind, text: &str| command::Entry { e: MemoryEntry { at, kind, text: text.into(), app: "Ghostty".into(), field: "TextArea".into() }, pid: 1, role: String::new(), value_after: None };
+        let e = |at, kind, text: &str| command::Entry { e: MemoryEntry { at, kind, text: text.into(), app: "Ghostty".into(), field: "TextArea".into() }, pid: 1, role: String::new(), value_after: None, rect: None };
         let now = 1_760_000_000_000;
         let mem: Memory = [e(now - 11 * 60_000, MemKind::Typed, "old"), e(now - 1000, MemKind::Said, "type ls"), e(now - 500, MemKind::Typed, "ls")].into();
         let l = memory_lines(&mem, now);
         assert_eq!(l.len(), 1);
         assert!(l[0].ends_with(" typed 'ls' in Ghostty TextArea"), "{}", l[0]);
+    }
+
+    #[test]
+    fn previous_line_holds_the_last_order_and_what_it_did() {
+        let done = |s: &str| End { status: CmdStatus::Done, summary: s.into(), message: None, steps: 1 };
+        let said = "Now change the color to red on the bottom.";
+        let p = previous_line(None, 3, said, "click “red”", &done("clicked “Colors” (menu item, main), not sure it is “red”"));
+        assert_eq!(p, (3, format!("“{said}” -> click “red”: clicked “Colors” (menu item, main), not sure it is “red”")));
+        let p = previous_line(Some(p), 3, said, "⏎", &End { status: CmdStatus::Unsure, summary: String::new(), message: Some("nothing changed".into()), steps: 2 });
+        assert!(p.1.ends_with("; ⏎: Unsure: nothing changed"), "{}", p.1);
+        let p = previous_line(Some(p), 4, "No, on the bottom, not the top.", "retry “red” (bottom)", &done("clicked “red” (box, screen)"));
+        assert_eq!(p.1, "“No, on the bottom, not the top.” -> retry “red” (bottom): clicked “red” (box, screen)");
     }
 }

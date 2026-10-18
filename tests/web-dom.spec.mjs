@@ -215,3 +215,24 @@ test("fill refuses a password field even with its id", async ({ page }) => {
   expect(await run(page, { op: "fill", id: 5, value: "x" })).toEqual({ err: "secure" });
   expect(await run(page, { op: "bogus", id: 5 })).toEqual({ err: "op" });
 });
+
+// vc-feedback 26: JS Paint's palette is divs with data-color and no text; each swatch is a mark named by its color.
+const PALETTE = `
+<style>.palette{position:absolute;bottom:0;left:40px}.swatch{display:inline-block;width:16px;height:16px;margin:1px}</style>
+<div role="menubar"><div role="menuitem">Colors</div></div>
+<div class="palette">
+  <div class="swatch color-button" data-color="rgb(0,0,0)"></div><div class="swatch color-button" data-color="rgb(128,0,0)"></div>
+  <div class="swatch color-button" data-color="rgb(255,0,0)" onpointerdown="window.picked=this.dataset.color"></div>
+  <div class="swatch color-button" data-color="#0000ff"></div><div class="swatch color-button" title="Custom"></div>
+</div>`;
+
+test("paint palette: swatches are marks named by color, the click reaches pointerdown", async ({ page }) => {
+  await page.setContent(PALETTE);
+  const els = await scan(page);
+  expect(els.map((e) => e.name)).toEqual(["Colors", "black color", "dark red color", "red color", "blue color", "Custom"]);
+  const red = named(els, "red color")[0];
+  expect(red.role).toBe("button");
+  const r = await run(page, { op: "click", id: red.id, name: "red color" });
+  expect(r.err).toBeUndefined();
+  expect(await page.evaluate(() => window.picked)).toBe("rgb(255,0,0)");
+});

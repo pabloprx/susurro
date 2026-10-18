@@ -10,7 +10,11 @@
       "marks": ["Chats (button, sidebar)", "Archived (button, sidebar)", "coding vibes (row, sidebar)", "Type a message (text area, bottom)", "Send (button, bottom)"]},
     "slack": {"app": "Slack", "focused": {"role": "AXTextArea", "name": "Message #general", "value": ""},
       "marks": ["Home (button, sidebar)", "DMs (button, sidebar)", "# general (link, sidebar)", "Comercial X (link, sidebar)", "Pablo (tú) (row, sidebar)",
-                "Search (button, toolbar)", "Message #general (text area, bottom)", "Send now (button, bottom)"]}
+                "Search (button, toolbar)", "Message #general (text area, bottom)", "Send now (button, bottom)"]},
+    "edge_newtab": {"app": "Microsoft Edge", "focused": {"role": "AXWebArea", "name": "", "value": ""},
+      "marks": ["[1] JS Paint (tab, toolbar)", "[2] New Tab (button, toolbar)", "[3] Back (button, toolbar, disabled)", "[4] Refresh (button, toolbar)", "[5] Address and search bar (text field, toolbar)", "[6] Favorites (button, toolbar)", "[7] Copilot (button, toolbar)", "[8] Settings and more (button, toolbar)", "[9] Search the web (search field, main)", "[10] Outlook (link, main)", "[11] YouTube (link, main)", "[12] LinkedIn (link, main)"]},
+    "jspaint": {"app": "Microsoft Edge", "focused": {"role": "AXWebArea", "name": "JS Paint", "value": ""},
+      "marks": ["[1] JS Paint (tab, toolbar)", "[2] New Tab (button, toolbar)", "[3] Back (button, toolbar)", "[4] Refresh (button, toolbar)", "[5] Address and search bar (text field, toolbar)", "[6] Settings and more (button, toolbar)", "[7] File (menu item, main)", "[8] Edit (menu item, main)", "[9] View (menu item, main)", "[10] Image (menu item, main)", "[11] Colors (menu item, main)", "[12] Help (menu item, main)", "[13] Free-Form Select (button, sidebar)", "[14] Select (button, sidebar)", "[15] Eraser/Color Eraser (button, sidebar)", "[16] Fill With Color (button, sidebar)", "[17] Pick Color (button, sidebar)", "[18] Magnifier (button, sidebar)", "[19] Pencil (button, sidebar, on)", "[20] Brush (button, sidebar)", "[21] Airbrush (button, sidebar)", "[22] Text (button, sidebar)"]}
   },
   "cases": [
     {"id": "type_ls", "case": 1, "utterance": "Type LS.", "screen": "ghostty",
@@ -66,7 +70,8 @@
      "memory": ["21:09:45 copied 'https://chatgpt.com/share/6a1f' in Google Chrome", "21:10:19 clicked 'coding vibes' in WhatsApp"],
      "accept": [{"complete": true, "actions": [{"op": "paste"}]}, {"complete": true, "actions": [{"op": "paste", "target": ["type a message"]}]}]},
     {"id": "search_elevenlabs", "case": 18, "utterance": "Search for ElevenLabs.", "screen": "chrome",
-     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+l"}, {"op": "type", "text_ci": "elevenlabs"}, {"op": "key", "keys": "return"}]}]},
+     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+l"}, {"op": "type", "text_ci": "elevenlabs"}, {"op": "key", "keys": "return"}]},
+                {"complete": true, "actions": [{"op": "click", "target": ["search"]}, {"op": "type", "text_ci": "elevenlabs"}, {"op": "key", "keys": "return"}]}]},
     {"id": "confirm_answer", "case": 2, "utterance": "Yeah, go ahead.", "screen": "ghostty", "pending": "Press Return? Say yes · F11 · Esc",
      "accept": [{"complete": true, "actions": [], "answer": "yes"}]},
     {"id": "noise", "case": 10, "utterance": "Voilà.", "screen": "ghostty",
@@ -75,6 +80,21 @@
      "accept": [{"complete": true, "actions": [{"op": "click", "target": ["comercial x"]}]},
                 {"complete": true, "actions": [{"op": "key", "keys": "cmd+k"}, {"op": "type", "text_ci": "Comercial X"}, {"op": "key", "keys": "return"}]}]},
     {"id": "slack_dm_keyboard", "case": 26, "utterance": "Abre el DM con Ana Silva.", "screen": "slack",
-     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+k"}, {"op": "type", "text_ci": "Ana Silva"}, {"op": "key", "keys": "return"}]}]}
+     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+k"}, {"op": "type", "text_ci": "Ana Silva"}, {"op": "key", "keys": "return"}]}]},
+    {"id": "edge_newtab_search_0151", "case": 25, "utterance": "Now on Edge, open a new tab and search for GS Paint. Open that.", "screen": "edge_newtab",
+     "accept": [{"complete": true, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]},
+                {"complete": true, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "click", "target": ["address"]}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]},
+                {"complete": false, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]},
+                {"complete": false, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "click", "target": ["address"]}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]},
+                {"complete": true, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "key", "keys": "cmd+l"}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]},
+                {"complete": false, "actions": [{"op": "key", "keys": "cmd+t"}, {"op": "key", "keys": "cmd+l"}, {"op": "type", "text_ci": "GS Paint"}, {"op": "key", "keys": "return"}]}]},
+    {"id": "jspaint_red_0152", "case": 26, "utterance": "Now there select the pencil, it's already selected. Now change the color to red on the bottom.", "screen": "jspaint",
+     "accept": [{"complete": true, "actions": [{"op": "click", "target": ["red"]}]}]},
+    {"id": "jspaint_correction_0152", "case": 27, "utterance": "No, on the bottom, not the top.", "screen": "jspaint", "previous": "“Now there select the pencil, it's already selected. Now change the color to red on the bottom.” -> click “red”: clicked “Colors” (menu item, main), not sure it is “red”", "memory": ["15:52:28 clicked 'Colors' in Microsoft Edge"],
+     "accept": [{"complete": true, "actions": [{"op": "retry", "target": ["red"]}]}]},
+    {"id": "jspaint_no_0152", "case": 27, "utterance": "No.", "screen": "jspaint", "previous": "“No, on the bottom, not the top.” -> retry “red” (bottom, not the top): clicked “red” (box, screen)",
+     "accept": [{"complete": true, "actions": []}]},
+    {"id": "confirm_no_bro_0152", "case": 27, "utterance": "No, bro, not yet.", "screen": "ghostty", "pending": "Press Return? Say yes · F11 · Esc", "previous": "“LS command.” -> type “ls”: typed “ls”",
+     "accept": [{"complete": true, "actions": [], "answer": "no"}, {"complete": true, "actions": []}]}
   ]
 }

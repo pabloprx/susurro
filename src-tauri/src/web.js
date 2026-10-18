@@ -5,7 +5,7 @@
   try {
     var ATTR = "data-susurro-id";
     var MAX = 150;
-    var SEL = 'a[href],button,input,textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=radio],[role=option],[role=combobox],[role=searchbox],[role=textbox],[onclick],[contenteditable=""],[contenteditable=true]';
+    var SEL = 'a[href],button,input,textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=radio],[role=option],[role=combobox],[role=searchbox],[role=textbox],[onclick],[contenteditable=""],[contenteditable=true],[data-color],.swatch,[class*=color-button]';
     var NATIVE = { A: 1, BUTTON: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, SUMMARY: 1 };
     var clip = function (s) {
       s = (s || "").replace(/\s+/g, " ").trim();
@@ -82,6 +82,30 @@
       var alt = img && (img.getAttribute("alt") || img.getAttribute("aria-label"));
       return clip(alt || e.title || "");
     };
+    // A paint palette swatch (JS Paint: div.swatch.color-button[data-color], no text): named by its color, "red".
+    // ponytail: the nearest of a few named colors; add a name here when a swatch reads wrong.
+    var COLORS = [["black", 0, 0, 0], ["white", 255, 255, 255], ["gray", 128, 128, 128], ["silver", 192, 192, 192], ["red", 255, 0, 0],
+      ["dark red", 128, 0, 0], ["yellow", 255, 255, 0], ["olive", 128, 128, 0], ["green", 0, 255, 0], ["dark green", 0, 128, 0],
+      ["cyan", 0, 255, 255], ["teal", 0, 128, 128], ["blue", 0, 0, 255], ["navy", 0, 0, 128], ["magenta", 255, 0, 255],
+      ["purple", 128, 0, 128], ["orange", 255, 128, 64], ["brown", 128, 64, 0], ["pink", 255, 0, 128], ["light blue", 128, 128, 255]];
+    var colorName = function (e) {
+      var c = e.getAttribute("data-color") || getComputedStyle(e).backgroundColor || "";
+      var m = c.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
+      var v = m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : (c.match(/\d+(\.\d+)?/g) || []).slice(0, 3).map(Number);
+      if (v.length < 3 || /^rgba\(.*,\s*0\)$/.test(c)) return "";
+      var best = COLORS.reduce(function (b, n) {
+        var d = Math.pow(n[1] - v[0], 2) + Math.pow(n[2] - v[1], 2) + Math.pow(n[3] - v[2], 2);
+        return d < b[1] ? [n[0], d] : b;
+      }, ["", Infinity]);
+      return best[0] + " color";
+    };
+    var swatch = function (e) {
+      return e.hasAttribute("data-color") || /(^|\s)(swatch|color-button)(\s|$)/.test(e.className || "");
+    };
+    var markName = function (e) {
+      var nm = nameOf(e);
+      return !nm && swatch(e) ? colorName(e) : nm;
+    };
     var stateOf = function (e) {
       if (e.tagName === "INPUT" && (e.type === "checkbox" || e.type === "radio")) return e.checked ? "on" : "off";
       var c = e.getAttribute("aria-checked") || e.getAttribute("aria-pressed");
@@ -122,7 +146,7 @@
         if (secret(e) || e.disabled || e.getAttribute("aria-disabled") === "true" || (e.tagName === "INPUT" && e.type === "hidden")) continue;
         var r = e.getBoundingClientRect();
         if (!shown(e, r)) continue;
-        cands.push({ e: e, r: r, role: roleOf(e), name: nameOf(e) });
+        cands.push({ e: e, r: r, role: roleOf(e), name: markName(e) });
       }
       // Leaves, not containers: drop a candidate that wraps another one with the same name, and a non-native
       // wrapper (onclick div, role=button card) around a real link / button / field.
@@ -160,7 +184,7 @@
     if (P.op === "sig") return JSON.stringify({ sig: sig(), url: location.href, title: document.title });
     if (!el) return JSON.stringify({ err: "gone" });
     // the page re-rendered since the scan: the node with this id now shows something else (a reused list row)
-    if (typeof P.name === "string" && nameOf(el) !== P.name) return JSON.stringify({ err: "gone" });
+    if (typeof P.name === "string" && markName(el) !== P.name) return JSON.stringify({ err: "gone" });
     if (P.op !== "fill") el.scrollIntoView({ block: P.op === "scroll" ? "center" : "nearest", inline: "nearest" });
     if (P.op === "click") {
       addEventListener("beforeunload", function () { document.documentElement.setAttribute(ATTR + "-nav", String(Date.now())); }, { once: true });

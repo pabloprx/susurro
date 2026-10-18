@@ -1,7 +1,7 @@
 //! Real-API planner scenarios (VOICE_CONTROL_V2 section 8): the production `planner::PROMPT`, request and parse on
 //! `tests/fixtures/planner_cases.json` (every planner-side case of `.lo/vc-feedback.md`). Sequential calls.
 //! `OPENROUTER_API_KEY=... cargo test --test planner_real -- --ignored --nocapture --test-threads=1`
-//! Env: PLANNER_MODEL (default contract::DEFAULT_PLANNER), RUNS (default 2).
+//! Env: PLANNER_MODEL (default contract::DEFAULT_PLANNER), RUNS (default 2), ONLY (comma-separated case ids).
 
 use serde_json::Value;
 use susurro_lib::ax::Field;
@@ -104,6 +104,7 @@ fn input(c: &Value, screens: &Value) -> Input {
         memory: c["memory"].as_array().map(|m| m.iter().map(s).collect()).unwrap_or_default(),
         marks: sc["marks"].as_array().unwrap().iter().map(s).collect(),
         pending: c["pending"].as_str().map(String::from),
+        previous: c["previous"].as_str().map(String::from),
     }
 }
 
@@ -115,11 +116,13 @@ fn planner_cases() {
     let runs: usize = std::env::var("RUNS").ok().and_then(|r| r.parse().ok()).unwrap_or(2);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/planner_cases.json");
     let fx: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let cases = fx["cases"].as_array().unwrap();
+    // ONLY=id1,id2: just those cases (a cheap re-run)
+    let only = std::env::var("ONLY").ok();
+    let cases: Vec<&Value> = fx["cases"].as_array().unwrap().iter().filter(|c| only.as_deref().is_none_or(|o| o.split(',').any(|id| c["id"] == id))).collect();
     let (mut pass, mut total, mut cost, mut lat) = (0, 0, 0.0, vec![]);
     let mut misses = vec![];
     for run in 1..=runs {
-        for c in cases {
+        for c in &cases {
             let id = c["id"].as_str().unwrap();
             total += 1;
             match planner::plan_openrouter(&key, &model, &input(c, &fx["screens"])) {

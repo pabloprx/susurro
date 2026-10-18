@@ -486,8 +486,9 @@ pub fn tied(c: &[(u32, f32)]) -> Vec<(u32, f32)> {
 }
 
 /// Region words in an order or an answer -> the mark region they name.
-const REGION_WORDS: [(&[&str], &str); 3] = [
+const REGION_WORDS: [(&[&str], &str); 4] = [
     (&["sidebar", "lateral"], "sidebar"),
+    (&["bottom", "abajo", "inferior", "debajo"], "bottom"),
     (&["toolbar", "barra", "pestaña", "pestana", "tab"], "toolbar"),
     (&["principal", "main", "contenido", "content", "pagina", "page", "resultado", "result"], "main"),
 ];
@@ -753,6 +754,28 @@ pub fn decide(instr: &str, app: &str, els: &[El], ask: &mut Ask, shot: &mut dyn 
     Ok(d)
 }
 
+/// Words of a target that name no element: articles, ordinals, roles, places, verbs ("the first link", "el botón
+/// de arriba"). ponytail: a word list; a missing word only sends a good match to the box.
+const GENERIC: &[&str] = &[
+    "the", "a", "an", "el", "la", "los", "las", "un", "una", "de", "del", "on", "in", "at", "to", "of", "en", "and", "or", "y",
+    "with", "con", "for", "para", "first", "second", "third", "last", "primer", "primera", "primero", "segundo", "segunda",
+    "tercer", "tercera", "ultimo", "ultima", "one", "uno", "link", "enlace", "button", "boton", "tab", "pestana", "field",
+    "campo", "box", "input", "result", "resultado", "item", "icon", "icono", "menu", "option", "opcion", "this", "that",
+    "it", "esto", "eso", "ese", "esa", "este", "esta", "top", "bottom", "left", "right", "arriba", "abajo", "izquierda",
+    "derecha", "sidebar", "toolbar", "main", "page", "pagina", "bar", "barra", "click", "open", "abre", "select", "press",
+    "not", "no", "other", "otra", "otro", "thing", "cosa",
+];
+
+/// The target words name this element (case 26): some content word of `words` starts a word of `name`, or the
+/// other way round ("pricing" / "Pricing | Acme", "la factura" / "Enviar factura"). Only generic words
+/// ("the first link") = true: Jev's pick stands. "red" / "Colors" = false: no fuzzy map to another element.
+pub fn names(words: &str, name: &str) -> bool {
+    let words = words.split(" (").next().unwrap_or(words);
+    let content: Vec<String> = said_words(words).into_iter().filter(|w| w.chars().count() >= 2 && !GENERIC.contains(&w.as_str())).collect();
+    let name = said_words(name);
+    content.is_empty() || content.iter().any(|w| name.iter().any(|n| (w.len() >= 3 && n.starts_with(w.as_str())) || (n.len() >= 3 && w.starts_with(n.as_str())) || n == w))
+}
+
 /// The planner's target words name one mark exactly (it copies "Share (button, toolbar)" from the marks it saw):
 /// no Jev call. Tried in order: the full label, "name (role)", the name. Two matches = ambiguous = None.
 pub fn local_match<'a>(words: &str, els: &'a [El]) -> Option<&'a El> {
@@ -968,6 +991,8 @@ pub struct Entry {
     pub role: String,
     /// The field value right after susurro's paste (the undo strategy checks nothing changed since).
     pub value_after: Option<String>,
+    /// Clicked: the element's rect, so a retry skips that one element and not its namesakes (two "Share" buttons).
+    pub rect: Option<PtRect>,
 }
 
 pub type Memory = VecDeque<Entry>;
@@ -979,9 +1004,18 @@ pub fn remember(mem: &mut Memory, kind: MemKind, text: &str, f: &Field, value_af
         pid: f.pid,
         role: f.role.clone(),
         value_after,
+        rect: None,
     });
     while mem.len() > MEMORY_MAX {
         mem.pop_front();
+    }
+}
+
+/// Remember a click with the element's rect (a retry skips that one element).
+fn clicked(mem: &mut Memory, h: &Hit, f: &Field) {
+    remember(mem, MemKind::Clicked, &h.mark.name, f, None);
+    if let Some(m) = mem.back_mut() {
+        m.rect = Some(h.mark.rect);
     }
 }
 
@@ -997,6 +1031,8 @@ struct Run {
     said: String,
     /// The front app's kind, from the last screen read.
     kind: Kind,
+    /// retry (case 27): the last click (name, rect, app); that element is never the answer again.
+    not: Option<(String, Option<PtRect>, String)>,
 }
 
 impl Run {
@@ -1041,21 +1077,38 @@ struct Hit {
     picked: bool,
     /// Pablo clicked it himself: the app already got the click.
     by_user: bool,
+    /// Jev was sure of it (>= CONF_MIN): a synonym, not a guess; no "not sure" in the pill.
+    sure: bool,
 }
 
 impl Hit {
     fn of(e: &El, risky: f32) -> Self {
-        Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky, picked: false, by_user: false }
+        Hit { target: Target::Mark(e.mark.id), mark: e.mark.clone(), url: e.url.clone(), value: e.value.clone(), risky, picked: false, by_user: false, sure: false }
     }
 }
 
 /// Read the screen and find `words` on it. Err = the run ended (unsure, setup, pick refused...).
 fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn Desk) -> Result<Hit, End> {
-    let scr = match desk.read() {
+    let mut scr = match desk.read() {
         Ok(s) => s,
         Err(e) if e == "accessibility" => return Err(r.fail(desk, CmdStatus::Setup, "accessibility")),
         Err(e) => return Err(r.fail(desk, CmdStatus::Unsure, &e)),
     };
+    if let Some((name, rect, app)) = r.not.clone() {
+        // Pablo changed apps since the click: "no, the other one" is not about this window
+        if !app.is_empty() && !scr.app.is_empty() && app != scr.app {
+            return Err(r.fail(desk, CmdStatus::Unsure, &format!("The last click was in {app}, not {}", scr.app)));
+        }
+        let same = |e: &El| e.mark.name.eq_ignore_ascii_case(&name);
+        // namesakes ("the other Share"): drop only the one nearest to where the last click was
+        let near = rect.filter(|_| scr.els.iter().filter(|e| same(e)).count() > 1).and_then(|rc| {
+            let (x, y) = center(rc);
+            let d = |e: &&El| (center(e.mark.rect).0 - x).powi(2) + (center(e.mark.rect).1 - y).powi(2);
+            scr.els.iter().filter(|e| same(e)).min_by(|a, b| d(a).total_cmp(&d(b))).map(|e| e.mark.id)
+        });
+        // a box click has no name: its rect alone keeps the next box off that spot (box_ground)
+        scr.els.retain(|e| if near.is_some() { Some(e.mark.id) != near } else { name.is_empty() || !same(e) });
+    }
     r.kind = scr.kind;
     // the marks Pablo read a number from, before this read replaces them on screen
     let board = desk.board();
@@ -1080,12 +1133,13 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
     }
     let words = split_mark(words).1;
     let instr = format!("{verb} {words}");
+    // the box sees what Pablo said too: "red" + "on the bottom" (case 26)
+    let instr_said = if r.said.trim().is_empty() { instr.clone() } else { format!("{instr} (the user said: \"{}\")", r.said.trim()) };
     if scr.els.len() < MIN_AX {
-        return ocr_ground(r, &instr, words, &scr, ask, desk);
+        return ocr_ground(r, &instr_said, words, &scr, ask, desk);
     }
     if pick_mode {
-        let instr = if r.said.trim().is_empty() { instr } else { format!("{instr} (the user said: \"{}\")", r.said.trim()) };
-        return choose(r, &instr, &scr, local.map(|e| e.mark.id), ask, desk);
+        return choose(r, &instr_said, &scr, local.map(|e| e.mark.id), ask, desk);
     }
     let display = scr.display;
     let d = {
@@ -1102,6 +1156,11 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
     (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + d.latency_ms, r.st.cost_usd + d.cost);
     if desk.aborted() {
         return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
+    }
+    // Jev: no mark fits (a palette color, an icon on a canvas, case 26): look at the pixels
+    if d.target.choice == "none" && desk.screen_ok() {
+        log::warn!("{words:?} has no mark (Jev: none): the box");
+        return box_ground(r, &instr_said, &scr, ask, desk);
     }
     let conf = if d.target.choice == "none" { 0.0 } else { d.target.confidence };
     if d.need_screen && conf < CONF_MIN {
@@ -1123,7 +1182,14 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
     let keep = prior(&c.iter().map(|x| x.0).collect::<Vec<_>>(), &scr.els, &order, scr.page);
     let el = |id: u32| scr.els.iter().find(|e| e.mark.id == id);
     match keep.as_slice() {
-        [one] => el(*one).map(|e| Hit::of(e, d.risky)).ok_or_else(|| r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
+        // Jev's pick has another name ("red" -> the menu "Colors", case 26): no such mark, so look at the pixels
+        // Jev sure of a synonym ("search" -> "Buscar" 0.98, "settings" -> "Preferencias" 0.91; "red" -> "Colors" was
+        // 0.32, measured 2026-10-18) is no mismatch: only a weak pick with another name goes to the box.
+        [one] if conf < CONF_MIN && el(*one).is_some_and(|e| !names(words, &e.mark.name)) => {
+            log::warn!("{words:?} has no mark (Jev: {:?}): the box", el(*one).map(|e| e.mark.name.as_str()));
+            box_ground(r, &instr_said, &scr, ask, desk)
+        }
+        [one] => el(*one).map(|e| Hit { sure: conf >= CONF_MIN, ..Hit::of(e, d.risky) }).ok_or_else(|| r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
         [] => Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE)),
         many => {
             let c: Vec<(u32, f32)> = c.into_iter().filter(|x| many.contains(&x.0)).collect();
@@ -1264,7 +1330,8 @@ fn ocr_ground(r: &mut Run, instr: &str, words: &str, scr: &Screen, ask: &mut Ask
             let d = decide(instr, &scr.app, &els, ask, &mut || None).map_err(|e| r.fail(desk, CmdStatus::Error, &format!("{e:#}")))?;
             (r.st.latency_ms, r.st.cost_usd) = (r.st.latency_ms + d.latency_ms, r.st.cost_usd + d.cost);
             let id = d.target.choice.parse::<u32>().ok().filter(|_| d.target.confidence >= UNSURE_MIN);
-            id.and_then(|id| els.iter().find(|e| e.mark.id == id)).map(|e| (e, d.risky))
+            let sure = d.target.confidence >= CONF_MIN;
+            id.and_then(|id| els.iter().find(|e| e.mark.id == id)).filter(|e| sure || names(words, &e.mark.name)).map(|e| (e, d.risky))
         }
     };
     if desk.aborted() {
@@ -1273,7 +1340,7 @@ fn ocr_ground(r: &mut Run, instr: &str, words: &str, scr: &Screen, ask: &mut Ask
     match found {
         Some((e, risky)) => {
             let (x, y) = center(e.mark.rect);
-            Ok(Hit { target: Target::Point(x, y), mark: e.mark.clone(), url: None, value: None, risky, picked: false, by_user: false })
+            Ok(Hit { target: Target::Point(x, y), mark: e.mark.clone(), url: None, value: None, risky, picked: false, by_user: false, sure: false })
         }
         None => box_ground(r, instr, scr, ask, desk),
     }
@@ -1301,12 +1368,18 @@ fn box_ground(r: &mut Run, instr: &str, scr: &Screen, ask: &mut Ask, desk: &mut 
         return Err(r.end(desk, CmdStatus::Stopped, None, String::new()));
     }
     let p = center(rect);
+    // a retry's box must not land on the element the last click hit (only its namesakes left the marks)
+    if let Some((_, Some(rc), _)) = &r.not {
+        if p.0 >= rc.x && p.0 <= rc.x + rc.w && p.1 >= rc.y && p.1 <= rc.y + rc.h {
+            return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE));
+        }
+    }
     Ok(match snap(p, &scr.els) {
         Some(e) => Hit::of(e, risky),
         None => {
             let mark = Mark { id: 1, rect, name: String::new(), role: "box".into(), region: "screen".into() };
             r.st.marks = vec![mark.clone()];
-            Hit { target: Target::Point(p.0, p.1), mark, url: None, value: None, risky, picked: false, by_user: false }
+            Hit { target: Target::Point(p.0, p.1), mark, url: None, value: None, risky, picked: false, by_user: false, sure: false }
         }
     })
 }
@@ -1352,7 +1425,7 @@ fn focus_target(r: &mut Run, words: &str, ask: &mut Ask, desk: &mut dyn Desk) ->
 /// Runs one planner action. `step` numbers the action in the session, `order` the planner reply it came from.
 pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
     let st = CommandStep { instruction: crate::planner::label(a), step, max: 0, status: CmdStatus::Thinking, op: Some(a.op.clone()), order, ..Default::default() };
-    let mut r = Run { st, choose: cfg.choose, said: a.said.clone(), kind: Kind::Native };
+    let mut r = Run { st, choose: cfg.choose, said: a.said.clone(), kind: Kind::Native, not: None };
     if desk.aborted() {
         return r.end(desk, CmdStatus::Stopped, None, String::new());
     }
@@ -1423,13 +1496,42 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             let into = hit.map(|h| format!(" into {}", quote(&h.mark.name))).unwrap_or_default();
             r.done(desk, format!("typed {}{into}", quote(&text)))
         }
-        "click" => {
+        "click" | "retry" => {
             let Some(t) = target else { return r.fail(desk, CmdStatus::Unsure, NOT_SURE) };
             r.st.action = Some("click".into());
+            if a.op == "retry" {
+                // case 27: the last target again, with Pablo's constraint ("bottom, not the top"), never the same element
+                let constraint = text.trim();
+                r.said = format!("{t} {constraint} {}", r.said).trim().to_string();
+                r.not = mem.iter().rev().find(|m| m.e.kind == MemKind::Clicked).map(|m| (m.e.text.clone(), m.rect, m.e.app.clone()));
+            }
             let h = match ground(&mut r, "click", t, ask, desk) {
                 Ok(h) => h,
                 Err(end) => return end,
             };
+            let words = split_mark(t).1;
+            // case 25: a text field that has the keys already (cmd+t / cmd+l focus the omnibox) needs no click; a
+            // toolbar field takes AXFocused before any click (a real click there can hit the dropdown over it)
+            let has_keys = |f: &Field| ax::takes_text(&h.mark.role) && !h.mark.name.is_empty() && f.name == h.mark.name && f.role.starts_with("AX");
+            if ax::takes_text(&h.mark.role) && !h.by_user {
+                let f = desk.focused();
+                if has_keys(&f) {
+                    aim(&mut r, desk, &h);
+                    clicked(mem, &h, &f);
+                    return r.done(desk, format!("{} has the keys", quote(&h.mark.name)));
+                }
+                if h.mark.region == "toolbar" && matches!(h.target, Target::Mark(_)) && !desk.aborted() {
+                    aim(&mut r, desk, &h);
+                    if desk.act(&Act::Focus(h.target.clone())).is_ok() {
+                        desk.sleep(FOCUS_MS);
+                        let f = desk.focused();
+                        if has_keys(&f) {
+                            clicked(mem, &h, &f);
+                            return r.done(desk, format!("focused {}", quote(&h.mark.name)));
+                        }
+                    }
+                }
+            }
             // Pablo picked or clicked it himself: that was his yes.
             let risky = !h.picked && (a.risky || h.risky >= RISKY_MIN);
             if gate(1.0, if risky { 1.0 } else { 0.0 }, cfg.confirm_risky) == Gate::Confirm {
@@ -1440,7 +1542,8 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             }
             aim(&mut r, desk, &h);
             if h.by_user {
-                remember(mem, MemKind::Clicked, &h.mark.name, &desk.focused(), None);
+                let f = desk.focused();
+                clicked(mem, &h, &f);
                 return r.done(desk, format!("you clicked {} ({})", quote(&h.mark.name), h.mark.role));
             }
             if let Target::Point(x, y) = h.target {
@@ -1462,6 +1565,12 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             if before.is_some() && desk.sig() == before {
                 log::info!("click on {} changed nothing: a real click", h.mark.name);
                 if let Err(e) = desk.act(&Act::RealClick(h.target.clone())) {
+                    // "something covers" the field we wanted the keys in, and it has them: that is the goal
+                    let f = desk.focused();
+                    if has_keys(&f) {
+                        clicked(mem, &h, &f);
+                        return r.done(desk, format!("focused {}", quote(&h.mark.name)));
+                    }
                     return r.fail(desk, CmdStatus::Error, &format!("{e:#}"));
                 }
                 desk.sleep(SETTLE_MS);
@@ -1469,8 +1578,17 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
                     return r.fail(desk, CmdStatus::Unsure, &format!("Clicked {} but nothing changed", quote(&h.mark.name)));
                 }
             }
-            remember(mem, MemKind::Clicked, &h.mark.name, &f, None);
-            r.done(desk, format!("clicked {} ({})", quote(&h.mark.name), h.mark.role))
+            clicked(mem, &h, &f);
+            // case 28: say it when what was clicked has another name than what Pablo asked for
+            let place = if h.mark.region.is_empty() { h.mark.role.clone() } else { format!("{}, {}", h.mark.role, h.mark.region) };
+            if h.mark.name.is_empty() {
+                return r.done(desk, format!("clicked {} ({place})", quote(words)));
+            }
+            if !h.sure && !h.picked && !names(words, &h.mark.name) {
+                log::warn!("click {words:?} landed on {:?}", h.mark.name);
+                return r.done(desk, format!("clicked {} ({place}), not sure it is {}", quote(&h.mark.name), quote(words)));
+            }
+            r.done(desk, format!("clicked {} ({place})", quote(&h.mark.name)))
         }
         "open_app" => {
             let said = a.app.clone().unwrap_or_default();
@@ -2435,6 +2553,10 @@ mod tests {
         sigs: VecDeque<u64>,
         /// What OCR reads.
         lines: Vec<crate::ocr::Line>,
+        /// A real click's hit-test finds something over the target (Edge's omnibox at 15:51:55).
+        covered: bool,
+        /// `capture` crops this PNG (global points x `scale` = px, python3 + PIL) instead of the fake bytes: real Jev box tests.
+        image: Option<(std::path::PathBuf, f64)>,
     }
 
     impl FakeDesk {
@@ -2498,8 +2620,18 @@ mod tests {
         fn screen_ok(&mut self) -> bool {
             self.screen_ok
         }
-        fn capture(&mut self, _: PtRect, _: bool) -> anyhow::Result<Vec<u8>> {
-            Ok(b"\xff\xd8jpeg".to_vec())
+        fn capture(&mut self, r: PtRect, native: bool) -> anyhow::Result<Vec<u8>> {
+            let Some((png, scale)) = self.image.clone() else { return Ok(b"\xff\xd8jpeg".to_vec()) };
+            // PIL crops (sips -c ignores --cropOffset on this macOS); the first pass is downscaled like the real one
+            let out = std::env::temp_dir().join(format!("susurro-fake-{}-{}.jpg", std::process::id(), self.acts.len() + self.sleeps.len()));
+            let py = "import sys; from PIL import Image; a = sys.argv; im = Image.open(a[1]).convert('RGB').crop(tuple(round(float(v)) for v in a[3:7])); \
+                      im.thumbnail((1568, 1568)) if a[7] == '0' else None; im.save(a[2], 'JPEG', quality=90)";
+            let box_px = [r.x, r.y, r.x + r.w, r.y + r.h].map(|v| (v * scale).to_string());
+            let ok = std::process::Command::new("python3").args(["-I", "-c", py]).arg(&png).arg(&out).args(box_px).arg(if native { "1" } else { "0" }).status()?.success();
+            anyhow::ensure!(ok, "PIL crop failed");
+            let b = std::fs::read(&out)?;
+            let _ = std::fs::remove_file(&out);
+            Ok(b)
         }
         fn act(&mut self, a: &Act) -> anyhow::Result<()> {
             assert!(!self.aborted(), "an action ran after the abort");
@@ -2536,7 +2668,14 @@ mod tests {
                     let t = self.clip.0.clone().unwrap_or_default();
                     self.f().insert(&t);
                 }
-                Act::Combo(17, CMD) => self.tabs += 1,
+                Act::Combo(17, CMD) => {
+                    // a browser's new tab puts the keys in its address bar
+                    self.tabs += 1;
+                    if let Some(i) = self.fields.iter().position(|f| f.name == "Address and search bar") {
+                        self.focus = i;
+                    }
+                }
+                Act::RealClick(_) if self.covered => anyhow::bail!("something covers it"),
                 Act::Burst(LEFT, f, n) if f == OPT | SHIFT => {
                     // select n words left of the caret
                     let fl = self.f();
@@ -3839,5 +3978,205 @@ mod tests {
         assert!(done(&log[1].4) && matches!(log[1].0.first(), Some(Act::Combo(37, CMD) | Act::Click(Target::Mark(3)))) && log[1].1 == ["YouTube"] && log[1].0.last() == Some(&Act::Combo(36, 0)) && log[1].2.is_empty(), "cmd+l or the only search field, YouTube, Return: no pick, no confirm");
         assert!(done(&log[2].4) && log[2].3.as_ref().is_some_and(|c| c.starts_with(&[40, 41, 42])) && log[2].0 == [Act::Click(Target::Mark(40))], "pick list, 'uno' clicks 40");
         assert!(done(&log[3].4) && log[3].0 == [Act::Click(Target::Mark(41))] && log[3].2.is_empty(), "41 clicks mark 41, no list");
+    }
+
+
+    // ---------- Pablo's session 2026-10-18 15:51-15:53 UTC (vc-feedback 25-28) on a fake desk ----------
+
+    /// The Edge screen around 15:51:55 (JS from Apple Events off: the AX path), a JS Paint page under it.
+    fn edge_0151(page: &[El]) -> Screen {
+        let mut els = vec![mk(1, "JS Paint", "tab", "toolbar", None, None), mk(2, "New Tab", "button", "toolbar", None, None), mk(3, "Address and search bar", "text field", "toolbar", None, None)];
+        els.extend(page.iter().cloned());
+        let win = PtRect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
+        Screen { app: "Microsoft Edge".into(), display: win, scale: 2.0, window: win, kind: Kind::Browser, els, ..Default::default() }
+    }
+
+    fn edge_0151_desk(page: &[El]) -> FakeDesk {
+        FakeDesk {
+            app: "Microsoft Edge".into(),
+            fields: vec![FField::new("AXTextField", "Address and search bar", "", Some(3)), FField::new("AXWebArea", "", "", None)],
+            focus: 1,
+            screens: vec![edge_0151(page)],
+            screen_ok: true,
+            ..Default::default()
+        }
+    }
+
+    /// 15:51:55 "open a new tab and search for GS Paint": cmd+t already put the keys in the omnibox; the planner's
+    /// click on it changed nothing, the real click's hit-test said "something covers", and the order died there.
+    #[test]
+    fn replay_0151_a_new_tab_types_into_the_omnibox_without_a_click() {
+        let mut d = FakeDesk { covered: true, sigs: sigs(&[5, 5, 5, 5]), ..edge_0151_desk(&[mk(4, "Search the web", "search field", "main", None, None)]) };
+        let mut mem = Memory::new();
+        let plan = [key("cmd+t"), on("click", "[3] Address and search bar (text field, toolbar)"), typ("GS Paint", None), key("return")];
+        let e = run_all(&plan, &mut d, &mut mem);
+        assert_eq!(statuses(&e), vec![CmdStatus::Done; 4], "{:?}", e.last().unwrap().message);
+        assert_eq!(d.acts, [Act::Combo(17, CMD), Act::Combo(36, 0)], "no click on the field that has the keys");
+        assert_eq!((d.value(0), d.typed.as_slice()), ("GS Paint", &["GS Paint".to_string()][..]));
+        // the keys are elsewhere: a toolbar field takes AXFocused, no click at all
+        let mut d = FakeDesk { covered: true, sigs: sigs(&[5, 5, 5]), ..edge_0151_desk(&[]) };
+        let e = exec(&on("click", "Address and search bar (text field, toolbar)"), 1, 1, &CFG, &mut no_jev, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Focus(Target::Mark(3))][..]));
+    }
+
+    /// JS Paint's AX tree (15:52:26): Edge chrome, the menu bar, the tools; the palette is canvas-like, no marks.
+    fn jspaint_page() -> Vec<El> {
+        let mut v: Vec<El> = [(4, "File"), (5, "Edit"), (6, "Colors"), (7, "Help")].iter().map(|(i, n)| mk(*i, n, "menu item", "main", None, None)).collect();
+        for (i, n) in [(8, "Pencil"), (9, "Brush"), (10, "Fill With Color")] {
+            let mut e = mk(i, n, "button", "sidebar", None, None);
+            e.mark.rect = PtRect { x: 4.0, y: 100.0 + 30.0 * (i - 8) as f64, w: 24.0, h: 24.0 };
+            v.push(e);
+        }
+        v
+    }
+
+    fn box_reply(top: f64, left: f64, side: f64, visible: f32) -> Value {
+        json!({ "box": { "box": { "top": top, "bottom": top + side, "left": left, "right": left + side } }, "visible": { "noul": visible }, "risky": { "noul": 0.0 } })
+    }
+
+    /// 15:52:26 "change the color to red on the bottom" -> click "red" -> Jev's best mark was the menu "Colors":
+    /// clicked, reported Done. No mark is named red: the box looks at the window (with "on the bottom" in its words).
+    #[test]
+    fn replay_0152_red_with_no_mark_goes_to_the_box_not_to_colors() {
+        let red = said(on("click", "red"), "Now there select the pencil, it's already selected. Now change the color to red on the bottom.");
+        let jev_colors = ranking(&[("6", 0.62), ("2", 0.2), ("4", 0.1)]);
+        let (mut ask, seen) = script(vec![jev_colors.clone(), jev_colors.clone(), box_reply(0.92, 0.2, 0.03, 0.9), box_reply(0.75, 0.45, 0.1, 0.9)]);
+        let mut d = edge_0151_desk(&jspaint_page());
+        let e = exec(&red, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done, "{:?}", e.message);
+        let [Act::Click(Target::Point(_, y))] = d.acts.as_slice() else { panic!("{:?}", d.acts) };
+        assert!(*y > 700.0, "the bottom palette, not the menu bar: {y}");
+        assert_eq!(e.summary, "clicked “red” (box, screen)");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[2].1["box"]["instructions"].as_str().unwrap().contains("on the bottom"), "{}", calls[2].1);
+        drop(calls);
+        // case 28: the box lands on an element with another name: it is clicked and the pill says so
+        let mut bar = mk(11, "Color box", "group", "bottom", None, None);
+        bar.mark.rect = PtRect { x: 200.0, y: 730.0, w: 400.0, h: 40.0 };
+        let mut page = jspaint_page();
+        page.push(bar);
+        let (mut ask, _) = script(vec![jev_colors.clone(), jev_colors.clone(), box_reply(0.92, 0.3, 0.03, 0.9), box_reply(0.75, 0.45, 0.1, 0.9)]);
+        let mut d = edge_0151_desk(&page);
+        let e = exec(&red, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(11))][..]));
+        assert_eq!(e.summary, "clicked “Color box” (group, bottom), not sure it is “red”");
+        // the box sees no red: nothing is clicked (never the menu)
+        let (mut ask, _) = script(vec![jev_colors.clone(), jev_colors, box_reply(0.92, 0.2, 0.03, 0.1)]);
+        let mut d = edge_0151_desk(&jspaint_page());
+        assert_eq!(exec(&red, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new()).status, CmdStatus::Unsure);
+        assert!(d.acts.is_empty());
+    }
+
+    /// 15:52:37 "No, on the bottom, not the top." clicked "New Tab". The planner now answers with retry: the last
+    /// target ("red") + the constraint; the element the last click hit is never the answer again.
+    #[test]
+    fn replay_0152_a_correction_retries_the_last_target_with_its_constraint() {
+        let mut mem = Memory::new();
+        remember(&mut mem, MemKind::Clicked, "Colors", &Field { app: "Microsoft Edge".into(), ..Default::default() }, None);
+        let retry = said(Action { op: "retry".into(), target: Some("red".into()), text: Some("bottom, not the top".into()), ..Default::default() }, "No, on the bottom, not the top.");
+        // Jev, without "Colors" on the list, leans to "New Tab" (real Jev 2026-10-18: none 0.45-0.5, a mark 0.22-0.26):
+        // weak and not red -> the box
+        let (mut ask, seen) = script(vec![ranking(&[("2", 0.4), ("4", 0.05)]), ranking(&[("2", 0.4), ("4", 0.05)]), box_reply(0.92, 0.2, 0.03, 0.9), box_reply(0.75, 0.45, 0.1, 0.9)]);
+        let mut d = edge_0151_desk(&jspaint_page());
+        let e = exec(&retry, 5, 4, &CFG, &mut ask, &mut d, &mut mem);
+        assert_eq!(e.status, CmdStatus::Done, "{:?}", e.message);
+        let [Act::Click(Target::Point(_, y))] = d.acts.as_slice() else { panic!("{:?}", d.acts) };
+        assert!(*y > 700.0, "{y}");
+        let calls = seen.lock().unwrap();
+        assert!(calls[0].1["target"]["criteria"].get("6").is_none(), "Colors is off the list");
+        assert!(calls[2].1["box"]["instructions"].as_str().unwrap().contains("bottom, not the top"));
+        assert_eq!(crate::planner::label(&retry), "retry “red” (bottom, not the top)");
+    }
+
+    /// Jev sure of a synonym in another language (measured: "search" -> "Buscar" 0.98): click it, no "not sure".
+    #[test]
+    fn a_sure_synonym_is_clicked_not_sent_to_the_box() {
+        let mut es = chrome();
+        es.els[1].mark.name = "Preferencias".into();
+        es.els[7].mark.name = "Buscar".into();
+        es.els[2].mark.name = "Dirección".into();
+        let (mut ask, seen) = script(vec![ranking(&[("8", 0.98), ("none", 0.02)])]);
+        let mut d = FakeDesk { screens: vec![es], screen_ok: true, ..chrome_desk() };
+        let e = exec(&on("click", "search"), 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(8))][..]), "{:?}", e.message);
+        assert_eq!(e.summary, "clicked “Buscar” (button, main)");
+        assert_eq!(seen.lock().unwrap().len(), 1, "no box calls");
+    }
+
+    /// "no, the other one" after Pablo switched apps: the last click was in Edge, nothing is clicked in Chrome.
+    #[test]
+    fn a_retry_never_clicks_in_another_app() {
+        for name in ["Colors", ""] {
+            // "" = the last click was a box click (no element name)
+            let mut mem = Memory::new();
+            remember(&mut mem, MemKind::Clicked, name, &Field { app: "Microsoft Edge".into(), ..Default::default() }, None);
+            let retry = Action { op: "retry".into(), target: Some("red".into()), text: Some("the other one".into()), ..Default::default() };
+            let mut d = FakeDesk { screen_ok: true, ..chrome_desk() };
+            let e = exec(&retry, 2, 2, &CFG, &mut no_jev, &mut d, &mut mem);
+            assert_eq!(e.status, CmdStatus::Unsure, "{name:?}: {:?}", e.message);
+            assert!(d.acts.is_empty());
+        }
+    }
+
+    /// Two "Share" buttons: "no, the other one" skips only the one clicked, so the other Share is the answer.
+    #[test]
+    fn a_retry_among_namesakes_clicks_the_other_one() {
+        let mut mem = Memory::new();
+        let h = Hit::of(&chrome().els[1], 0.0);
+        clicked(&mut mem, &h, &Field { app: "Google Chrome".into(), ..Default::default() });
+        let retry = Action { op: "retry".into(), target: Some("share".into()), text: Some("the other one".into()), ..Default::default() };
+        let mut d = chrome_desk();
+        let e = exec(&retry, 2, 2, &CFG, &mut no_jev, &mut d, &mut mem);
+        assert_eq!((e.status, d.acts.as_slice()), (CmdStatus::Done, &[Act::Click(Target::Mark(8))][..]), "{:?}", e.message);
+    }
+
+    #[test]
+    fn names_table() {
+        let rows = [
+            ("red", "Colors", false),
+            ("red", "New Tab", false),
+            ("the pricing", "Pricing | Acme", true),
+            ("la factura", "Enviar factura", true),
+            ("the first link", "JS Paint JS Paint https://jspaint.app", true),
+            ("Address and search bar (text field, toolbar)", "Address and search bar", true),
+            ("the share button in the top header", "Share", true),
+            ("comercial", "Comercial X", true),
+            ("gear icon", "Settings", false),
+            ("", "Anything", true),
+        ];
+        for (w, n, want) in rows {
+            assert_eq!(names(w, n), want, "{w:?} / {n:?}");
+        }
+    }
+
+    /// Real API (Jev box, coarse-to-fine) on a synthetic JS Paint window (tests/fixtures/jspaint_palette.png, made by
+    /// jspaint_palette.py: 2400 x 1600 px = 1200 x 800 pt at 2x, the MS Paint palette at the bottom, red = row 2,
+    /// column 3). No capture of Pablo's screen; PIL crops the PNG. 4 Jev calls at most.
+    /// `OPENROUTER_API_KEY=... cargo test jev_box_finds_red_in_a_synthetic_palette -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn jev_box_finds_red_in_a_synthetic_palette() {
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY");
+        let png = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jspaint_palette.png");
+        let calls = std::cell::Cell::new(0);
+        let mut cost = 0.0;
+        let mut ask = |s: &Value, q: &Value| {
+            anyhow::ensure!(calls.get() < 4, "call cap");
+            calls.set(calls.get() + 1);
+            let r = jev::ask(jev::DECISIONS_URL, &key, crate::contract::JEV_MODEL, s, q)?;
+            cost += r.cost;
+            println!("jev {} ms ${:.5}: {}", r.latency_ms, r.cost, r.answers);
+            Ok(r)
+        };
+        let mut d = FakeDesk { image: Some((png, 2.0)), ..edge_0151_desk(&jspaint_page()) };
+        let red = said(on("click", "red"), "Now change the color to red on the bottom.");
+        let e = exec(&red, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        println!("{:?} {:?} {} calls ${cost:.5}", e, d.acts, calls.get());
+        // the red swatch, in points (jspaint_palette.py: x 38 + 2 * 17, y 733 + 17, 16 x 16)
+        let r = PtRect { x: 72.0, y: 750.0, w: 16.0, h: 16.0 };
+        let [Act::Click(Target::Point(x, y))] = d.acts.as_slice() else { panic!("{:?}", d.acts) };
+        assert!(*x >= r.x - 2.0 && *x <= r.x + r.w + 2.0 && *y >= r.y - 2.0 && *y <= r.y + r.h + 2.0, "({x}, {y}) is not on red {r:?}");
     }
 }
