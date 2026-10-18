@@ -74,6 +74,10 @@ pub struct Plan {
     pub answer: Option<String>,
     pub say: Option<String>,
     pub actions: Vec<Action>,
+    /// Set by live.rs from the screen, not by the model: no other text input to name, so an untargeted `type` goes
+    /// to the focus at once (live::hold).
+    #[serde(skip)]
+    pub type_here: bool,
 }
 
 pub const OPS: [&str; 11] = ["open_app", "key", "type", "click", "select_typed", "delete_typed", "copy", "paste", "scroll", "wait_user", "correct_word"];

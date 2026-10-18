@@ -506,6 +506,33 @@ pub trait Desk {
     fn learn_word(&mut self, _word: &str, _heard: &str) -> Result<(), String> {
         Ok(())
     }
+    /// The installed app names (open_app matches the spoken name against them). Empty = open the name as said.
+    fn apps(&mut self) -> Vec<String> {
+        vec![]
+    }
+}
+
+/// The installed app a spoken name means: "edge" -> Microsoft Edge, "ghosty" -> Ghostty. Rungs, first hit wins:
+/// 1. the same name, 2. a whole word of the name, 3. a name that starts with it, 4. 1-2 typos (names of 5+ letters).
+/// Ties: the shortest name ("chrome" -> Google Chrome, not Chrome Remote Desktop).
+pub fn match_app(spoken: &str, installed: &[String]) -> Option<String> {
+    let squash = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let want = squash(spoken.trim().trim_end_matches(".app"));
+    if want.is_empty() {
+        return None;
+    }
+    let wc: Vec<char> = want.chars().collect();
+    let max_typos = match wc.len() { 0..=4 => 0, 5..=8 => 1, _ => 2 };
+    let rungs: [&dyn Fn(&str) -> bool; 4] = [
+        &|n| squash(n) == want,
+        &|n| n.split(|c: char| !c.is_alphanumeric()).any(|w| squash(w) == want),
+        &|n| squash(n).starts_with(&want),
+        &|n| {
+            let names = std::iter::once(squash(n)).chain(n.split_whitespace().map(squash));
+            names.into_iter().any(|x| crate::dictionary::dl(&x.chars().collect::<Vec<_>>(), &wc) <= max_typos)
+        },
+    ];
+    rungs.iter().find_map(|hit| installed.iter().filter(|n| hit(n)).min_by_key(|n| n.chars().count()).cloned())
 }
 
 pub struct Cfg {
@@ -868,10 +895,11 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             r.done(desk, format!("clicked {} ({})", quote(&h.mark.name), h.mark.role))
         }
         "open_app" => {
-            let app = a.app.clone().unwrap_or_default();
-            if app.trim().is_empty() {
+            let said = a.app.clone().unwrap_or_default();
+            if said.trim().is_empty() {
                 return r.fail(desk, CmdStatus::Unsure, "Which app? Say it again.");
             }
+            let app = match_app(&said, &desk.apps()).unwrap_or(said);
             r.st.action = Some("open_app".into());
             r.st.detail = Some(app.clone());
             if desk.aborted() {
@@ -1306,6 +1334,17 @@ pub mod mac {
             crate::learn::add_correction(&self.app, word, heard)
         }
 
+        /// The .app bundles in the usual folders (one level deep, plus Utilities).
+        fn apps(&mut self) -> Vec<String> {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let dirs = ["/Applications".into(), "/Applications/Utilities".into(), "/System/Applications".into(), "/System/Applications/Utilities".into(), format!("{home}/Applications")];
+            dirs.iter()
+                .filter_map(|d| std::fs::read_dir(d).ok())
+                .flatten()
+                .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".app").map(String::from))
+                .collect()
+        }
+
         fn read(&mut self) -> Result<Screen, String> {
             if !crate::permissions::accessibility_trusted() {
                 return Err("accessibility".into());
@@ -1616,6 +1655,7 @@ mod tests {
         waits: Vec<Wait>,
         screen_ok: bool,
         abort_after_acts: Option<usize>,
+        installed: Vec<String>,
     }
 
     impl FakeDesk {
@@ -1757,6 +1797,9 @@ mod tests {
         fn aborted(&self) -> bool {
             self.abort_after_acts.is_some_and(|n| self.acts.len() >= n)
         }
+        fn apps(&mut self) -> Vec<String> {
+            self.installed.clone()
+        }
     }
 
     fn mk(id: u32, name: &str, role: &str, region: &str, url: Option<&str>, value: Option<&str>) -> El {
@@ -1811,6 +1854,50 @@ mod tests {
     }
 
     const CFG: Cfg = Cfg { confirm_risky: true };
+
+    const INSTALLED: [&str; 12] = [
+        "Microsoft Edge", "Google Chrome", "Chrome Remote Desktop", "Ghostty", "Claude", "Safari", "Slack", "Notes",
+        "Visual Studio Code", "WhatsApp", "Terminal", "Arc",
+    ];
+
+    #[test]
+    fn open_app_matches_spoken_names_to_installed_apps() {
+        // Pablo 2026-10-17: "open Edge" did nothing (`open -a Edge` has no such app)
+        let apps: Vec<String> = INSTALLED.iter().map(|s| s.to_string()).collect();
+        let rows = [
+            ("edge", Some("Microsoft Edge")),
+            ("Edge", Some("Microsoft Edge")),
+            ("chrome", Some("Google Chrome")),
+            ("ghosty", Some("Ghostty")),
+            ("Ghostty", Some("Ghostty")),
+            ("claude", Some("Claude")),
+            ("whats app", Some("WhatsApp")),
+            ("Safari.app", Some("Safari")),
+            ("note", Some("Notes")),
+            ("arc", Some("Arc")),
+            ("ark", None),
+            ("photoshop", None),
+            ("", None),
+        ];
+        for (said, want) in rows {
+            assert_eq!(match_app(said, &apps).as_deref(), want, "{said:?}");
+        }
+    }
+
+    #[test]
+    fn open_app_opens_and_reports_the_matched_app() {
+        let mut d = FakeDesk { installed: INSTALLED.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        let (mut ask, _) = script(vec![]);
+        let a = Action { op: "open_app".into(), app: Some("edge".into()), ..Default::default() };
+        let e = exec(&a, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!((e.status, e.summary.as_str()), (CmdStatus::Done, "opened Microsoft Edge"));
+        assert_eq!(d.acts, [Act::OpenApp("Microsoft Edge".into())]);
+        // no match: the name goes to `open -a` as said
+        let mut d = FakeDesk::default();
+        let a = Action { op: "open_app".into(), app: Some("Photoshop".into()), ..Default::default() };
+        let _ = exec(&a, 1, 1, &CFG, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(d.acts, [Act::OpenApp("Photoshop".into())]);
+    }
 
     /// No Jev call expected (local matches only).
     fn no_jev(_: &Value, _: &Value) -> anyhow::Result<Reply> {

@@ -696,9 +696,7 @@ pub fn find_cut_with(d: &[f32], c: Cuts) -> Option<usize> {
     if d.len() < cut_min + cut_sil {
         return None;
     }
-    let top = d.iter().cloned().fold(f32::MIN, f32::max);
-    let floor = d.iter().cloned().fold(f32::MAX, f32::min);
-    let thr = (top - PAUSE_BELOW_DB).max(floor + 6.0);
+    let thr = pause_thr(d);
     // No speech yet (all frames near the floor): wait for the hard cut.
     if d.iter().filter(|&&x| x > thr).count() >= loud {
         let mut run = 0;
@@ -714,6 +712,19 @@ pub fn find_cut_with(d: &[f32], c: Cuts) -> Option<usize> {
     }
     let w = 10;
     (cut_min..d.len() - w).min_by(|&a, &b| d[a..a + w].iter().sum::<f32>().total_cmp(&d[b..b + w].iter().sum::<f32>())).map(|i| i + w / 2)
+}
+
+/// The level under which a frame of `d` is a pause.
+fn pause_thr(d: &[f32]) -> f32 {
+    let top = d.iter().cloned().fold(f32::MIN, f32::max);
+    let floor = d.iter().cloned().fold(f32::MAX, f32::min);
+    (top - PAUSE_BELOW_DB).max(floor + 6.0)
+}
+
+/// `find_cut_with`'s view of the frames: speech in them, and they do not end in a pause yet.
+pub fn speaking_with(d: &[f32], c: Cuts) -> bool {
+    let thr = pause_thr(d);
+    d.iter().filter(|&&x| x > thr).count() >= c.loud && d.iter().rev().take(c.sil).any(|&x| x > thr)
 }
 
 /// Cuts the live recording at pauses. Holds only the audio since the last cut (device rate).
@@ -777,6 +788,11 @@ impl Chunker {
         worth(&chunk).then_some(chunk)
     }
 
+    /// Pablo is talking: speech since the last cut, and no pause after it yet (live.rs waits with a held order).
+    pub fn speaking(&self) -> bool {
+        speaking_with(&self.db, self.cuts)
+    }
+
     /// The audio after the last cut, from the final 16 kHz clip. None = nothing worth transcribing.
     pub fn tail(&self, clip: &Clip) -> Option<Vec<f32>> {
         let at = (self.start as u64 * RATE as u64 / self.rate as u64) as usize;
@@ -786,7 +802,7 @@ impl Chunker {
 }
 
 /// At least 100 ms (whisper.cpp skips shorter input) and louder than the silence gate.
-fn worth(s: &[f32]) -> bool {
+pub(crate) fn worth(s: &[f32]) -> bool {
     s.len() >= RATE as usize / 10 && db(s.iter().fold(0f32, |m, x| m.max(x.abs()))) >= SILENCE_DB
 }
 
@@ -1369,6 +1385,13 @@ mod tests {
         let mut c = Chunker { cuts: COMMAND, ..Chunker::new(16_000) };
         let chunks: Vec<Vec<f32>> = a.chunks(1600).filter_map(|p| c.push(p)).collect();
         assert_eq!(chunks.len(), 1, "one order cut at the pause");
+        assert!(c.speaking(), "the 0.6 s after the cut is voice with no pause yet");
+        c.push(&hush(16_000, 0.2));
+        assert!(c.speaking(), "200 ms of quiet is not a pause");
+        c.push(&hush(16_000, 0.15));
+        assert!(!c.speaking(), "a 350 ms pause: done talking (cut or not)");
+        assert!(!speaking_with(&vec![-80.0; 200], COMMAND), "room noise only");
+        assert!(!speaking_with(&[], COMMAND));
     }
 
     #[test]

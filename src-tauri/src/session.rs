@@ -987,6 +987,7 @@ impl Actor {
             } else {
                 ch.poll(rec)
             };
+            live.speaking(ch.speaking());
             match r {
                 Ok(Some(chunk)) => {
                     log::info!("live: chunk {} ms", chunk.len() / 16);

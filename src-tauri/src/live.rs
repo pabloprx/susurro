@@ -173,6 +173,8 @@ pub struct Core {
     pub buffer: String,
     pub order: u32,
     pub said: Vec<String>,
+    /// The order held for the next words (`hold`), with the buffer it was planned from. A pause runs it.
+    held: Option<(String, Plan)>,
 }
 
 pub type PlanFn<'a> = dyn FnMut(&str, bool, Option<&str>) -> anyhow::Result<Plan> + 'a;
@@ -216,18 +218,28 @@ impl Core {
             }
             _ => {}
         }
+        if text.is_empty() && !last {
+            // A pause (a silent chunk, or no new words for HOLD_MS): the held order runs; nothing else to plan.
+            return self.run_held();
+        }
         if !text.is_empty() {
             self.buffer = format!("{} {text}", self.buffer).trim().to_string();
         }
         if self.buffer.is_empty() {
             return Heard::Nothing;
         }
+        // The release with no new words since the hold: the held plan is the final plan.
+        if last && self.held.as_ref().is_some_and(|(b, _)| *b == self.buffer) {
+            return self.run_held();
+        }
         match plan(&self.buffer, last, None) {
             Ok(p) if !last && hold(&p, &self.buffer) => {
                 log::info!("live: holding {:?} for the next words", self.buffer);
+                self.held = Some((self.buffer.clone(), p));
                 Heard::Nothing
             }
             Ok(p) => {
+                let held = self.held.take();
                 if p.complete || last {
                     self.buffer.clear();
                 } else if !p.rest.trim().is_empty() {
@@ -236,15 +248,54 @@ impl Core {
                     // ponytail: incomplete with no rest = the model planned all but kept nothing: drop the buffer.
                     self.buffer.clear();
                 }
-                if p.actions.is_empty() { Heard::Nothing } else { self.order(p.actions, p.say) }
+                if !p.actions.is_empty() {
+                    return self.order(p.actions, p.say);
+                }
+                match held {
+                    // The replan kept the held words in its rest (the target may still come): hold on.
+                    Some((b, hp)) if !last && self.buffer.to_lowercase().contains(&b.to_lowercase()) => {
+                        self.held = Some((b, hp));
+                        Heard::Nothing
+                    }
+                    // The replan dropped the held words with nothing to run (log 2026-10-17: "De-" -> rest "De-"):
+                    // the held order runs, the new words stay in the buffer.
+                    Some((_, hp)) => {
+                        log::info!("live: the replan dropped the held order, it runs now");
+                        self.order(hp.actions, hp.say)
+                    }
+                    None => Heard::Nothing,
+                }
             }
             Err(e) => {
                 if last {
                     self.buffer.clear();
+                    if let Some((_, hp)) = self.held.take() {
+                        return self.order(hp.actions, hp.say);
+                    }
                 }
                 Heard::Error(format!("{e:#}"))
             }
         }
+    }
+
+    /// The held order runs now (a pause or the release); its words leave the buffer.
+    fn run_held(&mut self) -> Heard {
+        let Some((b, p)) = self.held.take() else { return Heard::Nothing };
+        log::info!("live: pause, the held order runs: {b:?}");
+        self.buffer = self.buffer.strip_prefix(b.as_str()).unwrap_or("").trim().to_string();
+        self.order(p.actions, p.say)
+    }
+
+    /// An order waits for the next words (`hold`).
+    pub fn holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The held order will not run (Pablo moved to another app): its words leave the buffer, the new ones stay.
+    pub fn drop_held(&mut self) {
+        let Some((b, _)) = self.held.take() else { return };
+        log::info!("live: the front app changed, the held order is dropped: {b:?}");
+        self.buffer = self.buffer.strip_prefix(b.as_str()).unwrap_or("").trim().to_string();
     }
 
     fn order(&mut self, actions: Vec<Action>, say: Option<String>) -> Heard {
@@ -257,11 +308,93 @@ impl Core {
 /// 1. The plan ends in a `type` with no target: the next words may name the field ("type hello" | "onto the search
 ///    input"). Measured on gpt-oss-120b: it plans "Type hello" as complete and types into the wrong field (case 5).
 /// 2. The plan keeps the whole buffer as `rest` but has actions: the next replan would run them again.
-/// ponytail: the held order waits one chunk (or the release); add a silence timer if hands-free feels slow.
+/// No hold for 1 when there is no other text input to name (`type_here`: a terminal, a canvas app, the only field).
+/// The held order runs at the next pause: a silent chunk, HOLD_MS with no new words, or the release.
 pub fn hold(p: &Plan, buffer: &str) -> bool {
-    let trailing_type = p.actions.last().is_some_and(|a| a.op == "type" && a.target.as_deref().is_none_or(|t| t.trim().is_empty()));
+    let trailing_type = !p.type_here && p.actions.last().is_some_and(|a| a.op == "type" && a.target.as_deref().is_none_or(|t| t.trim().is_empty()));
     let rest_is_all = !p.complete && !p.actions.is_empty() && p.rest.trim() == buffer.trim();
     trailing_type || rest_is_all
+}
+
+/// No new words for this long = a pause: a held order runs. ponytail: 800 ms is a first guess (Pablo's ask).
+const HOLD_MS: u64 = 800;
+
+/// An untargeted `type` means "type here": the screen has no text input besides the focused one (Ghostty and
+/// Claude Code are one AXTextArea; a canvas app has none). `inputs` = text-input marks on screen.
+pub fn type_here(focused_role: &str, inputs: usize) -> bool {
+    let focused_text = matches!(focused_role, "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField");
+    inputs.saturating_sub(usize::from(focused_text)) == 0
+}
+
+// ---------- Scribe Realtime bookkeeping (pure) ----------
+
+/// Scribe Realtime rejects a commit with under 0.3 s of uncommitted audio (`commit_throttled`), and every replay of
+/// that segment fails again (log 2026-10-17: 3 reconnects, 6 s lost, then the batch fallback).
+const RT_MIN_COMMIT_MS: usize = 300;
+
+/// The device audio of each commit not answered yet, and of the open segment. A dead socket or a lost answer sends
+/// it to the batch STT. Each commit takes the next seq, so the answers and a fallback's chunks keep the spoken order.
+#[derive(Debug, Default)]
+struct RtAudio {
+    rate: u32,
+    unanswered: VecDeque<(u32, Vec<f32>)>,
+    open: Vec<f32>,
+}
+
+#[derive(Debug, PartialEq)]
+enum RtAnswer {
+    Text(u32, String),
+    /// Run this audio through the batch STT.
+    Batch(u32, Vec<f32>),
+    Nothing,
+}
+
+impl RtAudio {
+    fn min(&self) -> usize {
+        self.rate as usize * RT_MIN_COMMIT_MS / 1000
+    }
+
+    /// New samples; `cut` = a pause cut. true = commit them now (a cut with enough uncommitted audio).
+    fn audio(&mut self, a: &[f32], cut: bool, seq: &mut u32) -> bool {
+        self.open.extend_from_slice(a);
+        let commit = cut && self.open.len() >= self.min();
+        if commit {
+            self.unanswered.push_back((*seq, std::mem::take(&mut self.open)));
+            *seq += 1;
+        }
+        commit
+    }
+
+    /// The release: the open segment is the last commit. Some(silence) = send it first, so the commit is long enough.
+    fn end(&mut self, seq: &mut u32) -> Option<Vec<f32>> {
+        if self.open.is_empty() {
+            return None;
+        }
+        let pad = vec![0.0; self.min().saturating_sub(self.open.len())];
+        self.open.extend_from_slice(&pad);
+        self.unanswered.push_back((*seq, std::mem::take(&mut self.open)));
+        *seq += 1;
+        Some(pad)
+    }
+
+    /// Scribe answered the oldest commit. After the release no next chunk catches a lost order: an empty answer for
+    /// audio with speech in it goes to the batch STT.
+    fn committed(&mut self, t: &str, ended: bool) -> RtAnswer {
+        let Some((n, a)) = self.unanswered.pop_front() else { return RtAnswer::Nothing };
+        if t.trim().is_empty() && ended && crate::audio::worth(&crate::audio::resample(&a, self.rate)) {
+            return RtAnswer::Batch(n, a);
+        }
+        RtAnswer::Text(n, t.to_string())
+    }
+
+    /// The socket is gone (failed, closed early, no answer in time): everything not answered goes batch.
+    fn drain(&mut self, seq: &mut u32) -> Vec<(u32, Vec<f32>)> {
+        if !self.open.is_empty() {
+            self.unanswered.push_back((*seq, std::mem::take(&mut self.open)));
+            *seq += 1;
+        }
+        self.unanswered.drain(..).collect()
+    }
 }
 
 // ---------- the queue between cmd-live and cmd-exec ----------
@@ -317,6 +450,8 @@ enum Msg {
     Text(u32, anyhow::Result<Option<String>>),
     End(Option<Vec<f32>>),
     Abort,
+    /// No message for 100 ms (the timers run).
+    Tick,
 }
 
 /// One session's stop flag and the words heard so far. Esc ends the session through it at once, while a planner,
@@ -325,6 +460,8 @@ enum Msg {
 struct Ctl {
     stopped: AtomicBool,
     ended: AtomicBool,
+    /// The Chunker hears Pablo talking (no pause yet): a held order waits.
+    speaking: AtomicBool,
     said: Mutex<String>,
 }
 
@@ -351,6 +488,11 @@ impl Handle {
     /// New device-rate samples; `cut` = the Chunker found a pause (Scribe commits there).
     pub fn audio(&self, samples: Vec<f32>, cut: bool) {
         let _ = self.tx.send(Msg::Audio(samples, cut));
+    }
+
+    /// The Chunker's `speaking`, every poll.
+    pub fn speaking(&self, on: bool) {
+        self.ctl.speaking.store(on, Ordering::SeqCst);
     }
 
     /// The recording stopped: the tail after the last cut, then drain the queue and end.
@@ -443,96 +585,105 @@ fn live_loop(
     let mut core = Core::default();
     let (mut seq, mut in_flight, mut ended) = (0u32, 0usize, false);
     let mut waiting: VecDeque<(u32, Vec<f32>)> = VecDeque::new();
-    // Scribe Realtime: device audio of the commits not answered yet and of the open segment. If the socket dies,
-    // they go to the batch STT as chunks (the fallback) and so does the rest of the session.
-    // Each commit takes the next seq, so the answers and a fallback's chunks keep the spoken order.
-    let (mut unanswered, mut open): (VecDeque<(u32, Vec<f32>)>, Vec<f32>) = (VecDeque::new(), vec![]);
-    let mut rt_last = Instant::now();
+    // Scribe Realtime: if the socket dies, the unanswered audio goes to the batch STT and so does the rest.
+    let mut rta = RtAudio { rate, ..Default::default() };
+    // The release (Scribe gets RT_FINISH_MS from here) and the last new words (a held order runs HOLD_MS after).
+    let (mut released, mut words_at): (Option<Instant>, Instant) = (None, Instant::now());
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
-        let mut input = context(&app);
+        let (mut input, here) = context(&app);
         (input.utterance, input.last) = (text.to_string(), last);
         input.pending = pending.map(String::from);
-        let (p, m) = planner::plan_openrouter(&key, &cfg.planner_model, &input)?;
+        let (mut p, m) = planner::plan_openrouter(&key, &cfg.planner_model, &input)?;
+        p.type_here = here;
         log::info!("live: planner {} ms ${:.5} {text:?} -> complete={} {:?} rest={:?}", m.latency_ms, m.cost, p.complete, p.actions.iter().map(planner::label).collect::<Vec<_>>(), p.rest);
         Ok(p)
     };
     let to_16k = |a: &[f32]| crate::audio::resample(a, rate);
+    // The front app when the order was held: Some(pid) while holding.
+    let mut held_front: Option<Option<i32>> = None;
     loop {
         if ctl.stopped.load(Ordering::SeqCst) {
+            // Esc: the exec thread waits on the queue; the End lets it go.
+            queue.push(Item::End { instruction: core.said.join(" ") });
             break;
         }
-        let msg = match rx.recv_timeout(Duration::from_millis(500)) {
+        let msg = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(m) => m,
             // The finish waits at most RT_FINISH_MS for Scribe's last answers, then the unanswered audio goes batch.
-            Err(mpsc::RecvTimeoutError::Timeout) if ended && rt.is_some() && rt_last.elapsed() > Duration::from_millis(RT_FINISH_MS) => {
+            Err(mpsc::RecvTimeoutError::Timeout) if rt.is_some() && released.is_some_and(|t| t.elapsed() > Duration::from_millis(RT_FINISH_MS)) => {
                 Msg::Rt(scribe_rt::Ev::Failed("no answer after the release".into()))
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        same_front(&mut core, &mut held_front);
         match msg {
+            Msg::Tick => {}
             Msg::Chunk(a) => {
                 waiting.push_back((seq, a));
                 seq += 1;
             }
-            Msg::Audio(a, cut) => {
-                open.extend_from_slice(&a);
-                let cut = cut && !open.is_empty();
-                match &rt {
-                    Some(l) => {
-                        l.send(&a, cut);
-                        if cut {
-                            unanswered.push_back((seq, std::mem::take(&mut open)));
-                            seq += 1;
-                        }
-                    }
-                    // the socket failed earlier: cut chunks go to the batch STT
-                    None if cut => {
-                        waiting.push_back((seq, to_16k(&std::mem::take(&mut open))));
-                        seq += 1;
-                    }
-                    None => {}
+            Msg::Audio(a, cut) => match &rt {
+                Some(l) => {
+                    let commit = rta.audio(&a, cut, &mut seq);
+                    l.send(&a, commit);
                 }
-            }
-            Msg::Rt(e) => {
-                rt_last = Instant::now();
-                match e {
-                    scribe_rt::Ev::Partial(p) if !p.is_empty() => update(&app, |l| l.last_said = p),
-                    scribe_rt::Ev::Partial(_) => {}
-                    scribe_rt::Ev::Committed(t) => {
-                        // Scribe answers in commit order; the answer goes the way of a finished batch chunk.
-                        if let Some((n, _)) = unanswered.pop_front() {
-                            in_flight += 1;
-                            let _ = tx.send(Msg::Text(n, Ok(command_words(&app, &t))));
-                        }
-                    }
-                    scribe_rt::Ev::Closed => rt = None,
-                    scribe_rt::Ev::Failed(err) => {
-                        log::warn!("live: Scribe Realtime failed, {:?} takes the rest: {err}", crate::stt::batch_for_realtime(true));
-                        rt = None;
-                        for (n, a) in unanswered.drain(..) {
+                // the socket failed earlier: cut chunks go to the batch STT
+                None => {
+                    rta.open.extend_from_slice(&a);
+                    if cut {
+                        for (n, a) in rta.drain(&mut seq) {
                             waiting.push_back((n, to_16k(&a)));
                         }
                     }
                 }
-            }
+            },
+            Msg::Rt(e) => match e {
+                scribe_rt::Ev::Partial(p) if !p.is_empty() => {
+                    words_at = Instant::now();
+                    update(&app, |l| l.last_said = p);
+                }
+                scribe_rt::Ev::Partial(_) => {}
+                // Scribe answers in commit order; the answer goes the way of a finished batch chunk.
+                scribe_rt::Ev::Committed(t) => match rta.committed(&t, released.is_some()) {
+                    RtAnswer::Text(n, t) => {
+                        log::info!("live: commit {n}: {t:?}");
+                        in_flight += 1;
+                        let _ = tx.send(Msg::Text(n, Ok(command_words(&app, &t))));
+                    }
+                    RtAnswer::Batch(n, a) => {
+                        log::info!("live: commit {n} came back empty after the release, the batch STT tries it");
+                        waiting.push_back((n, to_16k(&a)));
+                    }
+                    RtAnswer::Nothing => {}
+                },
+                scribe_rt::Ev::Closed | scribe_rt::Ev::Failed(_) => {
+                    if let scribe_rt::Ev::Failed(err) = &e {
+                        log::warn!("live: Scribe Realtime failed, {:?} takes the rest: {err}", crate::stt::batch_for_realtime(true));
+                    }
+                    rt = None;
+                    for (n, a) in rta.drain(&mut seq) {
+                        waiting.push_back((n, to_16k(&a)));
+                    }
+                }
+            },
             Msg::End(tail) => {
                 if realtime_mode(&provider) {
                     // Scribe (or its fallback) has every sample already: the tail is not sent again.
                     match &rt {
                         Some(l) => {
-                            if !open.is_empty() {
-                                unanswered.push_back((seq, std::mem::take(&mut open)));
-                                seq += 1;
+                            log::info!("live: release, {} ms of audio not committed yet", rta.open.len() * 1000 / rate.max(1) as usize);
+                            if let Some(pad) = rta.end(&mut seq) {
+                                l.send(&pad, false);
                             }
                             l.finish();
-                            rt_last = Instant::now();
+                            released = Some(Instant::now());
                         }
-                        None if !open.is_empty() => {
-                            waiting.push_back((seq, to_16k(&std::mem::take(&mut open))));
-                            seq += 1;
+                        None => {
+                            for (n, a) in rta.drain(&mut seq) {
+                                waiting.push_back((n, to_16k(&a)));
+                            }
                         }
-                        None => {}
                     }
                 } else if let Some(t) = tail {
                     waiting.push_back((seq, t));
@@ -556,8 +707,15 @@ fn live_loop(
                     }
                 };
                 for t in core.arrive(n, text) {
-                    let Some(t) = t else { continue };
-                    update(&app, |l| l.last_said = t.clone());
+                    // A silent chunk is a pause: a held order runs (hear "" plans nothing else).
+                    let t = t.unwrap_or_default();
+                    if t.is_empty() && !core.holding() {
+                        continue;
+                    }
+                    if !t.is_empty() {
+                        words_at = Instant::now();
+                        update(&app, |l| l.last_said = t.clone());
+                    }
                     if paused() && resume_word(&t) {
                         resume(&app);
                         continue;
@@ -576,6 +734,16 @@ fn live_loop(
                     handle(&app, &queue, &core, heard);
                 }
             }
+        }
+        // No new words for HOLD_MS and no STT in flight: a pause, the held order runs (log 2026-10-17: it waited
+        // forever). Checked after every message: Scribe's audio arrives every ~100 ms, so a timeout alone would starve.
+        same_front(&mut core, &mut held_front);
+        if ctl.speaking.load(Ordering::SeqCst) {
+            words_at = Instant::now();
+        }
+        if core.holding() && words_at.elapsed() > Duration::from_millis(HOLD_MS) && in_flight == 0 && waiting.is_empty() && rta.unanswered.is_empty() && !ctl.stopped.load(Ordering::SeqCst) {
+            let heard = core.hear("", false, None, &mut planner);
+            handle(&app, &queue, &core, heard);
         }
         while in_flight < max_in_flight {
             let Some((n, audio)) = waiting.pop_front() else { break };
@@ -606,8 +774,28 @@ fn live_loop(
     log::info!("live: recording side done after {} ms, {} orders", t0.elapsed().as_millis(), core.order);
 }
 
-/// Scribe's last commit answers within this after the release (measured ~0.2 s, TESTING.md "Latency").
-const RT_FINISH_MS: u64 = 4000;
+/// A held order types into the app it was planned for: if Pablo moved to another app by hand since (a key or a click
+/// paused the queue), it is dropped. An app an order of his opened is no reason.
+fn same_front(core: &mut Core, held_front: &mut Option<Option<i32>>) {
+    if !core.holding() {
+        *held_front = None;
+        return;
+    }
+    let now = crate::paste::target_app().map(|a| a.pid);
+    match *held_front {
+        None => *held_front = Some(now),
+        Some(f) if f != now && paused() => {
+            core.drop_held();
+            *held_front = None;
+        }
+        Some(f) if f != now => *held_front = Some(now),
+        Some(_) => {}
+    }
+}
+
+/// Scribe's last commit answers within this after the release (measured ~0.2 s, TESTING.md "Latency"); later, the
+/// unanswered audio goes to the batch STT.
+const RT_FINISH_MS: u64 = 1500;
 
 fn realtime_mode(p: &crate::contract::SttProvider) -> bool {
     *p == crate::contract::SttProvider::ElevenLabsRealtime
@@ -718,11 +906,12 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
     finish(&app, &ctl, Ended { instruction, end, latency_ms: t0.elapsed().as_millis() as u32 });
 }
 
-/// The planner's view right before the call: app, focused field, marks (ids dropped).
-fn context(app: &AppHandle) -> planner::Input {
+/// The planner's view right before the call: app, focused field, marks (ids dropped). true = `type_here`.
+fn context(app: &AppHandle) -> (planner::Input, bool) {
     let _ = app;
     let t = Instant::now();
     let mut input = planner::Input { memory: memory_lines(&MEMORY.lock().unwrap(), crate::history::now_ms()), ..Default::default() };
+    let mut inputs = 0;
     #[cfg(target_os = "macos")]
     if crate::permissions::accessibility_trusted() {
         if let Some(front) = crate::paste::target_app() {
@@ -732,12 +921,15 @@ fn context(app: &AppHandle) -> planner::Input {
                 input.focused = f;
             }
             if let Some(tree) = crate::ax::mac::read(front.pid) {
-                input.marks = crate::ax::collect(&tree.root, tree.window).iter().map(crate::ax::describe).collect();
+                let els = crate::ax::collect(&tree.root, tree.window);
+                inputs = els.iter().filter(|e| crate::ax::takes_text(&e.mark.role)).count();
+                input.marks = els.iter().map(crate::ax::describe).collect();
             }
         }
     }
-    log::info!("live: context read {} ms, {} marks", t.elapsed().as_millis(), input.marks.len());
-    input
+    let here = type_here(&input.focused.role, inputs);
+    log::info!("live: context read {} ms, {} marks, {inputs} text inputs, type here: {here}", t.elapsed().as_millis(), input.marks.len());
+    (input, here)
 }
 
 /// The command STT hints: Pablo's dictionary first, then BRANDS (vc-feedback 18a).
@@ -892,6 +1084,145 @@ mod tests {
         assert!(matches!(c.hear("", true, None, &mut p), Heard::Order(..)));
         assert_eq!(runs, 0, "nothing ran before the final flush");
         assert!(!hold(&plan(false, "and", &["key"]), "create a new tab and"), "a real rest: the leading order runs");
+    }
+
+    fn ty(text: &str) -> Action {
+        Action { op: "type".into(), text: Some(text.into()), ..Default::default() }
+    }
+
+    #[test]
+    fn a_held_type_survives_a_replan_that_drops_it() {
+        // susurro.log 2026-10-17 23:38:54-23:39:02, chunks 9-12 replayed: the held type was never typed
+        let mut c = Core::default();
+        let mut calls = vec![];
+        let mut p = |t: &str, _: bool, _: Option<&str>| {
+            calls.push(t.to_string());
+            Ok(match t {
+                "Da type. Make me an application for HTML forms." => Plan { complete: true, actions: vec![ty("Make me an application for HTML forms.")], ..Default::default() },
+                "Da type. Make me an application for HTML forms. Use view." => Plan { complete: true, actions: vec![ty("Make me an application for HTML forms. Use view.")], ..Default::default() },
+                "Da type. Make me an application for HTML forms. Use view. De-" => plan(false, "De-", &[]),
+                _ => plan(true, "", &[]),
+            })
+        };
+        c.buffer = "Da type.".into();
+        assert_eq!(c.hear("Make me an application for HTML forms.", false, None, &mut p), Heard::Nothing, "held");
+        assert_eq!(c.hear("Use view.", false, None, &mut p), Heard::Nothing, "held again");
+        let Heard::Order(1, a, _) = c.hear("De-", false, None, &mut p) else { panic!("the held type runs") };
+        assert_eq!(a[0].text.as_deref(), Some("Make me an application for HTML forms. Use view."));
+        assert_eq!(c.buffer, "De-", "the new words stay");
+        assert_eq!(c.hear("AS.", false, None, &mut p), Heard::Nothing);
+        assert_eq!(calls.last().map(String::as_str), Some("De- AS."));
+    }
+
+    #[test]
+    fn a_pause_runs_the_held_type() {
+        // continuous mode: no release comes, a silent chunk or HOLD_MS of quiet is the end of the order
+        let mut c = Core::default();
+        let calls = std::cell::Cell::new(0);
+        let mut p = |_: &str, _: bool, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Ok(Plan { complete: true, actions: vec![ty("hello")], ..Default::default() })
+        };
+        assert_eq!(c.hear("type hello", false, None, &mut p), Heard::Nothing);
+        assert!(c.holding());
+        assert!(matches!(c.hear("", false, None, &mut p), Heard::Order(1, ref a, _) if a[0].text.as_deref() == Some("hello")));
+        assert_eq!((c.buffer.as_str(), c.holding(), calls.get()), ("", false, 1), "no second planner call");
+        assert_eq!(c.hear("", false, None, &mut p), Heard::Nothing, "a pause with nothing held plans nothing");
+        assert_eq!(calls.get(), 1);
+        // the release runs the held plan as is
+        c.hear("type hi", false, None, &mut p);
+        assert!(matches!(c.hear("", true, None, &mut p), Heard::Order(2, ..)));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_target_split_over_three_chunks_still_waits() {
+        // case 5 with one more cut: "Type hello" | "onto the" | "search input."
+        let mut c = Core::default();
+        let mut p = |t: &str, _: bool, _: Option<&str>| {
+            Ok(match t {
+                "Type hello" => Plan { complete: true, actions: vec![ty("hello")], ..Default::default() },
+                "Type hello onto the" => plan(false, "Type hello onto the", &[]),
+                _ => Plan { complete: true, actions: vec![Action { target: Some("Search".into()), ..ty("hello") }], ..Default::default() },
+            })
+        };
+        assert_eq!(c.hear("Type hello", false, None, &mut p), Heard::Nothing);
+        assert_eq!(c.hear("onto the", false, None, &mut p), Heard::Nothing, "the rest keeps the held words: wait on");
+        assert!(c.holding());
+        let Heard::Order(1, a, _) = c.hear("search input.", false, None, &mut p) else { panic!("one order") };
+        assert_eq!((a.len(), a[0].target.as_deref()), (1, Some("Search")));
+        assert!(!c.holding());
+    }
+
+    #[test]
+    fn a_dropped_held_type_never_runs() {
+        // Pablo clicked into another app while "type hello" waited: it must not type there, now or at the release
+        let mut c = Core::default();
+        let mut p = |t: &str, _: bool, _: Option<&str>| Ok(Plan { complete: true, actions: vec![ty(t)], ..Default::default() });
+        assert_eq!(c.hear("type hello", false, None, &mut p), Heard::Nothing);
+        c.drop_held();
+        assert_eq!((c.holding(), c.buffer.as_str()), (false, ""));
+        assert_eq!(c.hear("", false, None, &mut p), Heard::Nothing, "a pause runs nothing");
+        assert_eq!(c.hear("", true, None, &mut p), Heard::Nothing, "the release runs nothing");
+        // a held type runs once: a pause, then the release
+        c.hear("type hi", false, None, &mut p);
+        assert!(matches!(c.hear("", false, None, &mut p), Heard::Order(1, ..)));
+        assert_eq!(c.hear("", true, None, &mut p), Heard::Nothing, "not again at the release");
+    }
+
+    #[test]
+    fn type_here_runs_at_once() {
+        // Ghostty / Claude Code: the focus is the only text input, an untargeted type means "type here"
+        let mut c = Core::default();
+        let mut p = |_: &str, _: bool, _: Option<&str>| Ok(Plan { complete: true, actions: vec![ty("ls")], type_here: true, ..Default::default() });
+        assert!(matches!(c.hear("type ls", false, None, &mut p), Heard::Order(1, ..)));
+        // (focused role, text inputs on screen) -> type here
+        let rows = [("AXTextArea", 1, true), ("AXTextArea", 0, true), ("", 0, true), ("AXGroup", 0, true), ("AXTextArea", 2, false), ("AXButton", 1, false), ("AXSearchField", 1, true)];
+        for (role, n, want) in rows {
+            assert_eq!(type_here(role, n), want, "{role} {n}");
+        }
+    }
+
+    #[test]
+    fn a_short_order_released_before_any_cut_reaches_the_planner() {
+        // Pablo 2026-10-17 23:39:25: "open Edge", released, 0 orders
+        let rate = 48_000;
+        let speech = vec![0.3f32; rate as usize]; // 1 s, no pause cut
+        let mut r = RtAudio { rate, ..Default::default() };
+        let mut seq = 0;
+        assert!(!r.audio(&speech, false, &mut seq));
+        assert_eq!(r.end(&mut seq), Some(vec![]), "long enough: no pad, one last commit");
+        assert_eq!(r.committed("Open Edge.", true), RtAnswer::Text(0, "Open Edge.".into()));
+        // Scribe answers the last commit with nothing: the batch STT tries the audio (no next chunk will catch it)
+        let mut r = RtAudio { rate, ..Default::default() };
+        r.audio(&speech, false, &mut seq);
+        r.end(&mut seq);
+        assert!(matches!(r.committed("", true), RtAnswer::Batch(1, ref a) if a.len() == speech.len()));
+        // mid-session an empty commit is just silence
+        let mut r = RtAudio { rate, ..Default::default() };
+        r.audio(&vec![0.0; rate as usize], true, &mut seq);
+        assert_eq!(r.committed("", false), RtAnswer::Text(2, String::new()));
+        assert_eq!(r.committed("late", true), RtAnswer::Nothing, "no commit left");
+        // the socket closes or fails with audio not answered: it all goes batch, in order
+        let mut r = RtAudio { rate, ..Default::default() };
+        r.audio(&speech, true, &mut seq);
+        r.audio(&speech[..1000], false, &mut seq);
+        assert_eq!(r.drain(&mut seq).iter().map(|x| (x.0, x.1.len())).collect::<Vec<_>>(), [(3, speech.len()), (4, 1000)]);
+        assert!(RT_FINISH_MS <= 1500, "the release waits at most 1.5 s for Scribe");
+    }
+
+    #[test]
+    fn scribe_commits_are_never_shorter_than_300_ms() {
+        // susurro.log 2026-10-17 23:38:42: "commit_throttled: only 0.11s of uncommitted audio", 3 reconnects, 6 s lost
+        let rate = 16_000;
+        let mut r = RtAudio { rate, ..Default::default() };
+        let mut seq = 0;
+        assert!(!r.audio(&vec![0.3; 1760], true, &mut seq), "a cut after 0.11 s waits for more audio");
+        assert!(r.audio(&vec![0.3; 3200], true, &mut seq), "0.31 s: commit");
+        r.audio(&vec![0.3; 1760], false, &mut seq);
+        assert_eq!(r.end(&mut seq).map(|p| p.len()), Some(4800 - 1760), "the 0.11 s tail is padded with silence");
+        assert_eq!(r.unanswered.back().map(|x| x.1.len()), Some(4800));
+        assert_eq!(r.end(&mut seq), None, "nothing open: no commit");
     }
 
     #[test]
