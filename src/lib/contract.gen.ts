@@ -48,7 +48,20 @@ auto_click: boolean,
  * The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
  * "Latency"), else the dictation provider.
  */
-stt: SttProvider | null, };
+stt: SttProvider | null, 
+/**
+ * Agent mode: "modo agente: <task>", or an order that failed twice in a row, goes to the local Claude Code CLI
+ * (`claude -p`, the subscription login) driving the Mac through susurro's own tools (agent.rs).
+ */
+agent: boolean, 
+/**
+ * The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
+ */
+agent_model: string, 
+/**
+ * The OpenRouter vision model when the claude CLI is missing or not logged in.
+ */
+agent_fallback: string, };
 
 /**
  * Payload of `command_step` (all windows) and a row of `command_log`.

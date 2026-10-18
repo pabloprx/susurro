@@ -59,6 +59,13 @@ pub struct CommandSettings {
     /// The STT for commands. None = auto: Scribe Realtime when an ElevenLabs key is saved (fastest, TESTING.md
     /// "Latency"), else the dictation provider.
     pub stt: Option<SttProvider>,
+    /// Agent mode: "modo agente: <task>", or an order that failed twice in a row, goes to the local Claude Code CLI
+    /// (`claude -p`, the subscription login) driving the Mac through susurro's own tools (agent.rs).
+    pub agent: bool,
+    /// The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
+    pub agent_model: String,
+    /// The OpenRouter vision model when the claude CLI is missing or not logged in.
+    pub agent_fallback: String,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -807,7 +814,7 @@ impl Default for SessionState {
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None }
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into() }
     }
 }
 

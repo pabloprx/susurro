@@ -292,7 +292,7 @@ mod tests {
         let s = load(&p);
         assert_eq!(s.hotkeys.command, "F2");
         assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
-        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None }, "opt-in, also for migrated users");
+        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, ..Default::default() }, "opt-in, also for migrated users");
         assert_eq!(s.version, SETTINGS_VERSION);
         // A picked model is kept; a v3 user may clear it on purpose.
         std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
