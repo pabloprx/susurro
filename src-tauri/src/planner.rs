@@ -28,7 +28,8 @@ Output: strict JSON {"complete": bool, "rest": string, "answer": string|null, "s
 - type never presses return. Add key return only when the user says "run", "execute", "enter" or "X command" ("type ls" -> type only; "run ls" -> type + return).
 - "delete all the writing" = key cmd+a then key delete. "remove what you typed" = one delete_typed, never several key delete.
 - memory is only what susurro did. The screen (focused value) is the truth: if memory says susurro typed something that is no longer in the focused value, do not delete; return actions=[] and say why.
-- "search X" in a browser = key cmd+l, type X, key return. Outside a browser, "search X" uses the app's own search, unless X is a website ("YouTube", "Google", "Amazon"): then open_app a browser first. Use the app hints.
+- "search X" / "busca X": when marks show the page's or app's own search box (search field or combo box, "Search", "Buscar"), click it, type X, key return, all in this one order ("busca en YouTube Ultra Miami" on YouTube = click the YouTube search box, type "Ultra Miami", key return). With no such box, in a browser = key cmd+l, type X, key return. Outside a browser, "search X" uses the app's own search, unless X is a website ("YouTube", "Google", "Amazon"): then open_app a browser first. Use the app hints.
+- A search with no query yet ("busca en YouTube", "search on Google") and final=false: complete=false, actions=[], rest = the utterance: the query comes in the next words.
 - pending: if the utterance answers it ("yes", "sí", "no", "the second one", "7"), set answer to "yes", "no" or the number in digits ("the third one" -> "3") and actions=[].
 - risky=true when the action itself sends a message, posts, deletes data or spends money.
 - Noise or filler ("voila", "um", "thank you") = complete=true, actions=[].
@@ -463,6 +464,14 @@ mod tests {
             "YouTube - Apps on Google Play (link, main)", "YouTube on the App Store (link, main)", "YouTube - Wikipedia (link, main)", "Next page (link, bottom)"]).map(|(i, m)| format!("[{i}] {m}")).collect();
         let yt = numbered(1, &["YouTube (tab, top)", "Address and search bar (text field, toolbar)", "Guide (button, top)", "YouTube Home (link, top)", "Search (search field, top)",
             "Search (button, top)", "Search with your voice (button, top)", "Sign in (link, top)", "Home (link, left)", "Shorts (link, left)", "Subscriptions (link, left)"]);
+        // the YouTube page of the 01:51 session (Chrome in Spanish): the address bar and the "Buscar" combo box
+        let yt_es = numbered(1, &["YouTube (tab, top)", "Barra de direcciones y de búsqueda (text field, toolbar)", "Menú de guía (button, top)", "Página principal de YouTube (link, top)",
+            "Buscar (combo box, main)", "Buscar (button, main)", "Buscar con la voz (button, main)", "Crear (button, top)", "Notificaciones (button, top)", "Principal (link, left)", "Shorts (link, left)",
+            "Suscripciones (link, left)", "Ultra Music Festival 2015 - Aftermovie (link, main)"]);
+        fn yt_search(p: &Plan) -> bool {
+            let l: Vec<String> = p.actions.iter().map(label).collect();
+            l.len() == 3 && l[0].starts_with("click") && l[0].contains("Buscar") && l[0].contains("combo box") && l[1].to_lowercase() == "type “ultra miami 2015”" && l[2] == "⏎"
+        }
         let web = Field { role: "AXWebArea".into(), ..Default::default() };
         let chat = Field { role: "AXTextArea".into(), name: "Write your prompt to Claude".into(), ..Default::default() };
         type Check = fn(&Plan) -> bool;
@@ -488,6 +497,10 @@ mod tests {
                 matches!(p.answer.as_deref(), Some("2" | "15")) && p.actions.is_empty()
             }),
             ("Okay.", "Microsoft Edge", edge_res.clone(), web.clone(), None, |p| p.actions.is_empty()),
+            // susurro.log 2026-10-18 01:51-01:52 (Scribe heard Spanish as Portuguese): no query yet = wait for it
+            ("Boa- Busca em YouTube.", "Google Chrome", yt_es.clone(), web.clone(), None, |p| !p.complete && p.actions.is_empty()),
+            ("Boa- Busca em YouTube. Ultra Miami 2015.", "Google Chrome", yt_es.clone(), web.clone(), None, yt_search),
+            ("Busca en YouTube Ultra Miami 2015.", "Google Chrome", yt_es.clone(), web.clone(), None, yt_search),
         ];
         let (mut ok, mut cost) = (0, 0.0);
         for (utt, app, marks, focused, pending, check) in &cases {

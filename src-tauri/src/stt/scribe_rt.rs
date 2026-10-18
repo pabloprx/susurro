@@ -73,7 +73,7 @@ pub struct Opts {
     pub key: String,
     /// The device rate of the samples given to `send`.
     pub rate: u32,
-    /// None or "auto" = detect.
+    /// None or "auto" = detect (Scribe: among `AUTO_LANGUAGES`).
     pub language: Option<String>,
     pub keyterms: Vec<String>,
 }
@@ -127,14 +127,22 @@ fn name(p: Proto) -> &'static str {
     }
 }
 
+/// Scribe detects among these: `language_code` + `secondary_languages` (ElevenLabs realtime API reference).
+/// ponytail: Pablo's two languages hardcoded; a settings list when someone else speaks others.
+pub const AUTO_LANGUAGES: [&str; 2] = ["es", "en"];
+
 /// The handshake URL: Scribe takes its options in the query, OpenAI in the first `session.update`.
 fn request(o: &Opts, wire: u32) -> anyhow::Result<reqwest::Url> {
     if o.proto == Proto::OpenAi {
         return Ok(reqwest::Url::parse(&o.url)?);
     }
     let mut q: Vec<(&str, String)> = vec![("model_id", MODEL.into()), ("audio_format", format!("pcm_{wire}")), ("commit_strategy", "manual".into())];
-    if let Some(l) = o.language.as_deref().filter(|l| !l.is_empty() && *l != "auto") {
-        q.push(("language_code", l.into()));
+    // Detection among Pablo's languages only (live log 2026-10-18: "Busca em YouTube", "Boa-" = Portuguese). "auto" = es
+    // first; "es" or "en" keeps the other one as secondary, so English orders in a Spanish session stay English.
+    let main = o.language.as_deref().filter(|l| !l.is_empty() && *l != "auto").unwrap_or(AUTO_LANGUAGES[0]);
+    q.push(("language_code", main.into()));
+    if AUTO_LANGUAGES.contains(&main) {
+        q.extend(AUTO_LANGUAGES.iter().filter(|l| **l != main).map(|l| ("secondary_languages", l.to_string())));
     }
     q.extend(o.keyterms.iter().take(MAX_KEYTERMS).map(|k| ("keyterms", k.clone())));
     Ok(reqwest::Url::parse_with_params(&o.url, &q)?)
@@ -546,8 +554,20 @@ mod tests {
         let ev: Vec<Ev> = collect(&rx).into_iter().filter(|e| !matches!(e, Ev::Partial(_))).collect();
         assert_eq!(ev, [Ev::Committed("seg1".into()), Ev::Committed("seg2".into()), Ev::Closed]);
         let s = seen.lock().unwrap().clone();
-        assert!(s[0].starts_with("connect /v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual&language_code=es&keyterms=Contaflow&keyterms=Jev key=xi"), "{}", s[0]);
+        assert!(s[0].starts_with("connect /v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual&language_code=es&secondary_languages=en&keyterms=Contaflow&keyterms=Jev key=xi"), "{}", s[0]);
         assert_eq!(s.iter().filter(|l| l.contains("commit=true")).count(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn auto_language_keeps_scribe_on_spanish_and_english() {
+        // live log 2026-10-18: on auto Scribe heard "Busca en YouTube" as Portuguese ("Busca em YouTube", "Boa-")
+        let q = |l: Option<&str>| request(&Opts { language: l.map(Into::into), keyterms: vec![], ..opts("wss://x/v1/speech-to-text/realtime".into()) }, 16000).unwrap().query().unwrap().to_string();
+        for auto in [None, Some("auto"), Some("")] {
+            assert!(q(auto).ends_with("commit_strategy=manual&language_code=es&secondary_languages=en"), "{}", q(auto));
+        }
+        assert!(q(Some("es")).ends_with("language_code=es&secondary_languages=en"), "{}", q(Some("es")));
+        assert!(q(Some("en")).ends_with("language_code=en&secondary_languages=es"), "{}", q(Some("en")));
+        assert!(q(Some("fr")).ends_with("language_code=fr"), "another language is the only one");
     }
 
     #[test]

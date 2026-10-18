@@ -222,6 +222,16 @@ pub struct Core {
     held: Option<(String, Plan)>,
 }
 
+/// What the executor waits for, with its question.
+#[derive(Debug, Clone, Copy)]
+pub struct Pending<'a> {
+    pub wait: Wait,
+    pub question: &'a str,
+    /// A pick on a click into a text input ("busca en YouTube" -> the search box): the words of that order. A new order
+    /// is planned after them, so "Ultra Miami 2015" becomes click + type + Return (live log 2026-10-18).
+    pub said: Option<&'a str>,
+}
+
 pub type PlanFn<'a> = dyn FnMut(&str, bool, Option<&str>) -> anyhow::Result<Plan> + 'a;
 
 impl Core {
@@ -238,15 +248,26 @@ impl Core {
 
     /// One text, in order. `last` = the session ended (plan what is left). `pending` = what the executor waits for,
     /// with its question.
-    pub fn hear(&mut self, text: &str, last: bool, pending: Option<(Wait, &str)>, plan: &mut PlanFn) -> Heard {
+    pub fn hear(&mut self, text: &str, last: bool, pending: Option<Pending>, plan: &mut PlanFn) -> Heard {
         let text = text.trim();
         if !text.is_empty() {
             self.said.push(text.into());
         }
-        match pending {
-            // Only a number, an ordinal or a shown name answers "Which one?"; a full new order is planned (open risk c).
-            Some((Wait::Pick, q)) if !text.is_empty() && command::looks_like_pick(text, q) => return Heard::Pick(text.into()),
-            Some((Wait::Confirm, q)) if !text.is_empty() => {
+        match pending.map(|p| (p.wait, p.question, p.said)) {
+            // Only a shown number, an ordinal, "ese" or a shown name answers "Which one?" (command::looks_like_pick).
+            Some((Wait::Pick, q, _)) if !text.is_empty() && command::looks_like_pick(text, q) => return Heard::Pick(text.into()),
+            // Anything else is planned; an order drops the pick (`handle`), noise keeps it. After a search click the
+            // words may be its query: planned after the search words first. If that plans nothing ("Busca em YouTube.
+            // Abre Slack." -> [] on gpt-oss-120b, measured), the words are planned alone.
+            Some((Wait::Pick, _, Some(s))) if !text.is_empty() && !s.trim().is_empty() => {
+                let merged = format!("{} {} {text}", s.trim(), self.buffer).split_whitespace().collect::<Vec<_>>().join(" ");
+                if let Ok(p) = plan(&merged, last, None).inspect_err(|e| log::warn!("live: search query plan: {e:#}")) && !p.actions.is_empty() {
+                    self.buffer = if p.complete { String::new() } else { p.rest.trim().to_string() };
+                    self.held = None;
+                    return self.order(p.actions, p.say);
+                }
+            }
+            Some((Wait::Confirm, q, _)) if !text.is_empty() => {
                 if let Some(yes) = command::yes_no(text) {
                     return Heard::Confirm(yes);
                 }
@@ -778,16 +799,14 @@ fn live_loop(
                         resume(&app);
                         continue;
                     }
-                    let pending = command::waiting().map(|w| (w, LIVE.lock().unwrap().pending.clone().unwrap_or_default()));
-                    let heard = core.hear(&t, false, pending.as_ref().map(|(w, q)| (*w, q.as_str())), &mut planner);
+                    let question = LIVE.lock().unwrap().pending.clone().unwrap_or_default();
+                    let said = RUNNING.lock().unwrap().clone().filter(search_click).map(|a| a.said);
+                    let pending = command::waiting().map(|wait| Pending { wait, question: &question, said: said.as_deref() });
+                    let heard = core.hear(&t, false, pending, &mut planner);
                     *ctl.said.lock().unwrap() = core.said.join(" ");
                     // Esc while the planner ran: its answer is dropped.
                     if ctl.stopped.load(Ordering::SeqCst) {
                         break;
-                    }
-                    // A new order while "Which one?" waits: Pablo moved on, the pick is dropped.
-                    if matches!(heard, Heard::Order(..)) && command::waiting() == Some(Wait::Pick) {
-                        command::deny();
                     }
                     handle(&app, &queue, &core, heard);
                 }
@@ -872,6 +891,8 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
         Heard::Confirm(false) => command::deny(),
         Heard::Pick(t) => command::answer(t),
         Heard::Order(order, actions, say) => {
+            // A new order while "Which one?" waits (a held one too): Pablo moved on, the queue must not wait 20 s.
+            drop_pick();
             let said = core.said.last().cloned().unwrap_or_default();
             for mut a in actions {
                 a.said = said.clone();
@@ -892,6 +913,22 @@ fn handle(app: &AppHandle, queue: &Queue, core: &Core, h: Heard) {
     let labels = queue.labels();
     let buffer = core.buffer.clone();
     update(app, |l| (l.queue, l.buffer, l.took_over, l.paused) = (labels, buffer, took_over(), paused()));
+}
+
+/// The action the executor runs now (its pick or confirm is what `command::waiting` reports).
+static RUNNING: Mutex<Option<Action>> = Mutex::new(None);
+
+/// A click into a search box or another text input: its pick is for the field the next words go into.
+pub fn search_click(a: &Action) -> bool {
+    let t = crate::text::norm(a.target.as_deref().unwrap_or(""));
+    a.op == "click" && (["text field", "text area", "combo box", "search field"].iter().any(|r| t.contains(&format!("({r}"))) || ["search", "busca"].iter().any(|w| t.contains(w)))
+}
+
+fn drop_pick() {
+    if command::waiting() == Some(Wait::Pick) {
+        log::info!("live: a new order while \"Which one?\" waits: the pick is dropped");
+        command::deny();
+    }
 }
 
 fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSettings, ctl: Arc<Ctl>) {
@@ -930,8 +967,10 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                 update(&app, |l| l.queue = labels);
                 BUSY.store(true, Ordering::SeqCst);
                 STEPS.fetch_add(1, Ordering::SeqCst);
+                *RUNNING.lock().unwrap() = Some(action.clone());
                 #[cfg(target_os = "macos")]
                 let end = command::exec(&action, step, order, &cfg, &mut ask, &mut desk, &mut mem);
+                *RUNNING.lock().unwrap() = None;
                 BUSY.store(false, Ordering::SeqCst);
                 #[cfg(not(target_os = "macos"))]
                 let end = {
@@ -1035,6 +1074,13 @@ fn command_words(app: &AppHandle, text: &str) -> Option<String> {
     chunk_text_with(app, clip, &|_: &crate::stt::SttRequest| Ok(out.clone())).ok().flatten()
 }
 
+/// A text with letters but none Latin while Pablo speaks Spanish / English (or auto): MAI on a short noisy chunk
+/// (live log 2026-10-18 01:53:19: "ほんとで"). It names nothing on screen; it goes like a silent chunk.
+pub fn foreign_script(text: &str, language: &str) -> bool {
+    let latin = |c: char| c.is_ascii_alphabetic() || ('\u{c0}'..='\u{24f}').contains(&c);
+    matches!(language, "" | "auto" | "es" | "en") && text.chars().any(char::is_alphabetic) && !text.chars().any(latin)
+}
+
 /// One chunk through the command STT: the pipeline (hallucination filter, dictionary corrections), no cleanup LLM,
 /// plus BRANDS as extra hint words. Ok(None) = nothing heard.
 fn chunk_text(app: &AppHandle, audio: Vec<f32>) -> anyhow::Result<Option<String>> {
@@ -1055,6 +1101,10 @@ fn chunk_text_with(app: &AppHandle, clip: crate::audio::Clip, stt_fn: &dyn Fn(&c
     let d = crate::dictionary::Dictionary::new(crate::dictionary::load(&state.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone());
     let opts = pipeline::Opts { language: Some(s.language.as_str()), style: s.styles.style.clone(), raw_app: true, press_enter_command: false, strip_inverted: false, slash: None };
     match pipeline::run(&clip, &opts, &d, stt_fn, None) {
+        Outcome::Text(d) if foreign_script(&d.final_text, &s.language) => {
+            log::info!("live: {:?} is not in Pablo's script, dropped", d.final_text);
+            Ok(None)
+        }
         Outcome::Text(d) => Ok(Some(d.final_text)),
         Outcome::Skip(_) => Ok(None),
         Outcome::Failed(e) => Err(anyhow::anyhow!(e)),
@@ -1337,25 +1387,98 @@ mod tests {
             assert_eq!(q, Some("Press Return?"));
             Ok(Plan { complete: true, answer: Some("yes".into()), ..Default::default() })
         };
-        assert_eq!(c.hear("Sí.", false, Some((Wait::Confirm, "Press Return?")), &mut p), Heard::Confirm(true));
-        assert_eq!(c.hear("no", false, Some((Wait::Confirm, "Press Return?")), &mut p), Heard::Confirm(false));
-        assert_eq!(c.hear("go ahead and do it", false, Some((Wait::Confirm, "Press Return?")), &mut p), Heard::Confirm(true), "planner fallback");
+        assert_eq!(c.hear("Sí.", false, pend(Wait::Confirm, "Press Return?"), &mut p), Heard::Confirm(true));
+        assert_eq!(c.hear("no", false, pend(Wait::Confirm, "Press Return?"), &mut p), Heard::Confirm(false));
+        assert_eq!(c.hear("go ahead and do it", false, pend(Wait::Confirm, "Press Return?"), &mut p), Heard::Confirm(true), "planner fallback");
         assert_eq!(calls.get(), 1);
-        assert_eq!(c.hear("la dos", false, Some((Wait::Pick, "Which one?")), &mut p), Heard::Pick("la dos".into()));
+        assert_eq!(c.hear("la dos", false, pend(Wait::Pick, "Which one? 1 A · 2 B"), &mut p), Heard::Pick("la dos".into()));
         assert_eq!(c.buffer, "", "answers never enter the order buffer");
+    }
+
+    fn pend(wait: Wait, question: &str) -> Option<Pending<'_>> {
+        Some(Pending { wait, question, said: None })
     }
 
     #[test]
     fn a_new_order_during_a_pick_is_planned_not_swallowed() {
-        // open risk c: only numbers, ordinals and shown names answer "Which one?"
+        // open risk c: only shown numbers, ordinals and shown names answer "Which one?"
         let q = "Which one? 4 #general · 7 #design · 9 #random";
         let mut c = Core::default();
         let mut p = |t: &str, _: bool, _: Option<&str>| Ok(if t.starts_with("open") { plan(true, "", &["key", "open_app"]) } else { plan(true, "", &[]) });
-        for answer in ["la dos", "7", "the second one", "design", "el de random", "number four"] {
-            assert_eq!(c.hear(answer, false, Some((Wait::Pick, q)), &mut p), Heard::Pick(answer.into()), "{answer}");
+        for answer in ["7", "the second one", "design", "el de random", "number four", "la última"] {
+            assert_eq!(c.hear(answer, false, pend(Wait::Pick, q), &mut p), Heard::Pick(answer.into()), "{answer}");
         }
-        assert!(matches!(c.hear("open a new tab and type hello", false, Some((Wait::Pick, q)), &mut p), Heard::Order(1, ..)), "a full order");
-        assert_eq!(c.hear("something else entirely", false, Some((Wait::Pick, q)), &mut p), Heard::Nothing, "not a pick, no actions");
+        assert!(matches!(c.hear("la dos", false, pend(Wait::Pick, q), &mut p), Heard::Nothing), "2 is not shown");
+        assert!(matches!(c.hear("open a new tab and type hello", false, pend(Wait::Pick, q), &mut p), Heard::Order(1, ..)), "a full order (handle drops the pick)");
+        assert_eq!(c.hear("Eh.", false, pend(Wait::Pick, q), &mut p), Heard::Nothing, "noise: no order, the pick stays");
+    }
+
+    /// Live log 2026-10-18 01:51:56-01:52:19 (Scribe Realtime, "Clicks: I choose"): "Boa-" / "Busca em YouTube." ->
+    /// click the Buscar combo box, its pick waits; "Ultra Miami 2015." has a number, was taken as the pick answer, matched
+    /// no choice, and the pick timed out 20 s later with nothing planned. Now it drops the pick and is planned after the
+    /// search words: one order, click + type + Return.
+    #[test]
+    fn replay_a_search_query_during_a_pick_is_the_next_order() {
+        let calls = std::cell::RefCell::new(vec![]);
+        let mut p = |t: &str, last: bool, pending: Option<&str>| {
+            calls.borrow_mut().push(t.to_string());
+            assert!(pending.is_none() && !last);
+            Ok(match t {
+                "Boa-" => plan(false, "Boa-", &[]),
+                "Boa- Busca em YouTube." => Plan { complete: true, actions: vec![Action { op: "click".into(), target: Some("Buscar (combo box, main)".into()), ..Default::default() }], ..Default::default() },
+                "Busca em YouTube. Ultra Miami 2015." => Plan {
+                    complete: true,
+                    actions: vec![
+                        Action { op: "click".into(), target: Some("Buscar (combo box, main)".into()), ..Default::default() },
+                        ty("Ultra Miami 2015"),
+                        Action { op: "key".into(), keys: Some("return".into()), ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+                // a new order, not a query: the merged plan has nothing (gpt-oss-120b, measured), the words alone run
+                "Busca em YouTube. Abre Slack." => plan(false, "Busca em YouTube.", &[]),
+                "Abre Slack." => plan(true, "", &["open_app"]),
+                other => panic!("planned {other:?}"),
+            })
+        };
+        let mut c = Core::default();
+        let mut orders = vec![];
+        for (seq, t) in ["Boa-", "Busca em YouTube."].into_iter().enumerate() {
+            for t in c.arrive(seq as u32, Some(t.into())) {
+                orders.push(c.hear(&t.unwrap(), false, None, &mut p));
+            }
+        }
+        let Some(Heard::Order(1, first, _)) = orders.pop() else { panic!("{orders:?}") };
+        let running = Action { said: c.said.last().cloned().unwrap(), ..first[0].clone() };
+        assert!(search_click(&running), "a click into the search box");
+        // the pick of order 1 waits; the next commit arrives
+        let q = "Which one? 1 Buscar · 2 Buscar con la voz · 3 YouTube";
+        assert!(!command::looks_like_pick("Ultra Miami 2015.", q), "2015 is no shown choice");
+        let pending = Some(Pending { wait: Wait::Pick, question: q, said: Some(running.said.as_str()) });
+        let t = c.arrive(2, Some("Ultra Miami 2015.".into())).remove(0).unwrap();
+        let h = c.hear(&t, false, pending, &mut p);
+        let Heard::Order(2, acts, _) = h else { panic!("{h:?}") };
+        assert_eq!(acts.iter().map(planner::label).collect::<Vec<_>>(), ["click “Buscar (combo box, main)”", "type “Ultra Miami 2015”", "⏎"]);
+        assert_eq!(calls.borrow().last().unwrap(), "Busca em YouTube. Ultra Miami 2015.");
+        assert_eq!(c.buffer, "");
+        let h = c.hear("Abre Slack.", false, pending, &mut p);
+        assert!(matches!(&h, Heard::Order(3, a, _) if a[0].op == "open_app"), "{h:?}");
+        assert_eq!(c.buffer, "");
+        // "la dos" while that pick waits is an answer, not an order
+        assert_eq!(c.hear("la dos", false, Some(Pending { wait: Wait::Pick, question: q, said: Some("x") }), &mut p), Heard::Pick("la dos".into()));
+    }
+
+    #[test]
+    fn foreign_scripts_drop() {
+        assert!(foreign_script("ほんとで", "auto") && foreign_script("Привет", "es"));
+        assert!(!foreign_script("Ábrelo, ñandú.", "auto") && !foreign_script("104.", "auto") && !foreign_script("ほんとで", "ja"));
+    }
+
+    #[test]
+    fn search_clicks() {
+        let click = |t: &str| Action { op: "click".into(), target: Some(t.into()), ..Default::default() };
+        assert!(search_click(&click("Buscar (combo box, main)")) && search_click(&click("[5] Search (search field, top)")) && search_click(&click("the search box")));
+        assert!(!search_click(&click("Pablo (tú, disponible) (row, sidebar)")) && !search_click(&ty("search")));
     }
 
     #[test]

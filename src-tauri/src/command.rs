@@ -290,20 +290,44 @@ pub fn pick_by_name(text: &str, options: &[(u32, String)]) -> Option<u32> {
     (fits.len() == 1).then(|| fits[0])
 }
 
-/// The spoken text answers "Which one?" (open risk c): at most 5 words and a number, an ordinal or a shown name.
-/// A full new order ("open a new tab and type hello") is not a pick: the planner gets it.
-/// ponytail: a short order with a number ("type 5") still counts as a pick; add a verb check if that bites.
+/// Ordinals: a place in the pick list (0-based). Word starts, so "segunda", "tercero", "cuarta" fit.
+const ORDINALS: [(&str, usize); 10] =
+    [("first", 0), ("primer", 0), ("second", 1), ("segund", 1), ("third", 2), ("tercer", 2), ("fourth", 3), ("cuart", 3), ("fifth", 4), ("quint", 4)];
+/// Words around a pick answer that name nothing ("click on the second one", "go with two", "en la segunda").
+/// No verb that acts on its own ("type 5", "open 2" stay orders).
+const PICK_AROUND: [&str; 17] = ["click", "clic", "pick", "choose", "elige", "option", "opcion", "on", "en", "a", "to", "go", "with", "take", "quiero", "now", "ahora"];
+
+/// The spoken text answers "Which one?": a shown option number ("2", "dos", "number 4"), an ordinal ("la segunda",
+/// "the last one"), "sí / ese / that one", or a shown option name; every other word is filler. Anything else is a new
+/// order (live log 2026-10-18: "Ultra Miami 2015." had a number, was taken as the answer, and the order was lost).
 pub fn looks_like_pick(text: &str, question: &str) -> bool {
-    let l = text.to_lowercase();
-    let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let opts = pick_options(question);
+    let n = crate::text::norm(text);
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     if words.is_empty() || words.len() > 5 {
         return false;
     }
-    let ord = ["first", "primer", "second", "segund", "third", "tercer", "fourth", "cuart", "fifth", "quint", "last", "últim", "ultim"];
-    let number = |w: &str| w.parse::<u32>().is_ok() || NUMBERS.iter().any(|(s, _)| *s == w);
-    let n = crate::text::norm(text);
-    let normed: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    words.iter().any(|w| number(w) || ord.iter().any(|o| w.starts_with(o))) || this_one(&normed) || pick_by_name(text, &pick_options(question)).is_some()
+    if this_one(&words) || pick_by_name(text, &opts).is_some() {
+        return true;
+    }
+    let shown = |k: u32| opts.iter().any(|o| o.0 == k);
+    let core: Vec<&str> = words.iter().copied().filter(|w| !PICK_FILLER.contains(w) && !PICK_AROUND.contains(w)).collect();
+    if this_one(&core) {
+        return true; // "yes please"
+    }
+    if core.is_empty() {
+        // "One.", "the one": the filler "one" is the answer
+        return words.contains(&"one") && shown(1);
+    }
+    core.iter().all(|w| match digits(w).or_else(|| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1)) {
+        Some(k) => shown(k),
+        None => ORDINALS.iter().find(|(o, _)| w.starts_with(o)).is_some_and(|(_, k)| *k < opts.len()) || ((w.starts_with("last") || w.starts_with("ultim")) && !opts.is_empty()),
+    })
+}
+
+/// "2", "2nd", "3rd" -> the number.
+fn digits(w: &str) -> Option<u32> {
+    ["", "st", "nd", "rd", "th"].iter().find_map(|s| w.strip_suffix(s)?.parse().ok())
 }
 
 /// Pick mode ("Clicks: I choose"): what Pablo said to the numbered choices.
@@ -322,18 +346,17 @@ fn this_one(words: &[&str]) -> bool {
     !words.is_empty() && words.len() <= 3 && words.iter().all(|w| W.contains(w) || ["that", "this", "one"].contains(w)) && words.iter().any(|w| *w != "one")
 }
 
-/// The answer to the numbered choices (1..=names.len()). `pre` = #1 is highlighted, so a yes picks it.
-pub fn parse_choice(text: &str, names: &[String], ids: &[u32], pre: bool) -> Option<Picked> {
+/// The answer to the numbered choices (1..=names.len()). "sí" / "ese" takes #1, Jev's best.
+pub fn parse_choice(text: &str, names: &[String], ids: &[u32]) -> Option<Picked> {
     let l = crate::text::norm(text);
     let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let n = names.len();
     let num = |k: u32| if k >= 1 && k as usize <= n { Some(Picked::Nth(k as usize - 1)) } else { ids.contains(&k).then_some(Picked::Mark(k)) };
     for w in &words {
-        if let Ok(k) = w.parse::<u32>() {
+        if let Some(k) = digits(w) {
             return num(k);
         }
-        let ord = [("first", 0), ("primer", 0), ("second", 1), ("segund", 1), ("third", 2), ("tercer", 2), ("fourth", 3), ("cuart", 3), ("fifth", 4), ("quint", 4)];
-        if let Some((_, k)) = ord.iter().find(|(o, _)| w.starts_with(o)) {
+        if let Some((_, k)) = ORDINALS.iter().find(|(o, _)| w.starts_with(o)) {
             return (*k < n).then_some(Picked::Nth(*k));
         }
         if (w.starts_with("last") || w.starts_with("ultim")) && n > 0 {
@@ -347,7 +370,8 @@ pub fn parse_choice(text: &str, names: &[String], ids: &[u32], pre: bool) -> Opt
     if let Some(k) = words.iter().find_map(|w| NUMBERS.iter().find(|(s, _)| s == w).map(|p| p.1)) {
         return num(k);
     }
-    (pre && this_one(&words)).then_some(Picked::Nth(0))
+    let core: Vec<&str> = words.iter().copied().filter(|w| !PICK_FILLER.contains(w) && !PICK_AROUND.contains(w)).collect();
+    (this_one(&words) || this_one(&core)).then_some(Picked::Nth(0))
 }
 
 /// "[41] YouTube Music (link, main)" -> (Some(41), "YouTube Music (link, main)"). The planner copies the mark text with
@@ -847,6 +871,12 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
         let risky = if risky_name(&e.mark.name) { 1.0 } else { 0.0 };
         return Ok(Hit { picked: said_it, ..Hit::of(e, risky) });
     }
+    // Pick mode with nothing to choose: the only search box (combo box, text field...) of its kind on screen.
+    if let Some(e) = local.filter(|e| only_of_its_kind(e, &scr.els)) {
+        let h = Hit::of(e, if risky_name(&e.mark.name) { 1.0 } else { 0.0 });
+        flash(r, desk, &h);
+        return Ok(h);
+    }
     let words = split_mark(words).1;
     let instr = format!("{verb} {words}");
     if scr.els.len() < MIN_AX {
@@ -906,9 +936,12 @@ fn ground(r: &mut Run, verb: &str, words: &str, ask: &mut Ask, desk: &mut dyn De
 pub const CHOICES_MAX: usize = 5;
 /// Past the first 3, a choice needs this much of Jev's probability to be shown.
 const CHOICE_MIN: f32 = 0.05;
-/// Jev this sure of #1 (and #2 under PRE_NEXT_MAX): #1 is highlighted, "sí" takes it.
-pub const PRE_TOP_MIN: f32 = 0.97;
-pub const PRE_NEXT_MAX: f32 = 0.3;
+/// Jev this sure of #1, and #2 under SURE_NEXT_MAX: no choices, #1 is highlighted for HIGHLIGHT_MS and clicked.
+/// ponytail: first guesses, not measured; RESULTS.md: every miss was < 0.8.
+pub const SURE_TOP_MIN: f32 = 0.9;
+pub const SURE_NEXT_MAX: f32 = 0.3;
+/// An obvious target shows its brackets this long before the action (Pablo sees what is clicked).
+pub const HIGHLIGHT_MS: u64 = 300;
 
 /// The choices Pablo sees: Jev's ranking (ids on screen only), the planner's exact match kept in, 3 to 5 of them.
 pub fn choices(ranked: &[(String, f32)], ids: &[u32], local: Option<u32>) -> Vec<(u32, f32)> {
@@ -926,9 +959,20 @@ pub fn choices(ranked: &[(String, f32)], ids: &[u32], local: Option<u32>) -> Vec
     c
 }
 
-/// #1 is highlighted (Jev is sure and #2 far behind).
-pub fn preselect(c: &[(u32, f32)]) -> bool {
-    c.first().is_some_and(|x| x.1 >= PRE_TOP_MIN) && c.get(1).is_none_or(|x| x.1 < PRE_NEXT_MAX)
+/// Jev is sure of #1 and #2 is far behind: not ambiguous, no choices.
+pub fn sure(c: &[(u32, f32)]) -> bool {
+    c.first().is_some_and(|x| x.1 >= SURE_TOP_MIN) && c.get(1).is_none_or(|x| x.1 < SURE_NEXT_MAX)
+}
+
+/// A text input with no other of its role on screen ("Buscar (combo box)" next to the address bar's text field).
+pub fn only_of_its_kind(e: &El, els: &[El]) -> bool {
+    ax::takes_text(&e.mark.role) && els.iter().filter(|x| x.mark.role == e.mark.role).count() == 1
+}
+
+/// The target is obvious: its brackets show for HIGHLIGHT_MS, then the action runs.
+fn flash(r: &mut Run, desk: &mut dyn Desk, h: &Hit) {
+    aim(r, desk, h);
+    desk.sleep(HIGHLIGHT_MS);
 }
 
 /// Pick mode: marks + the marked screenshot -> Jev ranks the marks -> the top 3-5 as numbered choices -> Pablo
@@ -954,24 +998,27 @@ fn choose(r: &mut Run, instr: &str, scr: &Screen, local: Option<u32>, ask: &mut 
         return Err(r.fail(desk, CmdStatus::Unsure, NOT_SURE));
     }
     let el = |id: u32| scr.els.iter().find(|e| e.mark.id == id);
+    if let Some(e) = el(c[0].0).filter(|_| sure(&c)) {
+        let h = Hit::of(e, d.risky);
+        flash(r, desk, &h);
+        return Ok(h);
+    }
     let names: Vec<String> = c.iter().map(|(id, _)| el(*id).map(|e| e.mark.name.clone()).unwrap_or_default()).collect();
-    let pre = preselect(&c);
     let list = names.iter().enumerate().map(|(i, n)| format!("{} {}", i + 1, if n.is_empty() { "(no name)" } else { n })).collect::<Vec<_>>().join(" · ");
-    (r.st.choices, r.st.choose, r.st.preselect, r.st.status) = (c.clone(), true, pre, CmdStatus::Pick);
-    r.st.target = pre.then_some(c[0].0);
+    (r.st.choices, r.st.choose, r.st.preselect, r.st.status) = (c.clone(), true, false, CmdStatus::Pick);
+    r.st.target = None;
     r.st.message = Some(format!("Which one? {list}"));
     desk.emit(&r.st);
     let until = std::time::Instant::now() + PICK_TIMEOUT;
     let got = loop {
         let left = until.saturating_duration_since(std::time::Instant::now());
         match desk.wait(Wait::Pick, left) {
-            Answer::Text(t) => match parse_choice(&t, &names, &ids, pre) {
+            Answer::Text(t) => match parse_choice(&t, &names, &ids) {
                 Some(Picked::Nth(i)) => break (c[i].0, false),
                 Some(Picked::Mark(n)) => break (n, false),
                 // not an answer: the list stays up, the time keeps running
                 None => continue,
             },
-            Answer::Yes if pre => break (c[0].0, false),
             Answer::Yes => continue,
             Answer::Clicked(i) if i < c.len() => break (c[i].0, true),
             Answer::Clicked(_) => continue,
@@ -1811,7 +1858,8 @@ mod tests {
         assert_eq!(pick_by_name("Random stuff.", &opts), Some(9));
         assert_eq!(pick_by_name("ra", &opts), None, "too short to name one");
         assert_eq!(pick_by_name("type hello", &opts), None);
-        assert!(looks_like_pick("el tercero", q) && looks_like_pick("General.", q) && looks_like_pick("20", q));
+        assert!(looks_like_pick("el tercero", q) && looks_like_pick("General.", q) && looks_like_pick("7", q));
+        assert!(!looks_like_pick("20", q), "20 is not shown: a new order (a mark number goes to the planner)");
         assert!(!looks_like_pick("open slack and search for design reviews", q), "a full order");
         assert!(!looks_like_pick("type hello", q));
         assert_eq!(parse_pick("never mind", &choices, &ids), None);
@@ -2728,22 +2776,57 @@ mod tests {
     }
 
     #[test]
-    fn pick_mode_a_sure_first_choice_is_highlighted_and_si_takes_it() {
-        for answer in [Answer::Text("sí".into()), Answer::Text("ese".into()), Answer::Yes] {
-            let (mut ask, _) = script(vec![ranking(&[("5", 0.98), ("2", 0.01), ("8", 0.01)])]);
-            let mut d = pick_desk(vec![answer.clone()]);
-            let e = exec(&on("click", "copy link"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
-            assert_eq!(e.status, CmdStatus::Done, "{answer:?}");
-            assert_eq!(d.acts, [Act::Click(Target::Mark(5))], "{answer:?}");
-            let pick = d.steps.iter().find(|s| s.status == CmdStatus::Pick).unwrap();
-            assert!(pick.preselect && pick.target == Some(5), "#1 is highlighted");
-        }
-        // not sure enough: "sí" is no answer, the list waits for a number
-        let (mut ask, _) = script(vec![ranking(&[("5", 0.9), ("2", 0.05), ("8", 0.05)])]);
-        let mut d = pick_desk(vec![Answer::Text("sí".into()), Answer::Text("hmm what".into()), Answer::Text("uno".into())]);
+    fn pick_mode_a_sure_first_choice_is_highlighted_and_clicked() {
+        // Jev >= 0.9 with #2 far behind: no choices, no wait; the brackets show 300 ms, then the click
+        let (mut ask, _) = script(vec![ranking(&[("5", 0.92), ("2", 0.05), ("8", 0.01)])]);
+        let mut d = pick_desk(vec![]);
+        let e = exec(&on("click", "copy link"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
+        assert_eq!(e.status, CmdStatus::Done);
+        assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
+        assert!(d.waits.is_empty() && !d.steps.iter().any(|s| s.status == CmdStatus::Pick));
+        assert!(d.sleeps.contains(&HIGHLIGHT_MS) && d.steps.iter().any(|s| s.status == CmdStatus::Aim && s.target == Some(5)));
+        // not sure enough: the list waits; "hmm what" is no answer, "sí" takes #1
+        let (mut ask, _) = script(vec![ranking(&[("5", 0.85), ("2", 0.1), ("8", 0.05)])]);
+        let mut d = pick_desk(vec![Answer::Text("hmm what".into()), Answer::Yes, Answer::Text("sí".into())]);
         let e = exec(&on("click", "copy link"), 1, 1, &CHOOSE, &mut ask, &mut d, &mut Memory::new());
         assert_eq!((e.status, d.waits.len()), (CmdStatus::Done, 3));
         assert_eq!(d.acts, [Act::Click(Target::Mark(5))]);
+    }
+
+    /// Live log 2026-10-18 01:51:58: "Busca em YouTube." -> click "Buscar (combo box, main)" showed choices and waited
+    /// 20 s. The only combo box on screen is obvious: no Jev, no list, a 300 ms highlight, then the click, the query and
+    /// Return run as one order.
+    #[test]
+    fn pick_mode_the_only_search_box_is_obvious() {
+        let els = vec![
+            mk(1, "Atrás", "button", "toolbar", None, None),
+            mk(2, "Barra de direcciones y de búsqueda", "text field", "toolbar", None, None),
+            mk(3, "Buscar", "combo box", "main", None, None),
+            mk(4, "Buscar", "button", "main", None, None),
+            mk(5, "Buscar con la voz", "button", "main", None, None),
+            mk(6, "Ultra Music Festival", "link", "main", None, None),
+        ];
+        let yt = Screen { app: "Google Chrome".into(), display: PtRect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }, scale: 2.0, els };
+        let mut d = FakeDesk {
+            app: "Google Chrome".into(),
+            fields: vec![FField::new("AXWebArea", "", "", None), FField::new("AXComboBox", "Buscar", "", Some(3))],
+            screens: vec![yt],
+            screen_ok: true,
+            ..Default::default()
+        };
+        let order = [said(on("click", "Buscar (combo box, main)"), "Busca en YouTube. Ultra Miami 2015."), typ("Ultra Miami 2015", None), Action { op: "key".into(), keys: Some("return".into()), ..Default::default() }];
+        let mut mem = Memory::new();
+        for (i, a) in order.iter().enumerate() {
+            let e = exec(a, i as u32 + 1, 1, &CHOOSE, &mut no_jev, &mut d, &mut mem);
+            assert_eq!(e.status, CmdStatus::Done, "{i}: {e:?}");
+        }
+        assert!(d.waits.is_empty(), "no pick, no Return confirm in a browser");
+        assert_eq!(d.acts[0], Act::Click(Target::Mark(3)));
+        assert_eq!(d.sleeps.first(), Some(&HIGHLIGHT_MS));
+        assert_eq!(d.value(1), "Ultra Miami 2015");
+        assert!(matches!(d.acts.last(), Some(Act::Combo(36, 0))), "{:?}", d.acts);
+        // two text fields of the same kind: still a choice
+        assert!(!only_of_its_kind(&mk(2, "a", "text field", "main", None, None), &[mk(2, "a", "text field", "main", None, None), mk(7, "b", "text field", "main", None, None)]));
     }
 
     #[test]
@@ -2796,26 +2879,28 @@ mod tests {
     fn pick_tables() {
         let names: Vec<String> = ["Search", "New chat", "YouTube Music"].iter().map(|s| s.to_string()).collect();
         let ids: Vec<u32> = (1..=50).collect();
-        let rows: [(&str, bool, Option<Picked>); 16] = [
-            ("uno", false, Some(Picked::Nth(0))),
-            ("la dos", false, Some(Picked::Nth(1))),
-            ("tres", false, Some(Picked::Nth(2))),
-            ("2", false, Some(Picked::Nth(1))),
-            ("the second one", false, Some(Picked::Nth(1))),
-            ("el tercero", false, Some(Picked::Nth(2))),
-            ("the last one", false, Some(Picked::Nth(2))),
-            ("new chat", false, Some(Picked::Nth(1))),
-            ("youtube music", false, Some(Picked::Nth(2))),
-            ("41", false, Some(Picked::Mark(41))),
-            ("la 41", false, Some(Picked::Mark(41))),
-            ("99", false, None),
-            ("sí", true, Some(Picked::Nth(0))),
-            ("ese", true, Some(Picked::Nth(0))),
-            ("sí", false, None),
-            ("what was that", true, None),
+        let rows: [(&str, Option<Picked>); 18] = [
+            ("uno", Some(Picked::Nth(0))),
+            ("la dos", Some(Picked::Nth(1))),
+            ("tres", Some(Picked::Nth(2))),
+            ("2", Some(Picked::Nth(1))),
+            ("the second one", Some(Picked::Nth(1))),
+            ("el tercero", Some(Picked::Nth(2))),
+            ("the last one", Some(Picked::Nth(2))),
+            ("new chat", Some(Picked::Nth(1))),
+            ("youtube music", Some(Picked::Nth(2))),
+            ("41", Some(Picked::Mark(41))),
+            ("la 41", Some(Picked::Mark(41))),
+            ("99", None),
+            ("sí", Some(Picked::Nth(0))),
+            ("ese", Some(Picked::Nth(0))),
+            ("what was that", None),
+            ("the 2nd one", Some(Picked::Nth(1))),
+            ("yes please", Some(Picked::Nth(0))),
+            ("that one", Some(Picked::Nth(0))),
         ];
-        for (t, pre, want) in rows {
-            assert_eq!(parse_choice(t, &names, &ids, pre), want, "{t:?} pre={pre}");
+        for (t, want) in rows {
+            assert_eq!(parse_choice(t, &names, &ids), want, "{t:?}");
         }
         // Jev's ranking -> what Pablo sees
         let r = |v: &[(&str, f32)]| v.iter().map(|(k, p)| (k.to_string(), *p)).collect::<Vec<_>>();
@@ -2823,10 +2908,17 @@ mod tests {
         assert_eq!(choices(&r(&[("1", 0.5), ("none", 0.3), ("2", 0.1), ("3", 0.06), ("4", 0.03), ("99", 0.01)]), &on_screen, None), [(1, 0.5), (2, 0.1), (3, 0.06)], "none and unknown ids drop, 4th under 5%");
         assert_eq!(choices(&r(&[("1", 0.3), ("2", 0.2), ("3", 0.2), ("4", 0.2), ("5", 0.05), ("6", 0.05)]), &on_screen, None).len(), 5, "5 at most");
         assert_eq!(choices(&r(&[("1", 0.6), ("2", 0.4)]), &on_screen, Some(7)), [(1, 0.6), (2, 0.4), (7, 0.0)], "the planner's exact mark stays in");
-        assert!(preselect(&[(1, 0.98), (2, 0.01)]) && preselect(&[(1, 0.99)]));
-        assert!(!preselect(&[(1, 0.96), (2, 0.01)]) && !preselect(&[(1, 0.98), (2, 0.31)]));
-        assert!(looks_like_pick("ese", "Which one? 1 Search · 2 New chat"));
-        assert!(!looks_like_pick("open a new tab and type hello", "Which one? 1 Search · 2 New chat"));
+        assert!(sure(&[(1, 0.9), (2, 0.29)]) && sure(&[(1, 0.99)]));
+        assert!(!sure(&[(1, 0.89), (2, 0.01)]) && !sure(&[(1, 0.98), (2, 0.31)]));
+        // only a shown choice answers (live log 2026-10-18: "Ultra Miami 2015." was taken as an answer)
+        let q = "Which one? 1 Search · 2 New chat · 3 YouTube Music";
+        for t in ["ese", "sí", "that one", "One.", "la dos", "2", "number 3", "the second one", "la segunda", "la última", "click the third", "new chat", "dos por favor",
+            "click on the second one", "en la segunda", "go with two", "the 2nd one", "yes please"] {
+            assert!(looks_like_pick(t, q), "{t:?}");
+        }
+        for t in ["Ultra Miami 2015.", "4", "la cuarta", "open a new tab and type hello", "type 5", "busca una canción", "Onto the 104, open it.", "Open it.", "ok search youtube"] {
+            assert!(!looks_like_pick(t, q), "{t:?}");
+        }
     }
 
     #[test]
@@ -2925,9 +3017,9 @@ mod tests {
             assert!(looks_like_pick(answer, q), "{answer}");
         }
         let names: Vec<String> = ["Share", "Share", "Search"].map(String::from).to_vec();
-        assert_eq!(parse_choice("open search", &names, &[2, 8, 3], false), Some(Picked::Nth(2)));
-        assert_eq!(parse_choice("ok search youtube", &names, &[2, 8, 3], false), None);
-        assert_eq!(parse_choice("ok", &names, &[2, 8, 3], false), None, "a yes picks only a highlighted #1");
+        assert_eq!(parse_choice("open search", &names, &[2, 8, 3]), Some(Picked::Nth(2)));
+        assert_eq!(parse_choice("ok search youtube", &names, &[2, 8, 3]), None);
+        assert_eq!(parse_choice("ok", &names, &[2, 8, 3]), Some(Picked::Nth(0)), "a yes takes #1, Jev's best");
         // Esc while the list waits: nothing clicked, no message
         let (mut ask, _) = script(vec![ranking(&[("2", 0.6), ("8", 0.35), ("3", 0.05)])]);
         let mut d = pick_desk(vec![Answer::No]);
@@ -3009,7 +3101,7 @@ mod tests {
         println!("${cost:.5}");
         let done = |e: &Vec<CmdStatus>| !e.is_empty() && e.iter().all(|s| *s == CmdStatus::Done);
         assert!(done(&log[0].4) && log[0].0 == [Act::OpenApp("Microsoft Edge".into())], "open Edge");
-        assert!(done(&log[1].4) && log[1].0.first() == Some(&Act::Combo(37, CMD)) && log[1].1 == ["YouTube"] && log[1].0.last() == Some(&Act::Combo(36, 0)) && log[1].2.is_empty(), "cmd+l, YouTube, Return without a confirm");
+        assert!(done(&log[1].4) && matches!(log[1].0.first(), Some(Act::Combo(37, CMD) | Act::Click(Target::Mark(3)))) && log[1].1 == ["YouTube"] && log[1].0.last() == Some(&Act::Combo(36, 0)) && log[1].2.is_empty(), "cmd+l or the only search field, YouTube, Return: no pick, no confirm");
         assert!(done(&log[2].4) && log[2].3.as_ref().is_some_and(|c| c.starts_with(&[40, 41, 42])) && log[2].0 == [Act::Click(Target::Mark(40))], "pick list, 'uno' clicks 40");
         assert!(done(&log[3].4) && log[3].0 == [Act::Click(Target::Mark(41))] && log[3].2.is_empty(), "41 clicks mark 41, no list");
     }
