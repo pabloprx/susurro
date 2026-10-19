@@ -39,8 +39,9 @@ const PROTOCOL: &str = "2025-06-18";
 const OR_TIMEOUT: Duration = Duration::from_secs(60);
 /// The agent's screenshots: the long side in pixels (Pablo: <= 1280).
 pub const IMG_MAX: f64 = 1280.0;
-/// Marks listed with an order or an action answer; list_elements lists them all.
-pub const MARKS_MAX: usize = 80;
+/// Marks listed with an order or an action answer (the ones for the order: `pick`); list_elements lists them all.
+/// 80 -> 40 and one line per region: the order's message 4.7k -> 2.4k chars on a 120-mark window (smoke).
+pub const MARKS_MAX: usize = 40;
 /// A warm claude process with no order for this long is killed.
 pub const IDLE: Duration = Duration::from_secs(300);
 /// Actions kept in the rolling memory (agent-memory.json).
@@ -201,7 +202,7 @@ pub fn tools() -> Value {
     let done = json!({ "type": "string", "description": "If this action finishes the order: the short sentence for the user (no done call needed)" });
     let mut t = json!([
         { "name": "screenshot", "description": "The front window as a JPEG (at most 1280 px) with the numbered marks drawn on it, and the marks as text. Only to see pixels: a canvas, an image, colors, where to draw.", "inputSchema": none },
-        { "name": "list_elements", "description": "All the marks of the front window as text: [N] name (role, region). Faster than a screenshot.", "inputSchema": none },
+        { "name": "list_elements", "description": "All the marks of the front window as text, one line per region: region: [N] name (role) · ... Faster than a screenshot.", "inputSchema": none },
         { "name": "click", "description": "Click a mark (preferred), or a point x,y in screenshot pixels. With modifiers it is a raw click (cmd+click opens in a new tab).", "inputSchema": at },
         { "name": "double_click", "description": "Double-click a mark or a point x,y (open a file, select a word).", "inputSchema": at },
         { "name": "right_click", "description": "Right-click a mark or a point x,y (the context menu).", "inputSchema": at },
@@ -348,12 +349,47 @@ fn state_line(s: &Screen, focus: &crate::ax::Field, changed: Option<bool>) -> St
     l + &format!(" Screenshot frame: {w}x{h} px.")
 }
 
-fn marks_text(s: &Screen, max: usize) -> String {
-    let mut out: Vec<String> = s.els.iter().take(max).map(|e| format!("[{}] {}", e.mark.id, crate::ax::describe(e))).collect();
-    if s.els.len() > max {
-        out.push(format!("(+{} more: list_elements)", s.els.len() - max));
+/// The marks most useful for `task`, at most `max`, in reading order: first the ones whose name or role shares a
+/// word with the order (a rare word counts more: "the" is in every mail row, "Send" in one button), then the page
+/// (main region), then the rest (toolbar, sidebar, bottom).
+fn pick<'e>(els: &'e [crate::ax::El], task: &str, max: usize) -> Vec<&'e crate::ax::El> {
+    let t = plain(task);
+    let words: Vec<&str> = t.split(' ').filter(|w| w.chars().count() >= 3 || w.chars().all(|c| c.is_ascii_digit())).collect();
+    let names: Vec<String> = els.iter().map(|e| format!(" {} ", plain(&format!("{} {}", e.mark.name, e.mark.role)))).collect();
+    let has = |n: &str, w: &str| n.contains(&format!(" {w} "));
+    let df: Vec<usize> = words.iter().map(|w| names.iter().filter(|n| has(n, w)).count()).collect();
+    let mut v: Vec<(usize, &crate::ax::El)> = els.iter().enumerate().collect();
+    v.sort_by_cached_key(|(i, e)| {
+        let score: f64 = words.iter().zip(&df).filter(|(w, _)| has(&names[*i], w)).map(|(_, d)| 1.0 / *d as f64).sum();
+        (std::cmp::Reverse((score * 1e6) as u64), e.mark.region != "main")
+    });
+    let mut v: Vec<&crate::ax::El> = v.into_iter().map(|(_, e)| e).collect();
+    v.truncate(max);
+    v.sort_by_key(|e| e.mark.id);
+    v
+}
+
+/// One line per region: "main: [1] Message (text field) · [2] Send (button)".
+fn mark_lines(els: &[&crate::ax::El]) -> String {
+    let mut regions: Vec<(&str, Vec<String>)> = vec![];
+    for e in els {
+        let m = &e.mark;
+        let name = if m.name.is_empty() { "(no name)" } else { m.name.as_str() };
+        let item = match &e.state {
+            Some(s) => format!("[{}] {name} ({}, {s})", m.id, m.role),
+            None => format!("[{}] {name} ({})", m.id, m.role),
+        };
+        match regions.iter_mut().find(|r| r.0 == m.region) {
+            Some(r) => r.1.push(item),
+            None => regions.push((&m.region, vec![item])),
+        }
     }
-    format!("{} marks:\n{}", s.els.len(), out.join("\n"))
+    regions.iter().map(|(r, items)| format!("{r}: {}", items.join(" · "))).collect::<Vec<_>>().join("\n")
+}
+
+fn marks_text(total: usize, els: &[&crate::ax::El]) -> String {
+    let more = if els.len() < total { format!(" ({} for this order; list_elements for all)", els.len()) } else { String::new() };
+    format!("{total} marks{more}:\n{}", mark_lines(els))
 }
 
 /// The same screen for the model: app, window, the marks and where they are.
@@ -386,13 +422,18 @@ pub struct Agent<'a, 'b> {
     pub log: Vec<Step>,
     /// Pablo pressed a key or clicked during the order: it stops.
     pub took_over: bool,
+    /// ms from the order sent to claude's first tool call (the smoke measures it).
+    pub first_tool: Option<u128>,
+    /// The screen whose marks the model last got (this order or the warm process's last one), and which of them.
+    seen: Option<Screen>,
+    shown: Vec<u32>,
 }
 
 impl<'a, 'b> Agent<'a, 'b> {
     pub fn new(task: &str, confirm_risky: bool, ask: &'a mut Ask<'b>, desk: &'a mut dyn Desk, mem: &'a mut Memory) -> Self {
         // the agent picks its own targets: no "Which one?" per click
         let cfg = Cfg { confirm_risky, choose: false, max: STEP_CAP };
-        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false }
+        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false, first_tool: None, seen: None, shown: vec![] }
     }
 
     /// A pill line between actions.
@@ -403,17 +444,40 @@ impl<'a, 'b> Agent<'a, 'b> {
 
     /// The order's first user message: the words and the screen now (no round trip for a first look).
     pub fn first_message(&mut self) -> String {
-        let now = match self.desk.read() {
+        match self.desk.read() {
             Ok(scr) => {
-                let f = self.desk.focused();
-                let t = format!("{}\n{}", state_line(&scr, &f, None), marks_text(&scr, MARKS_MAX));
                 self.shot = Some(scr);
-                t
+                self.order_text()
             }
-            Err(e) if e == "accessibility" => "susurro has no Accessibility permission: call done and say so.".into(),
-            Err(e) => format!("The screen cannot be read: {e}."),
-        };
+            Err(e) if e == "accessibility" => self.order_with("susurro has no Accessibility permission: call done and say so.".into()),
+            Err(e) => self.order_with(format!("The screen cannot be read: {e}.")),
+        }
+    }
+
+    /// The order and the last read screen, against what the model has seen (`seen`).
+    fn order_text(&mut self) -> String {
+        let Some(scr) = self.shot.clone() else { return self.order_with("The screen cannot be read.".into()) };
+        let f = self.desk.focused();
+        let now = format!("{}\n{}", state_line(&scr, &f, None), self.marks(&scr));
+        self.order_with(now)
+    }
+
+    fn order_with(&self, now: String) -> String {
         format!("Order: {}\n\nThe screen now:\n{now}", self.task)
+    }
+
+    /// The marks for the model: the order's MARKS_MAX (`pick`) it has not got yet for this screen. A screen it saw
+    /// already costs one line (Pablo: "why is it so slow": every order and answer re-sent 80 marks).
+    fn marks(&mut self, scr: &Screen) -> String {
+        if !self.seen.as_ref().is_some_and(|s| same(s, scr)) {
+            self.seen = Some(scr.clone());
+            let els = pick(&scr.els, &self.task, MARKS_MAX);
+            self.shown = els.iter().map(|e| e.mark.id).collect();
+            return marks_text(scr.els.len(), &els);
+        }
+        let new: Vec<&crate::ax::El> = pick(&scr.els, &self.task, MARKS_MAX).into_iter().filter(|e| !self.shown.contains(&e.mark.id)).collect();
+        self.shown.extend(new.iter().map(|e| e.mark.id));
+        if new.is_empty() { "The marks are the ones you got last.".into() } else { format!("The marks you got last, plus:\n{}", mark_lines(&new)) }
     }
 
     pub fn call(&mut self, name: &str, args: &Value) -> Out {
@@ -558,7 +622,10 @@ impl<'a, 'b> Agent<'a, 'b> {
                 head += " No image: susurro has no Screen Recording permission. Use the marks.";
             }
         }
-        out.text = format!("{head}\n{}", marks_text(&scr, usize::MAX));
+        let all: Vec<&crate::ax::El> = scr.els.iter().collect();
+        out.text = format!("{head}\n{}", marks_text(all.len(), &all));
+        self.shown = scr.els.iter().map(|e| e.mark.id).collect();
+        self.seen = Some(scr.clone());
         self.shot = Some(scr);
         out
     }
@@ -584,7 +651,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         }
         let f = self.desk.focused();
         let Some(scr) = prev else { return Out::ok(format!("waited {slept} ms")) };
-        let t = format!("waited {slept} ms\n{}\n{}", state_line(&scr, &f, Some(start.as_ref().is_none_or(|b| !same(b, &scr)))), marks_text(&scr, MARKS_MAX));
+        let t = format!("waited {slept} ms\n{}\n{}", state_line(&scr, &f, Some(start.as_ref().is_none_or(|b| !same(b, &scr)))), self.marks(&scr));
         self.shot = Some(scr);
         Out::ok(t)
     }
@@ -595,7 +662,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         match self.desk.read() {
             Ok(scr) => {
                 let f = self.desk.focused();
-                let t = format!("{}\n{}", state_line(&scr, &f, Some(before.is_none_or(|b| !same(b, &scr)))), marks_text(&scr, MARKS_MAX));
+                let t = format!("{}\n{}", state_line(&scr, &f, Some(before.is_none_or(|b| !same(b, &scr)))), self.marks(&scr));
                 self.shot = Some(scr);
                 t
             }
@@ -1004,6 +1071,9 @@ struct Warm {
     sent: u32,
     results: u32,
     last: Instant,
+    /// The screen and marks this conversation last got (Agent::seen): the next order sends only what is new.
+    seen: Option<Screen>,
+    shown: Vec<u32>,
 }
 
 impl Drop for Warm {
@@ -1049,7 +1119,7 @@ impl Warm {
         let stdin = child.stdin.take().unwrap();
         log::info!("agent: claude started (pid {}, {})", child.id(), o.model);
         reaper();
-        Ok(Warm { bin: bin.into(), model: o.model.clone(), child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now() })
+        Ok(Warm { bin: bin.into(), model: o.model.clone(), child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![] })
     }
 
     /// Reads what came between two orders (a late result, a tool call after done). false = the process is gone.
@@ -1176,12 +1246,23 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
     let t0 = Instant::now();
     let mut w = take(bin, o)?;
     let order = w.sent + 1;
-    if let Err(e) = w.send(first) {
+    // this conversation saw a screen already: the order carries only what changed. `own` = the fresh view of
+    // `first`, back in place if the fallback takes the order (a new conversation).
+    let own = w.seen.take().map(|s| (std::mem::replace(&mut ag.seen, Some(s)), std::mem::replace(&mut ag.shown, std::mem::take(&mut w.shown))));
+    let first = if own.is_some() && ag.shot.is_some() { ag.order_text() } else { first.to_string() };
+    let restore = |ag: &mut Agent, own: Option<(Option<Screen>, Vec<u32>)>| {
+        if let Some((seen, shown)) = own {
+            (ag.seen, ag.shown) = (seen, shown);
+        }
+    };
+    if let Err(e) = w.send(&first) {
         release(bin);
+        restore(ag, own);
         return Err(format!("claude stdin: {e}"));
     }
     let mut result: Option<(bool, String)> = None;
     let mut first_tool: Option<u128> = None;
+    let mut usage = Value::Null;
     let (mut why, mut keep) = (None, true);
     loop {
         if ag.desk.aborted() || ag.capped || ag.took_over {
@@ -1205,6 +1286,9 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
                 let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
                 match v["type"].as_str() {
                     Some("assistant") => {
+                        if usage.is_null() {
+                            usage = v["message"]["usage"].clone(); // the first API call: the one before the first tool
+                        }
                         for c in v["message"]["content"].as_array().into_iter().flatten() {
                             match c["type"].as_str() {
                                 Some("tool_use") => {
@@ -1235,8 +1319,23 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
-    log::info!("agent: order {order} of claude pid {} ran {} ms, first tool call at {first_tool:?} ms", w.child.id(), t0.elapsed().as_millis());
+    ag.first_tool = first_tool;
+    let tok = |k: &str| usage[k].as_u64().unwrap_or(0);
+    let line = format!(
+        "agent: order {order} of claude pid {} ran {} ms, first tool call at {first_tool:?} ms; sent {} chars; first call tokens in {} cache read {} cache write {} out {}",
+        w.child.id(),
+        t0.elapsed().as_millis(),
+        first.len(),
+        tok("input_tokens"),
+        tok("cache_read_input_tokens"),
+        tok("cache_creation_input_tokens"),
+        tok("output_tokens")
+    );
+    log::info!("{line}");
+    #[cfg(test)]
+    println!("{line}");
     if keep && !result.as_ref().is_some_and(|r| r.0) {
+        (w.seen, w.shown) = (ag.seen.clone(), ag.shown.clone());
         give_back(w);
     } else {
         release(bin);
@@ -1244,6 +1343,7 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
     }
     // a prose answer with no tool call ("hola") is an answer, not a failure
     if ag.calls == 0 && !ag.desk.aborted() && why.is_none() && !matches!(result, Some((false, _))) {
+        restore(ag, own);
         return Err(result.map(|r| r.1).filter(|t| !t.is_empty()).unwrap_or_else(|| "no tool call".into()));
     }
     let why = why.or_else(|| match &result {
@@ -1521,7 +1621,7 @@ mod tests {
         let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
         let mut ag = Agent::new("send hi", true, &mut ask, &mut d, &mut mem);
         let shot = ag.call("screenshot", &json!({}));
-        assert!(shot.text.contains("[2] Send (button, main)"), "{}", shot.text);
+        assert!(shot.text.contains("3 marks:\nmain: [1] Message (text field) · [2] Send (button) · [3] Attach (button)"), "{}", shot.text);
         assert!(shot.text.contains("Screenshot frame: 1280x800 px"), "{}", shot.text);
         assert_eq!(shot.image.as_deref(), Some(&b"\xff\xd8jpeg"[..]));
         assert_eq!(shot.mcp()["content"][1]["mimeType"], "image/jpeg");
@@ -1530,7 +1630,7 @@ mod tests {
         assert!(!click.error);
         // every action answers with the state now and the marks: no screenshot needed
         assert!(click.text.contains("App: Chat. Window: “untitled”. Focus: TextField “Search”. Screen changed: no"), "{}", click.text);
-        assert!(click.text.contains("[3] Attach (button, main)"), "{}", click.text);
+        assert!(click.text.ends_with("The marks are the ones you got last."), "the same screen: no marks again, {}", click.text);
         assert!(!ag.call("type", &json!({ "text": "hola" })).error);
         // Send is risky: the executor asks (the fake says yes) before the click
         let send = ag.call("click", &json!({ "mark": 2 }));
@@ -1569,7 +1669,7 @@ mod tests {
         let mut ag = Agent::new("load", false, &mut ask, &mut d, &mut mem);
         ag.first_message();
         let w = ag.call("wait", &json!({ "ms": 3000 }));
-        assert!(w.text.starts_with(&format!("waited {WAIT_MIN_MS} ms")) && w.text.contains("[2] Send (button, main)"), "{}", w.text);
+        assert!(w.text.starts_with(&format!("waited {WAIT_MIN_MS} ms")) && w.text.ends_with("The marks are the ones you got last."), "{}", w.text);
         assert_eq!(ag.step, 0, "a wait is not a step");
         drop(ag);
         assert_eq!(d.slept, WAIT_MIN_MS);
@@ -1611,9 +1711,32 @@ mod tests {
         let mut ag = Agent::new("send hi", true, &mut ask, &mut d, &mut mem);
         let m = ag.first_message();
         assert!(m.starts_with("Order: send hi\n\nThe screen now:\nApp: Chat."), "{m}");
-        assert!(m.contains("3 marks:\n[1] Message (text field, main)"), "{m}");
+        assert!(m.ends_with("3 marks:\nmain: [1] Message (text field) · [2] Send (button) · [3] Attach (button)"), "{m}");
         // the marks of the first message are valid for a click at once
         assert!(!ag.call("click", &json!({ "mark": 2 })).error);
+    }
+
+    #[test]
+    fn an_order_gets_the_marks_for_it_and_only_new_ones_on_a_seen_screen() {
+        let (mut d, mut mem, mut ask) = (gmail(), Memory::new(), no_jev);
+        let mut ag = Agent::new("open Mail 77", false, &mut ask, &mut d, &mut mem);
+        let m = ag.first_message();
+        assert!(m.contains("120 marks (40 for this order; list_elements for all):\nmain: [31] Mail 31"), "{m}");
+        assert!(m.contains("[77] Mail 77: Weekly"), "the named mark is in, {m}");
+        assert!(!m.contains("toolbar:") && !m.contains("sidebar:"), "the page before the chrome, {m}");
+        assert_eq!(ag.shown.len(), 40);
+        // the next order of the same conversation, the screen unchanged: only its new marks
+        let (seen, shown) = (ag.seen.clone(), ag.shown.clone());
+        drop(ag);
+        let mut ag = Agent::new("click Label 20", false, &mut ask, &mut d, &mut mem);
+        ag.first_message();
+        (ag.seen, ag.shown) = (seen, shown);
+        let m = ag.order_text();
+        assert!(m.contains("The marks you got last, plus:\n") && m.contains("[20] Label 20 (link)"), "{m}");
+        assert!(!m.contains("[77]"), "sent already, {m}");
+        assert!(ag.order_text().ends_with("The marks are the ones you got last."));
+        // list_elements: all of them, whatever was sent
+        assert!(ag.call("list_elements", &json!({})).text.contains("120 marks:\nmain: [1]"));
     }
 
     #[test]
@@ -1884,20 +2007,24 @@ for line in sys.stdin:
         assert_eq!((&e1.status, &e2.status), (&CmdStatus::Done, &CmdStatus::Done), "{e1:?} {e2:?}");
         assert_eq!(e2.summary, "agent: Drew a line");
         assert!(matches!(&p.acts[..], [Act::Drag(path, 0)] if path.len() == 2), "JS Paint: a line is a drag on the canvas, {:?}", p.acts);
+        // the same window again: the conversation has its marks, the order does not repeat them
+        run("draw a line", &o, false, &mut ask, &mut p, &mut mem);
         let o2 = orders(&bin);
-        assert_eq!(o2.len(), 2);
+        assert_eq!(o2.len(), 3);
+        assert!(o2[2].2.ends_with("The marks are the ones you got last."), "{}", o2[2].2);
         assert_eq!(o2[0].0, o2[1].0, "the same process: it remembers the first order");
         assert!(o2[1].2.starts_with("Order: draw a line\n\nThe screen now:\nApp: Microsoft Edge."), "{}", o2[1].2);
         assert_eq!(o2[0].1, format!("{SYSTEM}{}", browser_note(default_browser())), "no memory yet");
         let st = status();
-        assert!(st["warm"].as_array().unwrap().iter().any(|w| w["orders"] == 2), "{st}");
+        assert!(st["warm"].as_array().unwrap().iter().any(|w| w["orders"] == 3), "{st}");
         // Esc / idle: killed; the next process starts with the rolling memory
         kill();
         let e3 = run("say hi", &o, false, &mut ask, &mut chat(), &mut mem);
         assert_eq!((e3.status, e3.summary.as_str()), (CmdStatus::Done, "agent: Hola"), "a prose answer is an answer, no fallback");
         let o3 = orders(&bin);
-        assert_ne!(o3[2].0, o3[0].0, "a new process");
-        assert!(o3[2].1.contains("- [Chat] clicked “Send” (button, main)") && o3[2].1.contains("- [Microsoft Edge] dragged from 200,300 to 600,300"), "{}", o3[2].1);
+        assert_ne!(o3[3].0, o3[0].0, "a new process");
+        assert!(o3[3].2.contains("3 marks:\nmain:"), "a new conversation gets the marks, {}", o3[3].2);
+        assert!(o3[3].1.contains("- [Chat] clicked “Send” (button, main)") && o3[3].1.contains("- [Microsoft Edge] dragged from 200,300 to 600,300"), "{}", o3[3].1);
         kill();
         let _ = (std::fs::remove_file(&bin), std::fs::remove_file(bin.with_extension("log")), std::fs::remove_file(&mem_file));
     }
@@ -1961,14 +2088,30 @@ for line in sys.stdin:
         assert!(!POOL.lock().unwrap().idle.iter().any(|w| w.bin == bin), "an aborted order never goes back warm");
     }
 
-    /// The real smoke run: Pablo's claude CLI against the MCP server, a FAKE desk only (no real clicks). Two orders
-    /// in one warm process; prints the time of each.
+    /// A Gmail-sized window: the chat's 3 marks, then 117 more (toolbar, sidebar, mail rows), as a real page has.
+    fn gmail() -> Fake {
+        let mut d = chat();
+        let names = ["Back", "Forward", "Reload", "Address and search bar", "Inbox", "Starred", "Snoozed", "Sent", "Drafts", "More labels"];
+        for id in 4..=120u32 {
+            let (name, role, region) = match id {
+                4..=13 => (names[(id - 4) as usize].to_string(), "button", "toolbar"),
+                14..=30 => (format!("Label {id}"), "link", "sidebar"),
+                _ => (format!("Mail {id}: Weekly report from the team, unread, starred"), "link", "main"),
+            };
+            let rect = PtRect { x: 50.0 + 90.0 * (id % 15) as f64, y: 40.0 + 30.0 * (id / 15) as f64, w: 80.0, h: 24.0 };
+            d.els.push(El { mark: Mark { id, rect, name, role: role.into(), region: region.into() }, state: None, h: id as usize, url: None, value: None });
+        }
+        d
+    }
+
+    /// The real smoke run: Pablo's claude CLI against the MCP server, a FAKE desk only (no real clicks). Five orders
+    /// in one warm process on a 120-mark window; prints each order's first tool call and total, and the medians.
     /// `cargo test --lib agent::tests::smoke_real_claude -- --ignored --nocapture` (SMOKE_MODEL=haiku to compare)
     #[test]
     #[ignore]
     fn smoke_real_claude() {
         let bin = find_claude().expect("no claude binary");
-        let mut d = chat();
+        let mut d = gmail();
         // a real JPEG (the API rejects a fake one): the app icon through sips
         let icon = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/128x128.png");
         let jpg = std::env::temp_dir().join("susurro-smoke.jpg");
@@ -1976,16 +2119,30 @@ for line in sys.stdin:
         d.jpeg = std::fs::read(&jpg).unwrap();
         let (mut mem, mut ask) = (Memory::new(), no_jev);
         let model = std::env::var("SMOKE_MODEL").unwrap_or("sonnet".into());
-        let o = Opts { timeout: Duration::from_secs(120), model, ..opts(Some(bin), "http://127.0.0.1:9") };
+        let o = Opts { timeout: Duration::from_secs(120), model, ..opts(Some(bin.clone()), "http://127.0.0.1:9") };
         prewarm(o.clone());
-        std::thread::sleep(Duration::from_secs(2)); // Pablo still talks
-        for task in ["click the Send button", "now click the Attach button"] {
+        std::thread::sleep(Duration::from_secs(5)); // Pablo still talks; the process is up
+        let (mut first, mut total) = (vec![], vec![]);
+        for task in ["click the Send button", "now click the Attach button", "click the Message field", "click Send again", "click Attach again"] {
+            // Pablo speaks the next order: the turn of the last one ends meanwhile (its reply to the done answer)
+            std::thread::sleep(Duration::from_secs(4));
             let t = Instant::now();
-            let end = run(task, &o, false, &mut ask, &mut d, &mut mem);
-            println!("SMOKE {task:?}: {:?} in {} ms: {} {:?}", end.status, t.elapsed().as_millis(), end.summary, end.message);
+            let mut ag = Agent::new(task, false, &mut ask, &mut d, &mut mem);
+            let msg = ag.first_message();
+            let end = run_claude(&bin, &msg, &o, &mut ag).unwrap();
+            let f = ag.first_tool.unwrap_or(0);
+            let ms = t.elapsed().as_millis();
+            println!("SMOKE {task:?}: {:?} first tool {f} ms, total {ms} ms, sent {} chars: {}", end.status, msg.len(), end.summary);
+            first.push(f);
+            total.push(ms);
         }
-        println!("SMOKE acts {:?}", d.acts);
         kill();
-        assert_eq!(d.acts, [Act::Click(Target::Mark(2)), Act::Click(Target::Mark(3))]);
+        let med = |v: &mut Vec<u128>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        println!("SMOKE median first tool {} ms, total {} ms", med(&mut first), med(&mut total));
+        println!("SMOKE acts {:?}", d.acts);
+        assert_eq!(d.acts, [2, 3, 1, 2, 3].map(|m| Act::Click(Target::Mark(m))));
     }
 }
