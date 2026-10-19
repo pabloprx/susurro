@@ -66,6 +66,13 @@ to draw); the marks and the window title are faster, never a screenshot just to 
 Do every part of the order, in its order, even when the screen seems to show the result already: \"a new tab\" is \
 cmd+t even when the page is open in this tab. \
 If the app the order names is already the front app (the App: line), do not call open_app: act in it. \
+Web orders: a site you know (YouTube, Gmail, ChatGPT, OpenRouter, GitHub...) is a URL, never a search: cmd+l (cmd+t \
+first when the order says a new tab), type its address (youtube.com, chatgpt.com, openrouter.ai/keys), return. \
+\"Search X on Google\" or \"busca X\": type google.com/search?q=X in the address bar; \"search X on YouTube\": \
+youtube.com/results?search_query=X. Do the whole task the user means, not only the first step: \"ask ChatGPT about \
+X\" or \"talk to ChatGPT\" = open chatgpt.com, start a new chat, type the question, return, wait for the answer, \
+read it, and put a one-sentence summary of it in done. To read or review a page, look at it (scroll if needed) and \
+say what you found in done. \
 Prefer keyboard shortcuts (cmd+t new tab, cmd+l address bar, cmd+f find, cmd+w, return, tab, escape) over clicks, and \
 click {mark} over x,y. Click a text field before you type into it. \
 Every action answers with what changed (app, window, focus, screen changed) and the new marks: trust it, use those \
@@ -96,6 +103,13 @@ screenshot; aim at the center of the element. \
 Do every part of the order, in its order, even when the screen seems to show the result already: \"a new tab\" is \
 cmd+t even when the page is open in this tab. \
 If the app the order names is already the front app (the App: line), do not call open_app: act in it. \
+Web orders: a site you know (YouTube, Gmail, ChatGPT, OpenRouter, GitHub...) is a URL, never a search: cmd+l (cmd+t \
+first when the order says a new tab), type its address (youtube.com, chatgpt.com, openrouter.ai/keys), return. \
+\"Search X on Google\" or \"busca X\": type google.com/search?q=X in the address bar; \"search X on YouTube\": \
+youtube.com/results?search_query=X. Do the whole task the user means, not only the first step: \"ask ChatGPT about \
+X\" or \"talk to ChatGPT\" = open chatgpt.com, start a new chat, type the question, return, wait for the answer, \
+read it, and put a one-sentence summary of it in done. To read or review a page, look at it (scroll if needed) and \
+say what you found in done. \
 Prefer keyboard shortcuts (cmd+t new tab, cmd+l address bar, cmd+f find, cmd+w, return, tab, escape) over clicks. \
 Click a text field before you type into it. \
 In Finder (and in an Open or Save dialog) go to a folder with cmd+shift+g, type its path (~/name), return. \
