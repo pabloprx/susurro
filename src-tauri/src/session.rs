@@ -376,7 +376,7 @@ fn run_pipeline_with(state: &AppState, clip: &Clip, bundle: Option<&str>, stream
 /// A voice command's text: the pipeline STT + dictionary corrections, no cleanup LLM, no spoken punctuation.
 fn command_text(state: &AppState, clip: &Clip) -> Outcome {
     let mut s = state.settings.read().unwrap().clone();
-    s.stt.provider = stt::command_stt(&s, &state.data_dir);
+    s.stt.provider = stt::command_stt(&s);
     let entries = dictionary::load(&state.db.lock().unwrap()).unwrap_or_default();
     let d = Dictionary::new(entries, s.dictionary.clone());
     let stt_fn = |r: &SttRequest| stt::build(&s, state)?.transcribe(r);

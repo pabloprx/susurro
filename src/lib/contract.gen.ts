@@ -45,8 +45,7 @@ planner_model: string,
  */
 auto_click: boolean, 
 /**
- * The STT for commands. None = auto: local Whisper when its model is downloaded (the dictation's instance,
- * Pablo's ask), else Scribe Realtime when an ElevenLabs key is saved, else the dictation provider.
+ * The STT for commands. None = auto: the dictation provider (an order is heard the way a dictation is).
  */
 stt: SttProvider | null, 
 /**

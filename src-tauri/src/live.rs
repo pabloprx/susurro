@@ -257,6 +257,11 @@ pub struct Core {
     /// The last agent order, and (set by the caller before each `hear`) whether it still runs or waits in the queue.
     pub last_agent: u32,
     pub agent_busy: bool,
+    /// The mic still hears Pablo (set by the caller before each `hear`): a whole sentence waits for the pause, its
+    /// next words may still belong to it (Whisper ends a 0.5 s fragment with a period: "Abre el.").
+    pub speaking: bool,
+    /// `said` entries of the words in the buffer (`retake` takes them back).
+    open: usize,
 }
 
 /// What the executor waits for, with its question.
@@ -287,8 +292,12 @@ impl Core {
     /// with its question.
     pub fn hear(&mut self, text: &str, last: bool, pending: Option<Pending>, plan: &mut PlanFn) -> Heard {
         let text = text.trim();
+        if self.buffer.is_empty() && self.held.is_none() {
+            self.open = 0;
+        }
         if !text.is_empty() {
             self.said.push(text.into());
+            self.open += 1;
         }
         if let Some(on) = numbers_toggle(text) {
             return Heard::Numbers(on);
@@ -340,7 +349,7 @@ impl Core {
         }
         match plan(&self.buffer, last, None) {
             // "Click the first one.": a whole sentence with a verb runs now (log 2026-10-19: it waited 8 s for a pause).
-            Ok(p) if !last && whole_agent_order(&p, &self.buffer) => {
+            Ok(p) if !last && !self.speaking && whole_agent_order(&p, &self.buffer) => {
                 log::info!("live: {:?} is a whole order, it runs now (held {} ms)", self.buffer, self.held_ms());
                 (self.held, self.held_at) = (None, None);
                 self.buffer.clear();
@@ -402,6 +411,14 @@ impl Core {
         self.held_at = None;
         self.buffer = self.buffer.strip_prefix(b.as_str()).unwrap_or("").trim().to_string();
         self.order(p.actions, p.say)
+    }
+
+    /// The held words come again in one transcript of all their audio (live.rs `regroup`): the chunk texts leave the
+    /// buffer and `said`, the next `hear` gets the whole text. The hold's start time stays.
+    pub fn retake(&mut self) {
+        let keep = self.said.len().saturating_sub(self.open);
+        self.said.truncate(keep);
+        (self.buffer, self.held, self.open) = (String::new(), None, 0);
     }
 
     /// An order waits for the next words (`hold`).
@@ -710,7 +727,7 @@ pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Ha
     let (provider, rt_opts) = {
         let st = app.state::<AppState>();
         let s = st.settings.read().unwrap().clone();
-        let p = crate::stt::command_stt(&s, &st.data_dir);
+        let p = crate::stt::command_stt(&s);
         let hints = crate::dictionary::Dictionary::new(crate::dictionary::load(&st.db.lock().unwrap()).unwrap_or_default(), s.dictionary.clone()).hints();
         let o = crate::stt::realtime_opts(&p, &s, rate, &with_brands(&hints), true);
         (p, o)
@@ -806,6 +823,12 @@ fn live_loop(
         Ok(p)
     };
     let to_16k = |a: &[f32]| crate::audio::resample(a, rate);
+    // Local Whisper, agent orders: the chunks of a held order go to Whisper again as one clip, the way a dictation is
+    // heard (log 2026-10-19: a 0.5 s chunk alone, with no words around it, comes out as the wrong words). One STT at a
+    // time here (max_in_flight 1), so the buffer is known when a chunk is sent.
+    let regroup = agent_first && provider == crate::contract::SttProvider::WhisperLocal && max_in_flight == 1;
+    let mut open_audio: Vec<f32> = vec![];
+    let mut whole: std::collections::HashSet<u32> = Default::default();
     // The front app when the order was held: Some(pid) while holding.
     let mut held_front: Option<Option<i32>> = None;
     loop {
@@ -917,6 +940,11 @@ fn live_loop(
                         None
                     }
                 };
+                // the held order's words and this chunk's, heard as one clip: they replace the chunk texts
+                if whole.remove(&n) && core.holding() && text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                    log::info!("live: chunk {n} heard with the held words: {:?} (was {:?})", text.as_deref().unwrap_or(""), core.buffer);
+                    core.retake();
+                }
                 for t in core.arrive(n, text) {
                     // A silent chunk is a pause: a held order runs (hear "" plans nothing else).
                     let t = t.unwrap_or_default();
@@ -940,6 +968,7 @@ fn live_loop(
                     let said = RUNNING.lock().unwrap().clone().filter(search_click).map(|a| a.said);
                     let pending = command::waiting().map(|wait| Pending { wait, question: &question, said: said.as_deref() });
                     core.agent_busy = queue.busy(core.last_agent);
+                    core.speaking = ctl.speaking.load(Ordering::SeqCst);
                     let heard = core.hear(&t, false, pending, &mut planner);
                     *ctl.said.lock().unwrap() = core.said.join(" ");
                     // Esc while the planner ran: its answer is dropped.
@@ -956,11 +985,24 @@ fn live_loop(
         same_front(&mut core, &mut held_front);
         if core.holding() && !ctl.speaking.load(Ordering::SeqCst) && in_flight == 0 && waiting.is_empty() && rta.unanswered.is_empty() && !ctl.stopped.load(Ordering::SeqCst) {
             core.agent_busy = queue.busy(core.last_agent);
+            core.speaking = false;
             let heard = core.hear("", false, None, &mut planner);
             handle(&app, &queue, &core, heard);
         }
+        if core.buffer.is_empty() && !core.holding() {
+            open_audio.clear();
+        }
         while in_flight < max_in_flight {
-            let Some((n, audio)) = waiting.pop_front() else { break };
+            let Some((n, mut audio)) = waiting.pop_front() else { break };
+            if regroup {
+                if core.holding() && !open_audio.is_empty() && open_audio.len() + audio.len() <= REGROUP_MAX {
+                    open_audio.extend_from_slice(&audio);
+                    audio = open_audio.clone();
+                    whole.insert(n);
+                } else {
+                    open_audio = audio.clone();
+                }
+            }
             in_flight += 1;
             let (app, tx) = (app.clone(), tx.clone());
             std::thread::Builder::new()
@@ -1007,6 +1049,9 @@ fn same_front(core: &mut Core, held_front: &mut Option<Option<i32>>) {
         Some(_) => {}
     }
 }
+
+/// `regroup` hears a held order again as one clip up to this long (16 kHz samples, 20 s); longer, chunk by chunk.
+const REGROUP_MAX: usize = 20 * 16_000;
 
 /// Scribe's last commit answers within this after the release (measured ~0.2 s, TESTING.md "Latency"); later, the
 /// unanswered audio goes to the batch STT.
@@ -1291,7 +1336,7 @@ fn chunk_text(app: &AppHandle, audio: Vec<f32>) -> anyhow::Result<Option<String>
     let state = app.state::<AppState>();
     let mut s = state.settings.read().unwrap().clone();
     // the command STT; Scribe Realtime here = its batch fallback (stt::build maps it to MAI or Scribe batch)
-    s.stt.provider = crate::stt::command_stt(&s, &state.data_dir);
+    s.stt.provider = crate::stt::command_stt(&s);
     let peak = audio.iter().fold(0f32, |m, x| m.max(x.abs()));
     let clip = crate::audio::Clip { duration_ms: (audio.len() / 16) as u32, peak_db: crate::audio::db(peak), samples: audio, device_names: vec![] };
     let stt = crate::stt::build(&s, &state)?;
@@ -1503,6 +1548,34 @@ mod tests {
         assert_eq!(task(&c.hear("And the second one too.", false, None, &mut p)), None, "no verb: waits for a pause");
         assert_eq!(task(&c.hear("", false, None, &mut p)).as_deref(), Some("continuation: And the second one too."));
         assert_eq!(task(&c.hear("Close this tab.", false, None, &mut p)).as_deref(), Some("continuation: Close this tab."));
+    }
+
+    #[test]
+    fn a_sentence_waits_while_he_talks_and_the_retake_replaces_the_chunk_texts() {
+        // Whisper ends a 0.5 s fragment with a period: "Abre el." is no whole order while the mic still hears him
+        let mut p = |t: &str, last: bool, _: Option<&str>| Ok(crate::agent::hold_plan(t, t, last));
+        let task = |h: &Heard| match h {
+            Heard::Order(_, a, _) => a[0].text.clone(),
+            _ => None,
+        };
+        let mut c = Core { speaking: true, ..Default::default() };
+        assert_eq!(c.hear("Abre el.", false, None, &mut p), Heard::Nothing);
+        assert!(c.holding());
+        // the next chunk came back heard with the held audio as one clip
+        c.retake();
+        assert!(!c.holding() && c.buffer.is_empty() && c.said.is_empty(), "the chunk text leaves buffer and said");
+        assert_eq!(c.hear("Abre el canal de diseño en Slack.", false, None, &mut p), Heard::Nothing, "still talking");
+        assert_eq!(c.said, ["Abre el canal de diseño en Slack."]);
+        // real silence: the held order runs with the whole transcript
+        c.speaking = false;
+        assert_eq!(task(&c.hear("", false, None, &mut p)).as_deref(), Some("Abre el canal de diseño en Slack."));
+        // quiet when the text arrives: a whole order runs at once, as before
+        assert_eq!(task(&c.hear("Close this tab.", false, None, &mut p)).as_deref(), Some("Close this tab."));
+        assert_eq!(c.said.len(), 2, "a retake takes back only the held words");
+        c.speaking = true;
+        c.hear("Click", false, None, &mut p);
+        c.retake();
+        assert_eq!(c.said, ["Abre el canal de diseño en Slack.", "Close this tab."]);
     }
 
     #[test]

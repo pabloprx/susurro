@@ -106,22 +106,11 @@ pub fn batch_for_realtime(openrouter: bool) -> SttProvider {
     if openrouter { SttProvider::OpenRouter } else { SttProvider::ElevenLabs }
 }
 
-/// The STT of voice-control commands: the explicit choice, else (auto) local Whisper when its model is downloaded
-/// (Pablo 2026-10-18: "use local Whisper for the commands, it is faster"; the dictation's one instance), else Scribe
-/// Realtime when the ElevenLabs key is saved, else the dictation provider.
-pub fn command_provider(s: &Settings, elevenlabs_key: bool, whisper_ready: bool) -> SttProvider {
-    match &s.command.stt {
-        Some(p) => p.clone(),
-        None if whisper_ready => SttProvider::WhisperLocal,
-        None if elevenlabs_key => SttProvider::ElevenLabsRealtime,
-        None => s.stt.provider.clone(),
-    }
-}
-
-/// `command_provider` with the real key and model checks.
-pub fn command_stt(s: &Settings, data_dir: &std::path::Path) -> SttProvider {
-    let (file, _) = whisper_local::usable(data_dir, &s.stt.whisper_model);
-    command_provider(s, secrets::get(KeyName::Elevenlabs).is_some(), whisper_local::model_path(data_dir, &file).exists())
+/// The STT of voice-control commands: the explicit choice, else (auto) the dictation's provider, so an order is heard
+/// the way a dictation is. Pablo 2026-10-19: "the dictation takes every word, the command mode gets the wrong words"
+/// (auto was local Whisper on 0.5 s chunks since agent v2).
+pub fn command_stt(s: &Settings) -> SttProvider {
+    s.command.stt.clone().unwrap_or_else(|| s.stt.provider.clone())
 }
 
 /// The realtime session options of provider `p`, or None when `p` is not a realtime provider or its key is
@@ -552,13 +541,13 @@ mod ranking_tests {
     }
 
     #[test]
-    fn command_stt_auto_prefers_local_whisper() {
+    fn command_stt_auto_is_the_dictation_provider() {
         let mut s = Settings::default();
         s.stt.provider = SttProvider::OpenRouter;
-        assert_eq!(command_provider(&s, true, true), SttProvider::WhisperLocal);
-        assert_eq!(command_provider(&s, true, false), SttProvider::ElevenLabsRealtime);
-        assert_eq!(command_provider(&s, false, false), SttProvider::OpenRouter);
+        assert_eq!(command_stt(&s), SttProvider::OpenRouter, "auto: what the dictation uses");
+        s.stt.provider = SttProvider::WhisperLocal;
+        assert_eq!(command_stt(&s), SttProvider::WhisperLocal);
         s.command.stt = Some(SttProvider::ElevenLabs);
-        assert_eq!(command_provider(&s, true, true), SttProvider::ElevenLabs, "an explicit choice wins");
+        assert_eq!(command_stt(&s), SttProvider::ElevenLabs, "an explicit choice wins");
     }
 }

@@ -56,8 +56,7 @@ pub struct CommandSettings {
     /// "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
     /// choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
     pub auto_click: bool,
-    /// The STT for commands. None = auto: local Whisper when its model is downloaded (the dictation's instance,
-    /// Pablo's ask), else Scribe Realtime when an ElevenLabs key is saved, else the dictation provider.
+    /// The STT for commands. None = auto: the dictation provider (an order is heard the way a dictation is).
     pub stt: Option<SttProvider>,
     /// Agent mode (on by default): every order goes to the local Claude Code CLI (`claude -p`, the subscription
     /// login) driving the Mac through susurro's own tools (agent.rs), except the trivial ones (agent::local_intent).

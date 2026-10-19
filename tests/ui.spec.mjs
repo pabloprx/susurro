@@ -1699,7 +1699,7 @@ test.describe("voice control", () => {
     await expect(sw(page, "Agent mode")).toHaveAttribute("aria-checked", "true");
     await expect(sw(page, "Fast mode (beta)")).toHaveAttribute("aria-checked", "false");
     await expect(page.locator(".sc-row", { hasText: "Agent mode" }).first()).toContainText("Every order, except open app, new tab, scroll");
-    await expect(page.getByRole("combobox", { name: "Speech to text for commands" }).locator('option[value="auto"]')).toContainText("Local Whisper");
+    await expect(page.getByRole("combobox", { name: "Speech to text for commands" }).locator('option[value="auto"]')).toContainText("same as dictation");
     await sw(page, "Fast mode (beta)").click();
     await expect(sw(page, "Fast mode (beta)")).toHaveAttribute("aria-checked", "true");
     await expect(page.locator(".sc-row", { hasText: "Fast mode (beta)" })).toContainText("gets more orders wrong");

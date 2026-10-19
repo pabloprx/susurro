@@ -71,7 +71,7 @@ pub fn load_in_background(app: AppHandle) {
         let all = state.settings.read().unwrap().clone();
         let s = all.stt.clone();
         // the command STT uses the same instance (auto = local Whisper)
-        let commands = all.command.enabled && super::command_stt(&all, &state.data_dir) == SttProvider::WhisperLocal;
+        let commands = all.command.enabled && super::command_stt(&all) == SttProvider::WhisperLocal;
         if s.provider != SttProvider::WhisperLocal && !s.local_fallback && !commands {
             return;
         }

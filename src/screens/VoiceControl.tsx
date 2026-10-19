@@ -264,7 +264,7 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
             value={s.command.stt ?? "auto"}
             onChange={(e) => save((x) => void (x.command.stt = e.target.value === "auto" ? null : (e.target.value as SttProvider)))}
           >
-            <option value="auto">Auto · Local Whisper (if downloaded, else {keys?.elevenlabs ? "Scribe Realtime" : "same as dictation"})</option>
+            <option value="auto">Auto · same as dictation</option>
             <option value="elevenlabs_realtime">Scribe Realtime (live)</option>
             <option value="openai_realtime" disabled={!keys?.openai}>
               OpenAI Realtime (live){keys?.openai ? "" : " · add an OpenAI key in Providers"}
