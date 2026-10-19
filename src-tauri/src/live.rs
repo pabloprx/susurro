@@ -9,7 +9,7 @@ use crate::command::{self, Cfg, End, Ended, Memory, Wait};
 use crate::contract::{CmdStatus, CommandSettings, CommandStep, LiveState, MemKind, MemoryEntry};
 use crate::planner::{self, Action, Plan};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
 use crate::stt::scribe_rt;
 use std::time::{Duration, Instant};
@@ -252,6 +252,11 @@ pub struct Core {
     pub said: Vec<String>,
     /// The order held for the next words (`hold`), with the buffer it was planned from. A pause runs it.
     held: Option<(String, Plan)>,
+    /// When the first words of the held order were held (the hold log line).
+    held_at: Option<Instant>,
+    /// The last agent order, and (set by the caller before each `hear`) whether it still runs or waits in the queue.
+    pub last_agent: u32,
+    pub agent_busy: bool,
 }
 
 /// What the executor waits for, with its question.
@@ -320,7 +325,7 @@ impl Core {
             _ => {}
         }
         if text.is_empty() && !last {
-            // A pause (a silent chunk, or no new words for HOLD_MS): the held order runs; nothing else to plan.
+            // A pause (a silent chunk, or real silence on the mic): the held order runs; nothing else to plan.
             return self.run_held();
         }
         if !text.is_empty() {
@@ -334,9 +339,17 @@ impl Core {
             return self.run_held();
         }
         match plan(&self.buffer, last, None) {
+            // "Click the first one.": a whole sentence with a verb runs now (log 2026-10-19: it waited 8 s for a pause).
+            Ok(p) if !last && whole_agent_order(&p, &self.buffer) => {
+                log::info!("live: {:?} is a whole order, it runs now (held {} ms)", self.buffer, self.held_ms());
+                (self.held, self.held_at) = (None, None);
+                self.buffer.clear();
+                self.order(p.actions, p.say)
+            }
             Ok(p) if !last && hold(&p, &self.buffer) => {
                 log::info!("live: holding {:?} for the next words", self.buffer);
                 self.held = Some((self.buffer.clone(), p));
+                self.held_at.get_or_insert_with(Instant::now);
                 Heard::Nothing
             }
             Ok(p) => {
@@ -350,6 +363,7 @@ impl Core {
                     self.buffer.clear();
                 }
                 if !p.actions.is_empty() {
+                    self.held_at = None;
                     return self.order(p.actions, p.say);
                 }
                 match held {
@@ -361,7 +375,8 @@ impl Core {
                     // The replan dropped the held words with nothing to run (log 2026-10-17: "De-" -> rest "De-"):
                     // the held order runs, the new words stay in the buffer.
                     Some((_, hp)) => {
-                        log::info!("live: the replan dropped the held order, it runs now");
+                        log::info!("live: the replan dropped the held order, it runs now (held {} ms)", self.held_ms());
+                        self.held_at = None;
                         self.order(hp.actions, hp.say)
                     }
                     None => Heard::Nothing,
@@ -371,6 +386,7 @@ impl Core {
                 if last {
                     self.buffer.clear();
                     if let Some((_, hp)) = self.held.take() {
+                        self.held_at = None;
                         return self.order(hp.actions, hp.say);
                     }
                 }
@@ -382,7 +398,8 @@ impl Core {
     /// The held order runs now (a pause or the release); its words leave the buffer.
     fn run_held(&mut self) -> Heard {
         let Some((b, p)) = self.held.take() else { return Heard::Nothing };
-        log::info!("live: pause, the held order runs: {b:?}");
+        log::info!("live: pause, the held order runs: {b:?} (held {} ms)", self.held_ms());
+        self.held_at = None;
         self.buffer = self.buffer.strip_prefix(b.as_str()).unwrap_or("").trim().to_string();
         self.order(p.actions, p.say)
     }
@@ -395,14 +412,51 @@ impl Core {
     /// The held order will not run (Pablo moved to another app): its words leave the buffer, the new ones stay.
     pub fn drop_held(&mut self) {
         let Some((b, _)) = self.held.take() else { return };
+        self.held_at = None;
         log::info!("live: the front app changed, the held order is dropped: {b:?}");
         self.buffer = self.buffer.strip_prefix(b.as_str()).unwrap_or("").trim().to_string();
     }
 
-    fn order(&mut self, actions: Vec<Action>, say: Option<String>) -> Heard {
+    fn held_ms(&self) -> u128 {
+        self.held_at.map_or(0, |t| t.elapsed().as_millis())
+    }
+
+    fn order(&mut self, mut actions: Vec<Action>, say: Option<String>) -> Heard {
         self.order += 1;
+        if actions.iter().any(|a| a.op == "agent") {
+            // Words after an agent order that still runs: a follow-up in the same warm claude conversation.
+            // ponytail: it queues behind the running order, not injected mid-turn (agent.rs counts one result a message).
+            if self.agent_busy {
+                log::info!("live: order {} continues agent order {}", self.order, self.last_agent);
+                for t in actions.iter_mut().filter(|a| a.op == "agent").filter_map(|a| a.text.as_mut()) {
+                    *t = format!("continuation: {t}");
+                }
+            }
+            self.last_agent = self.order;
+        }
         Heard::Order(self.order, actions, say)
     }
+}
+
+/// A plan for the agent whose words are a whole order: a sentence end from the STT and a verb, more than one word.
+/// "Click the first one." yes; "abre" no (the next words may come).
+pub fn whole_agent_order(p: &Plan, buffer: &str) -> bool {
+    p.actions.len() == 1 && p.actions[0].op == "agent" && whole_sentence(buffer)
+}
+
+/// ponytail: a word list, not a parser; add a verb when the hold log shows a whole order that waited.
+const VERBS: &[&str] = &[
+    "open", "abre", "abrir", "click", "clic", "clickea", "haz", "pincha", "toca", "tap", "escribe", "type", "write", "close", "cierra",
+    "cerrar", "busca", "buscar", "search", "find", "ve", "anda", "go", "crea", "create", "dibuja", "draw", "manda", "send", "envia",
+    "borra", "delete", "elimina", "remove", "scroll", "baja", "sube", "pon", "play", "reproduce", "pausa", "pause", "copia", "copy",
+    "pega", "paste", "guarda", "save", "selecciona", "select", "cambia", "switch", "mueve", "move", "presiona", "press", "muestra",
+    "show", "responde", "reply", "llena", "fill",
+];
+
+fn whole_sentence(text: &str) -> bool {
+    let t = text.trim();
+    let words: Vec<String> = crate::text::norm(t).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect();
+    t.ends_with(['.', '?', '!']) && words.len() > 1 && words.iter().any(|w| VERBS.contains(&w.as_str()))
 }
 
 /// Run nothing yet, keep the whole buffer for the next chunk (or the final flush):
@@ -410,15 +464,12 @@ impl Core {
 ///    input"). Measured on gpt-oss-120b: it plans "Type hello" as complete and types into the wrong field (case 5).
 /// 2. The plan keeps the whole buffer as `rest` but has actions: the next replan would run them again.
 /// No hold for 1 when there is no other text input to name (`type_here`: a terminal, a canvas app, the only field).
-/// The held order runs at the next pause: a silent chunk, HOLD_MS with no new words, or the release.
+/// The held order runs at the next pause: a silent chunk, real silence on the mic (audio::QUIET_MS), or the release.
 pub fn hold(p: &Plan, buffer: &str) -> bool {
     let trailing_type = !p.type_here && p.actions.last().is_some_and(|a| a.op == "type" && a.target.as_deref().is_none_or(|t| t.trim().is_empty()));
     let rest_is_all = !p.complete && !p.actions.is_empty() && p.rest.trim() == buffer.trim();
     trailing_type || rest_is_all
 }
-
-/// No new words for this long = a pause: a held order runs. ponytail: 800 ms is a first guess (Pablo's ask).
-const HOLD_MS: u64 = 800;
 
 /// An untargeted `type` means "type here": the screen has no text input besides the focused one (Ghostty and
 /// Claude Code are one AXTextArea; a canvas app has none). `inputs` = text-input marks on screen.
@@ -510,6 +561,8 @@ enum Item {
 struct Queue {
     items: Mutex<VecDeque<Item>>,
     cv: Condvar,
+    /// The order whose action cmd-exec runs now (0 = none).
+    running: AtomicU32,
 }
 
 impl Queue {
@@ -518,10 +571,13 @@ impl Queue {
         self.cv.notify_one();
     }
 
+    /// The next item; cmd-exec calls it once the last one is done, so `running` goes back to none here.
     fn pop(&self) -> Item {
         let mut q = self.items.lock().unwrap();
+        self.running.store(0, Ordering::SeqCst);
         loop {
             if let Some(i) = q.pop_front() {
+                self.running.store(if let Item::Do { order, .. } = &i { *order } else { 0 }, Ordering::SeqCst);
                 return i;
             }
             q = self.cv.wait(q).unwrap();
@@ -531,6 +587,12 @@ impl Queue {
     /// Esc: drop every queued action (the End stays, so the session still closes).
     fn clear(&self) {
         self.items.lock().unwrap().retain(|i| matches!(i, Item::End { .. }));
+    }
+
+    /// Order `n` runs now or waits in the queue.
+    fn busy(&self, n: u32) -> bool {
+        let q = self.items.lock().unwrap();
+        n != 0 && (self.running.load(Ordering::SeqCst) == n || q.iter().any(|i| matches!(i, Item::Do { order, .. } if *order == n)))
     }
 
     fn has_end(&self) -> bool {
@@ -564,7 +626,7 @@ enum Msg {
 struct Ctl {
     stopped: AtomicBool,
     ended: AtomicBool,
-    /// The Chunker hears Pablo talking (no pause yet): a held order waits.
+    /// The Chunker hears Pablo talking (under audio::QUIET_MS of real silence): a held order waits.
     speaking: AtomicBool,
     said: Mutex<String>,
 }
@@ -702,8 +764,8 @@ fn live_loop(
     let mut waiting: VecDeque<(u32, Vec<f32>)> = VecDeque::new();
     // Scribe Realtime: if the socket dies, the unanswered audio goes to the batch STT and so does the rest.
     let mut rta = RtAudio { rate, ..Default::default() };
-    // The release (Scribe gets RT_FINISH_MS from here) and the last new words (a held order runs HOLD_MS after).
-    let (mut released, mut words_at): (Option<Instant>, Instant) = (None, Instant::now());
+    // The release (Scribe gets RT_FINISH_MS from here).
+    let mut released: Option<Instant> = None;
     // Agent v2 (default): every order goes to the agent except the trivial ones; Fast mode (beta) = the planner.
     let agent_first = cfg.agent && !cfg.fast_mode;
     #[cfg(target_os = "macos")]
@@ -790,7 +852,6 @@ fn live_loop(
             },
             Msg::Rt(e) => match e {
                 scribe_rt::Ev::Partial(p) if !p.is_empty() => {
-                    words_at = Instant::now();
                     update(&app, |l| l.last_said = p);
                 }
                 scribe_rt::Ev::Partial(_) => {}
@@ -863,7 +924,6 @@ fn live_loop(
                         continue;
                     }
                     if !t.is_empty() {
-                        words_at = Instant::now();
                         update(&app, |l| l.last_said = t.clone());
                     }
                     if paused() && resume_word(&t) {
@@ -879,6 +939,7 @@ fn live_loop(
                     let question = LIVE.lock().unwrap().pending.clone().unwrap_or_default();
                     let said = RUNNING.lock().unwrap().clone().filter(search_click).map(|a| a.said);
                     let pending = command::waiting().map(|wait| Pending { wait, question: &question, said: said.as_deref() });
+                    core.agent_busy = queue.busy(core.last_agent);
                     let heard = core.hear(&t, false, pending, &mut planner);
                     *ctl.said.lock().unwrap() = core.said.join(" ");
                     // Esc while the planner ran: its answer is dropped.
@@ -889,13 +950,12 @@ fn live_loop(
                 }
             }
         }
-        // No new words for HOLD_MS and no STT in flight: a pause, the held order runs (log 2026-10-17: it waited
-        // forever). Checked after every message: Scribe's audio arrives every ~100 ms, so a timeout alone would starve.
+        // Real silence on the mic and no STT in flight: a pause, the held order runs. Not the next chunk: room noise
+        // can hold that back 8 s (log 2026-10-19 02:07). Checked after every message: Scribe's audio arrives every
+        // ~100 ms, so a timeout alone would starve.
         same_front(&mut core, &mut held_front);
-        if ctl.speaking.load(Ordering::SeqCst) {
-            words_at = Instant::now();
-        }
-        if core.holding() && words_at.elapsed() > Duration::from_millis(HOLD_MS) && in_flight == 0 && waiting.is_empty() && rta.unanswered.is_empty() && !ctl.stopped.load(Ordering::SeqCst) {
+        if core.holding() && !ctl.speaking.load(Ordering::SeqCst) && in_flight == 0 && waiting.is_empty() && rta.unanswered.is_empty() && !ctl.stopped.load(Ordering::SeqCst) {
+            core.agent_busy = queue.busy(core.last_agent);
             let heard = core.hear("", false, None, &mut planner);
             handle(&app, &queue, &core, heard);
         }
@@ -915,6 +975,7 @@ fn live_loop(
         }
         if ended && in_flight == 0 && waiting.is_empty() && rt.is_none() {
             if !core.buffer.is_empty() && !command::aborted() && !ctl.stopped.load(Ordering::SeqCst) {
+                core.agent_busy = queue.busy(core.last_agent);
                 let heard = core.hear("", true, None, &mut planner);
                 handle(&app, &queue, &core, heard);
             }
@@ -1409,6 +1470,49 @@ mod tests {
         c.hear("type hi", false, None, &mut p);
         assert!(matches!(c.hear("", true, None, &mut p), Heard::Order(2, ..)));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn whole_agent_orders_run_at_once_replay_2026_10_19() {
+        // log 02:07:27 "Click the first one." and 02:07:41 "Close this tab." waited 8 s and 7 s for the next chunk
+        let mut p = |t: &str, last: bool, _: Option<&str>| Ok(crate::agent::hold_plan(t, t, last));
+        let task = |h: &Heard| match h {
+            Heard::Order(_, a, _) => a[0].text.clone(),
+            _ => None,
+        };
+        let mut c = Core::default();
+        for (n, said) in [(1, "Click the first one."), (2, "Close this tab.")] {
+            let t = Instant::now(); // the final chunk's text arrives
+            let h = c.hear(said, false, None, &mut p);
+            let ms = t.elapsed().as_millis();
+            assert!(ms < 100, "{said:?} dispatched {ms} ms after its chunk");
+            assert!(matches!(h, Heard::Order(o, ..) if o == n), "{said:?}: {h:?}");
+            assert_eq!(task(&h).as_deref(), Some(said), "order 4 had ended: a new order, no continuation");
+            assert_eq!((c.buffer.as_str(), c.holding(), c.last_agent), ("", false, n));
+        }
+        // a partial waits for more words or a pause
+        assert_eq!(c.hear("abre", false, None, &mut p), Heard::Nothing);
+        assert!(c.holding());
+        let h = c.hear("Slack.", false, None, &mut p);
+        assert_eq!(task(&h).as_deref(), Some("abre Slack."), "the rest of the sentence: the whole order runs now");
+        assert!(!c.holding() && c.buffer.is_empty());
+        c.hear("abre", false, None, &mut p);
+        assert_eq!(task(&c.hear("", false, None, &mut p)).as_deref(), Some("abre"), "a pause runs the held partial");
+        // words while the agent order still runs: a follow-up to the same claude conversation
+        c.agent_busy = true;
+        assert_eq!(task(&c.hear("And the second one too.", false, None, &mut p)), None, "no verb: waits for a pause");
+        assert_eq!(task(&c.hear("", false, None, &mut p)).as_deref(), Some("continuation: And the second one too."));
+        assert_eq!(task(&c.hear("Close this tab.", false, None, &mut p)).as_deref(), Some("continuation: Close this tab."));
+    }
+
+    #[test]
+    fn whole_sentences() {
+        for t in ["Click the first one.", "Close this tab.", "Abre Slack.", "¿Puedes buscar gatos?", "Escribe hola!"] {
+            assert!(whole_sentence(t), "{t}");
+        }
+        for t in ["abre", "Abre.", "Click the first", "The first one.", "Gmail."] {
+            assert!(!whole_sentence(t), "{t}");
+        }
     }
 
     #[test]

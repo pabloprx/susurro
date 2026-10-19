@@ -707,7 +707,8 @@ pub fn find_cut_with(d: &[f32], c: Cuts) -> Option<usize> {
         let mut run = 0;
         for (i, &x) in d.iter().enumerate() {
             run = if x <= thr { run + 1 } else { 0 };
-            if run >= cut_sil && i + 1 - run >= cut_min {
+            // A pause as long as `min` cuts too: a short word right after a cut ("Slack") never waits for the hard cut.
+            if run >= cut_sil && (i + 1 - run >= cut_min || run >= cut_min) {
                 return Some(i + 1 - run / 2);
             }
         }
@@ -726,12 +727,6 @@ fn pause_thr(d: &[f32]) -> f32 {
     (top - PAUSE_BELOW_DB).max(floor + 6.0)
 }
 
-/// `find_cut_with`'s view of the frames: speech in them, and they do not end in a pause yet.
-pub fn speaking_with(d: &[f32], c: Cuts) -> bool {
-    let thr = pause_thr(d);
-    d.iter().filter(|&&x| x > thr).count() >= c.loud && d.iter().rev().take(c.sil).any(|&x| x > thr)
-}
-
 /// Cuts the live recording at pauses. Holds only the audio since the last cut (device rate).
 pub struct Chunker {
     rate: u32,
@@ -743,7 +738,20 @@ pub struct Chunker {
     /// Device samples before buf[0] since the recording start.
     start: usize,
     cuts: Cuts,
+    /// The session's loudest frame (decays QUIET_DECAY_DB a frame) and quietest frame: the scale `quiet` is read on.
+    peak: f32,
+    floor: f32,
+    /// 10 ms frames of real silence in a row, across cuts.
+    quiet: usize,
 }
+
+/// A frame this far under the session's loudest frame is real silence. ponytail: a first guess, not measured on his
+/// room; tune from the "live: held ... for N ms" log lines.
+const QUIET_BELOW_DB: f32 = 25.0;
+/// The peak decays this much a 10 ms frame (3 dB/s): one bump on the mic does not mute the meter for the session.
+const QUIET_DECAY_DB: f32 = 0.03;
+/// Real silence this long: Pablo stopped talking (live.rs runs a held order).
+pub const QUIET_MS: usize = 700;
 
 impl Chunker {
     pub fn new(rate: u32) -> Self {
@@ -751,7 +759,7 @@ impl Chunker {
     }
 
     pub fn with_cuts(rate: u32, cuts: Cuts) -> Self {
-        Self { rate, seg: 0, read: 0, buf: vec![], db: vec![], start: 0, cuts }
+        Self { rate, seg: 0, read: 0, buf: vec![], db: vec![], start: 0, cuts, peak: -100.0, floor: 0.0, quiet: 0 }
     }
 
     /// Read the new samples of `rec`. Err = the device changed: drop the chunker (the whole clip goes single-shot).
@@ -783,6 +791,10 @@ impl Chunker {
         self.buf.extend_from_slice(new);
         let have = self.db.len() * flen;
         let added: Vec<f32> = frame_db(&self.buf[have..], flen).collect();
+        for &x in &added {
+            (self.peak, self.floor) = ((self.peak - QUIET_DECAY_DB).max(x), self.floor.min(x));
+            self.quiet = if x > self.quiet_thr() { 0 } else { self.quiet + 1 };
+        }
         self.db.extend(added);
         let c = find_cut_with(&self.db, self.cuts)?;
         let chunk = resample(&self.buf[..((c + CUT_PAD) * flen).min(self.buf.len())], self.rate);
@@ -793,10 +805,17 @@ impl Chunker {
         worth(&chunk).then_some(chunk)
     }
 
-    /// Pablo is talking: speech since the last cut, and no pause after it yet (live.rs waits with a held order).
-    pub fn speaking(&self) -> bool {
-        speaking_with(&self.db, self.cuts)
+    fn quiet_thr(&self) -> f32 {
+        (self.peak - QUIET_BELOW_DB).max(self.floor + 6.0)
     }
+
+    /// Pablo may still be talking (live.rs waits with a held order): under QUIET_MS of real silence (the session's
+    /// level, not the chunk's: room noise that wobbles is no speech), or speech not cut into a chunk yet.
+    pub fn speaking(&self) -> bool {
+        let thr = self.quiet_thr();
+        self.quiet * 10 < QUIET_MS || self.db.iter().filter(|&&x| x > thr).count() >= self.cuts.loud
+    }
+
 
     /// The audio after the last cut, from the final 16 kHz clip. None = nothing worth transcribing.
     pub fn tail(&self, clip: &Clip) -> Option<Vec<f32>> {
@@ -1391,12 +1410,46 @@ mod tests {
         let chunks: Vec<Vec<f32>> = a.chunks(1600).filter_map(|p| c.push(p)).collect();
         assert_eq!(chunks.len(), 1, "one order cut at the pause");
         assert!(c.speaking(), "the 0.6 s after the cut is voice with no pause yet");
-        c.push(&hush(16_000, 0.2));
-        assert!(c.speaking(), "200 ms of quiet is not a pause");
-        c.push(&hush(16_000, 0.15));
-        assert!(!c.speaking(), "a 350 ms pause: done talking (cut or not)");
-        assert!(!speaking_with(&vec![-80.0; 200], COMMAND), "room noise only");
-        assert!(!speaking_with(&[], COMMAND));
+        c.push(&hush(16_000, 0.35));
+        assert!(c.speaking(), "a 350 ms pause cuts a chunk, but Pablo may go on");
+        c.push(&hush(16_000, 0.4));
+        assert!(!c.speaking(), "750 ms of real silence: done talking");
+    }
+
+    /// Room noise that wobbles 16 dB every 50 ms (a fan, a wireless mic), never under -66 dBFS.
+    fn wobble(rate: u32, secs: f32) -> Vec<f32> {
+        hush(rate, secs).iter().enumerate().map(|(i, x)| x * if (i / (rate as usize / 20)) % 2 == 0 { 0.5 } else { 3.0 }).collect()
+    }
+
+    #[test]
+    fn real_silence_ends_the_talk_even_over_wobbly_room_noise() {
+        // log 2026-10-19 02:07:27: "Click the first one." then room noise; the held order waited 8 s for the next chunk
+        let mut c = Chunker::with_cuts(16_000, COMMAND);
+        c.push(&wobble(16_000, 0.5));
+        assert!(c.speaking(), "no silence measured yet");
+        for p in voice(16_000, 1.2, 1.0).chunks(1600) {
+            c.push(p);
+        }
+        for p in wobble(16_000, 0.6).chunks(1600) {
+            c.push(p);
+        }
+        assert!(c.speaking(), "600 ms of quiet: he may go on");
+        for p in wobble(16_000, 0.2).chunks(1600) {
+            c.push(p);
+        }
+        assert!(!c.speaking(), "800 ms of room noise after the words is silence");
+        // "abre" | "Slack": a short word right after a cut is cut on its own once the pause is long, not at the 8 s hard cut
+        let mut c = Chunker::with_cuts(16_000, COMMAND);
+        let a = [voice(16_000, 1.0, 1.0), wobble(16_000, 0.3), voice(16_000, 0.25, 1.0), wobble(16_000, 1.0)].concat();
+        let mut cuts = 0;
+        for p in a.chunks(1600) {
+            cuts += usize::from(c.push(p).is_some());
+            if cuts == 1 {
+                assert!(c.speaking(), "a word not cut yet is still talking");
+            }
+        }
+        assert_eq!(cuts, 2, "the short word is its own chunk");
+        assert!(!c.speaking());
     }
 
     #[test]
