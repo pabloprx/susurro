@@ -57,6 +57,8 @@ const LEDGER_STEPS: usize = 8;
 pub const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 /// After an action, before the screen is read again (exec's own settle already covers a click).
 const AFTER_MS: u64 = 120;
+/// Actions one `steps` call takes (OSWorld-Human: grouping the actions on one screen halves the model calls).
+const STEPS_MAX: usize = 8;
 
 pub const SYSTEM: &str = "You control the user's Mac with the susurro tools, and only with them. The user talks; each \
 user message is one spoken order plus the screen as it is now: the front app, the window, the focus and the numbered \
@@ -75,6 +77,8 @@ read it, and put a one-sentence summary of it in done. To read or review a page,
 say what you found in done. \
 Prefer keyboard shortcuts (cmd+t new tab, cmd+l address bar, cmd+f find, cmd+w, return, tab, escape) over clicks, and \
 click {mark} over x,y. Click a text field before you type into it. \
+Put the actions you can already see through into one steps call (click the field, type, return; cmd+l, type the \
+URL, return): each tool call is a slow round trip. \
 Every action answers with what changed (app, window, focus, screen changed) and the new marks: trust it, use those \
 mark numbers, and never redo a step whose answer already shows it worked. \
 In Finder (and in an Open or Save dialog) go to a folder with cmd+shift+g, type its path (~/name), return; never \
@@ -112,6 +116,8 @@ read it, and put a one-sentence summary of it in done. To read or review a page,
 say what you found in done. \
 Prefer keyboard shortcuts (cmd+t new tab, cmd+l address bar, cmd+f find, cmd+w, return, tab, escape) over clicks. \
 Click a text field before you type into it. \
+Put the actions you can already see through into one steps call (click the field, type, return; cmd+l, type the \
+URL, return): each tool call is a slow round trip, and you get one screenshot after the last step. \
 In Finder (and in an Open or Save dialog) go to a folder with cmd+shift+g, type its path (~/name), return. \
 If a page is still loading in the screenshot, call wait. \
 To draw, move or resize (a paint app, a slider, a file onto a folder) use drag with a path in screenshot pixels. \
@@ -268,6 +274,16 @@ pub fn tools() -> Value {
         { "name": "wait", "description": "Wait for a page load: returns as soon as the screen stops changing, at most ms (max 5000), with the new marks.", "inputSchema": { "type": "object", "properties": { "ms": { "type": "integer" } }, "required": ["ms"] } },
         { "name": "done", "description": "The order is finished, or cannot be done: one short sentence for the user, in the language of the order.", "inputSchema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] } }
     ]);
+    let step_args = json!({ "type": "object", "description": "That tool's arguments (no done here: put done on the steps call)", "properties": {
+        "mark": mark, "x": xy("x"), "y": xy("y"), "modifiers": mods, "text": { "type": "string" }, "combo": { "type": "string" },
+        "dir": { "type": "string", "enum": ["up", "down"] }, "name": { "type": "string" }, "ms": { "type": "integer" },
+        "path": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
+    } });
+    let steps = json!({ "type": "array", "minItems": 1, "maxItems": STEPS_MAX, "items": { "type": "object", "properties": {
+        "tool": { "type": "string", "description": "click, double_click, right_click, mouse_move, drag, type, key, scroll, open_app or wait" },
+        "args": step_args
+    }, "required": ["tool", "args"] } });
+    t.as_array_mut().unwrap().push(json!({ "name": "steps", "description": "Several actions in one call, in order (one model round trip instead of one per action): click a field, type, return; cmd+l, type a URL, return. Stops at the first that fails. Only the first step may use a mark unless the screen stays the same. Answers like the last step.", "inputSchema": { "type": "object", "properties": { "steps": steps }, "required": ["steps"] } }));
     // every action can end the order itself (one model round trip less: ~1.5 s measured per round trip on sonnet)
     for x in t.as_array_mut().unwrap() {
         if !["screenshot", "list_elements", "wait", "done"].contains(&x["name"].as_str().unwrap_or("")) {
@@ -284,6 +300,9 @@ pub fn vision_tools() -> Value {
     v.retain(|x| x["name"] != "list_elements");
     for x in v.iter_mut() {
         if let Some(p) = x["inputSchema"]["properties"].as_object_mut() {
+            p.remove("mark");
+        }
+        if let Some(p) = x["inputSchema"]["properties"]["steps"]["items"]["properties"]["args"]["properties"].as_object_mut() {
             p.remove("mark");
         }
         let d = match x["name"].as_str().unwrap_or("") {
@@ -657,6 +676,7 @@ impl<'a, 'b> Agent<'a, 'b> {
                 self.done = Some(s("summary").unwrap_or_default());
                 Out::ok("Finished. End your turn now: no more tools, no text.")
             }
+            "steps" => self.steps(&args["steps"]),
             "click" if mods == 0 => match (mark("mark"), args["x"].as_f64(), args["y"].as_f64()) {
                 (Some(m), _, _) => self.act(Action { op: "click".into(), target: Some(self.label(m)), ..Default::default() }),
                 (None, Some(x), Some(y)) => self.click_point(x, y),
@@ -705,6 +725,52 @@ impl<'a, 'b> Agent<'a, 'b> {
             }
             n => Out::err(format!("unknown tool {n}")),
         }
+    }
+
+    /// `steps`: the actions in order, one answer (the last step's, after a line per step). A mark after the first
+    /// step is refused once the screen changed: the numbers were read before it.
+    fn steps(&mut self, list: &Value) -> Out {
+        let Some(list) = list.as_array().filter(|l| !l.is_empty()) else { return Out::err("steps needs a list of {tool, args}.") };
+        if list.len() > STEPS_MAX {
+            return Out::err(format!("At most {STEPS_MAX} steps per call."));
+        }
+        let start = self.shot.clone();
+        let mut done: Vec<String> = vec![];
+        let mut last = Out::ok("");
+        for (i, st) in list.iter().enumerate() {
+            let (name, args) = (st["tool"].as_str().unwrap_or(""), &st["args"]);
+            if ["steps", "done", "screenshot", "list_elements"].contains(&name) {
+                last = Out::err(format!("{name} cannot be a step."));
+                break;
+            }
+            let moved = match (&start, &self.shot) {
+                (Some(a), Some(b)) => !same(a, b),
+                _ => i > 0,
+            };
+            if i > 0 && args.get("mark").is_some() && moved {
+                last = Out::err(format!("Stopped before step {}: the screen changed, so its mark is stale. Use the marks below.\n{}", i + 1, self.now(None)));
+                break;
+            }
+            if self.desk.aborted() || self.desk.paused() {
+                break;
+            }
+            let mods = match modifiers(args["modifiers"].as_str().unwrap_or("")) {
+                Ok(m) => m,
+                Err(e) => {
+                    last = Out::err(e);
+                    break;
+                }
+            };
+            last = self.tool(name, args, mods);
+            if last.error {
+                break;
+            }
+            done.push(format!("{}. {}", i + 1, last.text.lines().next().unwrap_or(name)));
+        }
+        if !done.is_empty() {
+            last.text = format!("{}\n{}", done.join("\n"), last.text);
+        }
+        last
     }
 
     /// "[12] Send (button, main)": the target text the executor grounds (planner style), else the bare number.
@@ -1808,7 +1874,7 @@ mod tests {
     fn schema_names_and_required() {
         let t = tools();
         let names: Vec<&str> = t.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["screenshot", "list_elements", "click", "double_click", "right_click", "mouse_move", "drag", "type", "key", "scroll", "open_app", "wait", "done"]);
+        assert_eq!(names, ["screenshot", "list_elements", "click", "double_click", "right_click", "mouse_move", "drag", "type", "key", "scroll", "open_app", "wait", "done", "steps"]);
         for x in t.as_array().unwrap() {
             assert_eq!(x["inputSchema"]["type"], "object", "{}", x["name"]);
             assert!(x["description"].as_str().unwrap().len() > 10);
@@ -2039,6 +2105,27 @@ mod tests {
     }
 
     #[test]
+    fn steps_run_in_one_call() {
+        let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
+        let mut ag = Agent::new("manda hola", false, &mut ask, &mut d, &mut mem);
+        ag.call("list_elements", &json!({}));
+        let r = ag.call("steps", &json!({ "steps": [
+            { "tool": "click", "args": { "mark": 1 } },
+            { "tool": "type", "args": { "text": "hola" } },
+            { "tool": "key", "args": { "combo": "return" } }
+        ], "done": "Enviado." }));
+        assert!(!r.error, "{}", r.text);
+        assert!(r.text.starts_with("1. ") && r.text.contains("\n3. "), "{}", r.text);
+        assert_eq!(ag.done.as_deref(), Some("Enviado."));
+        assert!(ag.call("steps", &json!({ "steps": [{ "tool": "done", "args": {} }] })).error);
+        assert!(ag.call("steps", &json!({ "steps": [] })).error);
+        let r = ag.call("steps", &json!({ "steps": [{ "tool": "key", "args": { "combo": "cmd+shift+q" } }, { "tool": "type", "args": { "text": "no" } }] }));
+        assert!(r.error, "a blocked step stops the rest");
+        drop(ag);
+        assert_eq!(d.typed, ["hola"]);
+    }
+
+    #[test]
     fn risky_raw_clicks_ask_and_secure_points_block() {
         let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
         d.els.push(el(4, "Delete", "button"));
@@ -2187,7 +2274,7 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(post(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), true).0, 202);
         let v: Value = serde_json::from_str(&post(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), true).1).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 14);
         let v: Value = serde_json::from_str(&post(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "click", "arguments": { "mark": 2 } } }), true).1).unwrap();
         assert_eq!(v["id"], 3);
         assert_eq!(v["result"]["content"][0]["text"], "click {\"mark\":2}");
@@ -2372,7 +2459,7 @@ for line in sys.stdin:
         assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0]["model"], "google/gemini-3.5-flash-lite");
-        assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 14);
         assert_eq!(seen[0]["tools"][2]["function"]["name"], "click");
         assert!(seen[0]["messages"][1]["content"].as_str().unwrap().contains("[2] Send"), "the first message has the screen");
         // the second request carries the tool answer and the screenshot as a user image
