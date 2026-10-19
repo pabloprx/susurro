@@ -2,8 +2,11 @@
 //! what it already did; it must control my mouse"). Every voice order goes to his local Claude Code (`claude -p`, his
 //! subscription), except the trivial ones (`local_intent`: no LLM at all). ONE warm `claude -p --input-format
 //! stream-json` process per binary: spawned when F11 goes down (its start overlaps his speech), each order a new user
-//! message in the same conversation (it remembers what it did), killed after IDLE, on Esc and at quit. A rolling
-//! memory of the last MEMORY_MAX actions (agent-memory.json) goes into the system prompt of a new process.
+//! message in the same conversation (it remembers what it did), killed after IDLE, on Esc and at quit. The session
+//! ledger (agent-memory.json: each order, how it ended and its actions) goes with an order to any conversation that
+//! has not seen those orders yet: a new process after Esc, a stop or the idle kill, and the OpenRouter fallback. So
+//! a "continue" after Esc does not redo what the stopped order did (Pablo 2026-10-18: "it has issues on things that
+//! he already did").
 //! susurro serves its own tools over MCP (HTTP on 127.0.0.1, a random token per process); every tool call runs on the
 //! exec thread through `command::exec` (verify + real-click fallback, risky confirm, password fields blocked) or the
 //! raw mouse acts (drag, double / right click, move). Every action answers with what changed and the new marks, so
@@ -44,8 +47,14 @@ pub const IMG_MAX: f64 = 1280.0;
 pub const MARKS_MAX: usize = 40;
 /// A warm claude process with no order for this long is killed.
 pub const IDLE: Duration = Duration::from_secs(300);
-/// Actions kept in the rolling memory (agent-memory.json).
-pub const MEMORY_MAX: usize = 20;
+/// Orders kept in the ledger file (agent-memory.json).
+pub const MEMORY_MAX: usize = 30;
+/// Orders a conversation gets from the ledger, the newest; actions per order.
+const LEDGER_ORDERS: usize = 12;
+const LEDGER_STEPS: usize = 8;
+/// A pause longer than this between two orders starts a new session: the orders before it are not sent (an action
+/// from this morning is no reason to skip one now).
+pub const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 /// After an action, before the screen is read again (exec's own settle already covers a click).
 const AFTER_MS: u64 = 120;
 
@@ -70,7 +79,9 @@ To draw a straight line in a paint app, pick its Line tool (a mark) when it has 
 To draw, move or resize (a paint app, a slider, a file onto a folder) use drag with a path in screenshot pixels: take \
 a screenshot first to see where. The mouse tools (drag, double_click, right_click, mouse_move, click with modifiers) \
 act on the real mouse. \
-Earlier orders in this conversation are done: never repeat them; use them for \"it\", \"again\", \"the same\". \
+Earlier orders in this conversation, and the ones listed under \"Done earlier in this session\", are done: never \
+repeat their actions (a stopped order stopped after the actions listed), unless the user asks again; use them for \
+\"it\", \"again\", \"the same\", \"continue\". \
 Risky actions (send, delete, buy) ask the user first; if a tool says the user said no, stop. Never type passwords. \
 When the last action of an order finishes it, give that action done: \"<one short sentence>\" (it saves a round \
 trip); else, when the order is done or cannot be done, call done. The sentence is in the language of the order.";
@@ -278,7 +289,7 @@ pub fn modifiers(s: &str) -> Result<u64, String> {
     })
 }
 
-/// One action in the rolling memory.
+/// One action of an order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub at: i64,
@@ -287,30 +298,76 @@ pub struct Step {
     pub ok: bool,
 }
 
-pub fn load_memory(p: &Path) -> Vec<Step> {
+/// One order in the session ledger: the words, how it ended, its actions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Order {
+    /// When it started (ms): also its id.
+    pub at: i64,
+    pub said: String,
+    /// "done", "stopped", "not finished: <why>".
+    pub end: String,
+    pub steps: Vec<Step>,
+}
+
+/// The ledger file. The old format (a list of actions) reads as empty.
+pub fn load_memory(p: &Path) -> Vec<Order> {
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-/// Appends `new`, keeps the last MEMORY_MAX.
-pub fn save_memory(p: &Path, new: &[Step]) {
-    if new.is_empty() {
+/// Appends `order`, keeps the last MEMORY_MAX. An order that did nothing is not kept: there is nothing to redo.
+pub fn save_order(p: &Path, order: Order) {
+    if order.steps.is_empty() {
         return;
     }
     let mut all = load_memory(p);
-    all.extend_from_slice(new);
+    all.push(order);
     all.drain(..all.len().saturating_sub(MEMORY_MAX));
     if let Err(e) = std::fs::write(p, serde_json::to_vec(&all).unwrap_or_default()) {
         log::warn!("agent: memory {}: {e}", p.display());
     }
 }
 
-/// SYSTEM, plus what earlier processes did (a new process starts with no conversation).
-pub fn system_prompt(mem: &[Step]) -> String {
-    if mem.is_empty() {
-        return SYSTEM.into();
+/// The orders of the session going on at `now`: back from the newest until a pause over SESSION_GAP_MS.
+pub fn session(all: &[Order], now: i64) -> Vec<Order> {
+    let mut next = now;
+    let from = all.iter().rposition(|o| {
+        let gap = next - o.at;
+        next = o.at;
+        gap > SESSION_GAP_MS
+    });
+    all[from.map_or(0, |i| i + 1)..].to_vec()
+}
+
+/// How an order ended, for the ledger.
+pub fn outcome(end: &End) -> String {
+    match (&end.status, end.message.as_deref().filter(|m| !m.is_empty())) {
+        (CmdStatus::Done, _) => "done".into(),
+        (CmdStatus::Stopped, Some(m)) => format!("stopped: {m}"),
+        (CmdStatus::Stopped, None) => "stopped".into(),
+        (s, m) => format!("not finished: {}", m.map(String::from).unwrap_or_else(|| format!("{s:?}").to_lowercase())),
     }
-    let lines: Vec<String> = mem.iter().map(|m| format!("- [{}] {}{}", m.app, m.did, if m.ok { "" } else { " (failed)" })).collect();
-    format!("{SYSTEM}\n\nYour last actions before this conversation (oldest first; done, do not redo them):\n{}", lines.join("\n"))
+}
+
+/// The orders a conversation has not seen, as a block before its order. Empty = nothing to tell.
+pub fn ledger_text(orders: &[Order], now: i64) -> String {
+    let orders = &orders[orders.len().saturating_sub(LEDGER_ORDERS)..];
+    if orders.is_empty() {
+        return String::new();
+    }
+    let ago = |at: i64| match (now - at).max(0) / 1000 {
+        s if s < 60 => format!("{s} s ago"),
+        s => format!("{} min ago", s / 60),
+    };
+    let lines: Vec<String> = orders
+        .iter()
+        .map(|o| {
+            let steps = &o.steps[o.steps.len().saturating_sub(LEDGER_STEPS)..];
+            let did: Vec<String> = steps.iter().map(|s| format!("[{}] {}{}", s.app, s.did, if s.ok { "" } else { " (failed)" })).collect();
+            let more = if steps.len() < o.steps.len() { format!("{} earlier actions, then ", o.steps.len() - steps.len()) } else { String::new() };
+            format!("- {}: “{}” ({}): {more}{}", ago(o.at), o.said.trim(), o.end, did.join("; "))
+        })
+        .collect();
+    format!("Done earlier in this session (oldest first; these actions happened, do not redo them):\n{}\n\n", lines.join("\n"))
 }
 
 /// GUI round 2: "abre una pestaña nueva, ve a jspaint.app" from Finder opened Safari, not Pablo's Edge.
@@ -1009,11 +1066,13 @@ pub fn claude_args(model: &str, system: &str, mcp_config: &str) -> Vec<String> {
 /// Runs one order to its end. `confirm_risky`: the Voice control setting.
 pub fn run(task: &str, o: &Opts, confirm_risky: bool, ask: &mut Ask, desk: &mut dyn Desk, mem: &mut Memory) -> End {
     let t0 = Instant::now();
+    let at = crate::history::now_ms();
+    let past = o.memory.as_deref().map(|p| session(&load_memory(p), at)).unwrap_or_default();
     let mut ag = Agent::new(task, confirm_risky, ask, desk, mem);
     ag.say(&format!("agent: {task}"));
     let first = ag.first_message();
     log::info!("agent: first look {} ms", t0.elapsed().as_millis());
-    let claude = o.claude.as_deref().map(|b| run_claude(b, &first, o, &mut ag));
+    let claude = o.claude.as_deref().map(|b| run_claude(b, &first, &past, at, o, &mut ag));
     let end = match claude {
         Some(Ok(end)) => end,
         other => {
@@ -1024,12 +1083,12 @@ pub fn run(task: &str, o: &Opts, confirm_risky: bool, ask: &mut Ask, desk: &mut 
                 End { status: CmdStatus::Setup, summary: String::new(), message: Some("key".into()), steps: 0 }
             } else {
                 ag.say(&format!("agent ({}): {task}", o.fallback_model));
-                run_openrouter(&first, o, &mut ag)
+                run_openrouter(&format!("{}{first}", ledger_text(&past, at)), o, &mut ag)
             }
         }
     };
     if let Some(p) = &o.memory {
-        save_memory(p, &ag.log);
+        save_order(p, Order { at, said: task.into(), end: outcome(&end), steps: ag.log.clone() });
     }
     log::info!("agent: {:?} in {} ms, {} steps, {} calls: {} {:?}", end.status, t0.elapsed().as_millis(), ag.step, ag.calls, end.summary, end.message);
     End { summary: if end.summary.is_empty() { end.summary } else { format!("agent: {}", end.summary) }, ..end }
@@ -1074,6 +1133,8 @@ struct Warm {
     /// The screen and marks this conversation last got (Agent::seen): the next order sends only what is new.
     seen: Option<Screen>,
     shown: Vec<u32>,
+    /// The newest ledger order this conversation knows (it ran it, or got it in a message): 0 = none.
+    known: i64,
 }
 
 impl Drop for Warm {
@@ -1095,7 +1156,7 @@ impl Warm {
         // An empty folder: no project CLAUDE.md, .mcp.json or settings to pick up.
         let dir = std::env::temp_dir().join("susurro-agent");
         let _ = std::fs::create_dir_all(&dir);
-        let system = system_prompt(&o.memory.as_deref().map(load_memory).unwrap_or_default()) + &browser_note(default_browser());
+        let system = format!("{SYSTEM}{}", browser_note(default_browser()));
         let mut child = Command::new(bin)
             .args(claude_args(&o.model, &system, &srv.config()))
             .current_dir(&dir)
@@ -1119,7 +1180,7 @@ impl Warm {
         let stdin = child.stdin.take().unwrap();
         log::info!("agent: claude started (pid {}, {})", child.id(), o.model);
         reaper();
-        Ok(Warm { bin: bin.into(), model: o.model.clone(), child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![] })
+        Ok(Warm { bin: bin.into(), model: o.model.clone(), child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![], known: 0 })
     }
 
     /// Reads what came between two orders (a late result, a tool call after done). false = the process is gone.
@@ -1242,7 +1303,9 @@ pub fn status() -> Value {
 }
 
 /// Err = claude failed before any tool call (missing login, a bad flag): the fallback may run.
-fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, String> {
+/// `past`: the session's earlier orders (the ones this conversation has not seen go before the order); `at`: this
+/// order's id in the ledger.
+fn run_claude(bin: &Path, first: &str, past: &[Order], at: i64, o: &Opts, ag: &mut Agent) -> Result<End, String> {
     let t0 = Instant::now();
     let mut w = take(bin, o)?;
     let order = w.sent + 1;
@@ -1250,6 +1313,8 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
     // `first`, back in place if the fallback takes the order (a new conversation).
     let own = w.seen.take().map(|s| (std::mem::replace(&mut ag.seen, Some(s)), std::mem::replace(&mut ag.shown, std::mem::take(&mut w.shown))));
     let first = if own.is_some() && ag.shot.is_some() { ag.order_text() } else { first.to_string() };
+    let unseen: Vec<Order> = past.iter().filter(|p| p.at > w.known).cloned().collect();
+    let first = format!("{}{first}", ledger_text(&unseen, at));
     let restore = |ag: &mut Agent, own: Option<(Option<Screen>, Vec<u32>)>| {
         if let Some((seen, shown)) = own {
             (ag.seen, ag.shown) = (seen, shown);
@@ -1336,6 +1401,8 @@ fn run_claude(bin: &Path, first: &str, o: &Opts, ag: &mut Agent) -> Result<End, 
     println!("{line}");
     if keep && !result.as_ref().is_some_and(|r| r.0) {
         (w.seen, w.shown) = (ag.seen.clone(), ag.shown.clone());
+        // no tool call: the fallback may take the order, and its actions reach this conversation with the next one
+        w.known = if ag.calls > 0 { at } else { past.last().map_or(w.known, |p| p.at.max(w.known)) };
         give_back(w);
     } else {
         release(bin);
@@ -1367,7 +1434,7 @@ fn run_openrouter(first: &str, o: &Opts, ag: &mut Agent) -> End {
         .iter()
         .map(|t| json!({ "type": "function", "function": { "name": t["name"], "description": t["description"], "parameters": t["inputSchema"] } }))
         .collect();
-    let system = system_prompt(&o.memory.as_deref().map(load_memory).unwrap_or_default()) + &browser_note(default_browser());
+    let system = format!("{SYSTEM}{}", browser_note(default_browser()));
     let mut msgs = vec![json!({ "role": "system", "content": system }), json!({ "role": "user", "content": first })];
     // ponytail: every screenshot stays in the history; drop old ones if long runs get slow or costly.
     for _ in 0..STEP_CAP * 3 {
@@ -1843,21 +1910,61 @@ mod tests {
         assert_eq!(finish(&ag, None).status, CmdStatus::Unsure);
     }
 
+    fn order(at: i64, said: &str, end: &str, steps: usize) -> Order {
+        let steps = (0..steps).map(|i| Step { at: at + i as i64, app: "Slack".into(), did: format!("clicked “{i}”"), ok: i != 1 }).collect();
+        Order { at, said: said.into(), end: end.into(), steps }
+    }
+
     #[test]
-    fn rolling_memory_keeps_the_last_20_and_goes_into_the_system_prompt() {
+    fn the_ledger_keeps_the_last_orders_with_actions() {
         let p = std::env::temp_dir().join(format!("susurro-agent-mem-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        assert_eq!(system_prompt(&load_memory(&p)), SYSTEM);
-        let step = |i: i64| Step { at: i, app: "Edge".into(), did: format!("clicked “{i}”"), ok: i != 24 };
-        save_memory(&p, &(0..15).map(step).collect::<Vec<_>>());
-        save_memory(&p, &(15..25).map(step).collect::<Vec<_>>());
+        std::fs::write(&p, r#"[{"at":1,"app":"Edge","did":"clicked","ok":true}]"#).unwrap();
+        assert_eq!(load_memory(&p), vec![], "the old list of actions reads as empty");
+        save_order(&p, order(1, "hola", "done", 0));
+        assert!(load_memory(&p).is_empty(), "an order that did nothing has nothing to redo");
+        for i in 0..35 {
+            save_order(&p, order(i, "x", "done", 1));
+        }
         let m = load_memory(&p);
-        assert_eq!(m.len(), MEMORY_MAX);
-        assert_eq!((m[0].at, m[19].at), (5, 24));
-        let s = system_prompt(&m);
-        assert!(s.starts_with(SYSTEM));
-        assert!(s.ends_with("- [Edge] clicked “23”\n- [Edge] clicked “24” (failed)"), "{s}");
+        assert_eq!((m.len(), m[0].at, m[MEMORY_MAX - 1].at), (MEMORY_MAX, 5, 34));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_session_ends_at_a_long_pause() {
+        let min = 60_000;
+        let all = vec![order(0, "this morning", "done", 1), order(100 * min, "a", "done", 1), order(120 * min, "b", "done", 1)];
+        let at = |v: Vec<Order>| v.iter().map(|o| o.at).collect::<Vec<_>>();
+        assert_eq!(at(session(&all, 125 * min)), [100 * min, 120 * min], "the 100 min pause cut this morning off");
+        assert_eq!(at(session(&all, 151 * min)), Vec::<i64>::new(), "31 min since the last order: a new session");
+        assert_eq!(at(session(&all[..1], 29 * min)), [0]);
+        assert!(session(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_text_names_each_order_its_end_and_its_actions() {
+        assert_eq!(ledger_text(&[], 0), "");
+        let t = ledger_text(&[order(0, " abre Slack ", "done", 1), order(60_000, "escribe hola en diseño", "stopped", 12)], 150_000);
+        assert!(t.starts_with("Done earlier in this session (oldest first; these actions happened, do not redo them):\n"), "{t}");
+        assert!(t.contains("\n- 2 min ago: “abre Slack” (done): [Slack] clicked “0”\n"), "{t}");
+        assert!(ledger_text(&[order(0, "x", "done", 1)], 59_000).contains("- 59 s ago:"));
+        assert!(t.contains("- 1 min ago: “escribe hola en diseño” (stopped): 4 earlier actions, then [Slack] clicked “4”; "), "{t}");
+        assert!(t.ends_with("[Slack] clicked “11”\n\n"), "{t}");
+        let many: Vec<Order> = (0..20).map(|i| order(i, &format!("o{i}"), "done", 1)).collect();
+        let t = ledger_text(&many, 20);
+        assert!(!t.contains("“o7”") && t.contains("“o8”") && t.contains("“o19”"), "the newest LEDGER_ORDERS: {t}");
+        let first = ledger_text(&[order(0, "x", "done", 2)], 0);
+        assert!(first.contains("[Slack] clicked “1” (failed)"), "{first}");
+    }
+
+    #[test]
+    fn outcomes() {
+        let e = |status, message: Option<&str>| End { status, summary: String::new(), message: message.map(String::from), steps: 1 };
+        assert_eq!(outcome(&e(CmdStatus::Done, None)), "done");
+        assert_eq!(outcome(&e(CmdStatus::Stopped, None)), "stopped");
+        assert_eq!(outcome(&e(CmdStatus::Stopped, Some("Paused: you took over"))), "stopped: Paused: you took over");
+        assert_eq!(outcome(&e(CmdStatus::Unsure, Some("Stopped at the 25-step cap"))), "not finished: Stopped at the 25-step cap");
+        assert_eq!(outcome(&e(CmdStatus::Error, None)), "not finished: error");
     }
 
     #[test]
@@ -1986,7 +2093,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn one_warm_process_takes_every_order_and_a_new_one_gets_the_memory() {
+    fn one_warm_process_takes_every_order_and_a_new_one_gets_the_session_ledger() {
         let bin = script("fake-warm", FAKE_CLAUDE);
         let mem_file = std::env::temp_dir().join(format!("susurro-agent-warm-mem-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&mem_file);
@@ -2014,17 +2121,30 @@ for line in sys.stdin:
         assert!(o2[2].2.ends_with("The marks are the ones you got last."), "{}", o2[2].2);
         assert_eq!(o2[0].0, o2[1].0, "the same process: it remembers the first order");
         assert!(o2[1].2.starts_with("Order: draw a line\n\nThe screen now:\nApp: Microsoft Edge."), "{}", o2[1].2);
-        assert_eq!(o2[0].1, format!("{SYSTEM}{}", browser_note(default_browser())), "no memory yet");
+        assert_eq!(o2[0].1, format!("{SYSTEM}{}", browser_note(default_browser())));
+        assert!(o2[0].2.starts_with("Order: click the Send button"), "nothing done yet: no ledger, {}", o2[0].2);
         let st = status();
         assert!(st["warm"].as_array().unwrap().iter().any(|w| w["orders"] == 3), "{st}");
-        // Esc / idle: killed; the next process starts with the rolling memory
+        // Esc / idle: killed; the next process gets what this session did before its order
         kill();
         let e3 = run("say hi", &o, false, &mut ask, &mut chat(), &mut mem);
         assert_eq!((e3.status, e3.summary.as_str()), (CmdStatus::Done, "agent: Hola"), "a prose answer is an answer, no fallback");
         let o3 = orders(&bin);
         assert_ne!(o3[3].0, o3[0].0, "a new process");
         assert!(o3[3].2.contains("3 marks:\nmain:"), "a new conversation gets the marks, {}", o3[3].2);
-        assert!(o3[3].1.contains("- [Chat] clicked “Send” (button, main)") && o3[3].1.contains("- [Microsoft Edge] dragged from 200,300 to 600,300"), "{}", o3[3].1);
+        let m = &o3[3].2;
+        assert!(m.starts_with("Done earlier in this session"), "{m}");
+        assert!(m.contains("“click the Send button” (done): [Chat] clicked “Send” (button, main)"), "{m}");
+        assert!(m.contains("“draw a line” (done): [Microsoft Edge] dragged from 200,300 to 600,300"), "{m}");
+        assert!(m.contains("\n\nOrder: say hi\n"), "{m}");
+        assert_eq!(o3[3].1, o3[0].1, "the system prompt stays the same (cached)");
+        // the same process again: it knows those orders now, the next one carries no ledger
+        run("say hi", &o, false, &mut ask, &mut chat(), &mut mem);
+        let o4 = orders(&bin);
+        assert_eq!(o4[4].0, o4[3].0);
+        assert!(o4[4].2.starts_with("Order: say hi"), "{}", o4[4].2);
+        let saved = load_memory(&mem_file);
+        assert_eq!(saved.iter().map(|o| o.said.as_str()).collect::<Vec<_>>(), ["click the Send button", "draw a line", "draw a line"], "say hi did nothing");
         kill();
         let _ = (std::fs::remove_file(&bin), std::fs::remove_file(bin.with_extension("log")), std::fs::remove_file(&mem_file));
     }
@@ -2129,7 +2249,7 @@ for line in sys.stdin:
             let t = Instant::now();
             let mut ag = Agent::new(task, false, &mut ask, &mut d, &mut mem);
             let msg = ag.first_message();
-            let end = run_claude(&bin, &msg, &o, &mut ag).unwrap();
+            let end = run_claude(&bin, &msg, &[], crate::history::now_ms(), &o, &mut ag).unwrap();
             let f = ag.first_tool.unwrap_or(0);
             let ms = t.elapsed().as_millis();
             println!("SMOKE {task:?}: {:?} first tool {f} ms, total {ms} ms, sent {} chars: {}", end.status, msg.len(), end.summary);
