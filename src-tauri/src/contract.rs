@@ -676,7 +676,7 @@ pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
 pub const DEFAULT_OPENROUTER_CLEANUP: &str = "google/gemini-2.5-flash-lite";
 pub const JEV_MODEL: &str = "typesafe/jev-1.14";
 /// `.lo/planner-bench.md` (2026-10-17): fastest of the models with every plan right (0.78 s p50, 60/60 same effect),
-/// pinned to Cerebras with reasoning low (planner.rs `extra_for`).
+/// Cerebras first, then Groq and SambaNova, with reasoning low (planner.rs `extra_for`).
 pub const DEFAULT_PLANNER: &str = "openai/gpt-oss-120b";
 
 impl SttProvider {

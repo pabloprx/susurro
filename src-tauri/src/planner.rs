@@ -137,7 +137,9 @@ pub fn schema() -> Value {
 /// if Pablo picks models outside it.
 pub fn extra_for(model: &str) -> Value {
     if model.starts_with("openai/gpt-oss") {
-        json!({"provider": {"only": ["cerebras"], "allow_fallbacks": false}, "reasoning": {"effort": "low"}})
+        // Cerebras first (fastest), then the other fast hosts: Cerebras alone timed out for Pablo (2026-10-19,
+        // "the planner timed out"). require_parameters keeps the strict JSON schema on every host.
+        json!({"provider": {"order": ["cerebras", "groq", "sambanova"], "allow_fallbacks": true, "require_parameters": true}, "reasoning": {"effort": "low"}})
     } else if model.starts_with("openai/gpt-6") || model.starts_with("google/gemini-3") {
         json!({"reasoning": {"effort": "minimal"}})
     } else if model.starts_with("google/gemini-2.5-flash") && !model.contains("lite") {
@@ -414,7 +416,7 @@ mod tests {
             .match_body(Matcher::PartialJson(json!({
                 "model": "openai/gpt-oss-120b",
                 "temperature": 0,
-                "provider": {"only": ["cerebras"]},
+                "provider": {"order": ["cerebras", "groq", "sambanova"], "allow_fallbacks": true},
                 "reasoning": {"effort": "low"},
                 "response_format": {"type": "json_schema", "json_schema": {"strict": true}},
             })))
