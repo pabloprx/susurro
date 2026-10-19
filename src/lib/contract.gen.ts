@@ -65,7 +65,13 @@ agent_model: string,
 /**
  * The OpenRouter vision model when the claude CLI is missing or not logged in.
  */
-agent_fallback: string, };
+agent_fallback: string, 
+/**
+ * "Computer use" (on by default, Pablo 2026-10-19): the agent sees the whole screen in a screenshot after every
+ * action and points at x,y, the way Claude's computer use works. Off = it reads the numbered marks (AX) and takes
+ * a screenshot only for pixels.
+ */
+agent_vision: boolean, };
 
 /**
  * Payload of `command_step` (all windows) and a row of `command_log`.

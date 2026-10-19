@@ -86,6 +86,31 @@ Risky actions (send, delete, buy) ask the user first; if a tool says the user sa
 When the last action of an order finishes it, give that action done: \"<one short sentence>\" (it saves a round \
 trip); else, when the order is done or cannot be done, call done. The sentence is in the language of the order.";
 
+/// The system prompt for computer use (CommandSettings::agent_vision): Claude's computer-use way, over susurro's tools.
+pub const SYSTEM_VISION: &str = "You control the user's Mac with the susurro tools, and only with them, the way computer \
+use works: you see the screen and point at it. The user talks; each user message is one spoken order, the front app, \
+the window, the focus, and a screenshot of the whole screen. \
+Act at once: no plan in prose, no questions. Every action answers with a new screenshot of the whole screen: look at \
+it before the next action and never redo a step it shows worked. Coordinates are x,y in the pixels of the last \
+screenshot; aim at the center of the element. \
+Do every part of the order, in its order, even when the screen seems to show the result already: \"a new tab\" is \
+cmd+t even when the page is open in this tab. \
+If the app the order names is already the front app (the App: line), do not call open_app: act in it. \
+Prefer keyboard shortcuts (cmd+t new tab, cmd+l address bar, cmd+f find, cmd+w, return, tab, escape) over clicks. \
+Click a text field before you type into it. \
+In Finder (and in an Open or Save dialog) go to a folder with cmd+shift+g, type its path (~/name), return. \
+If a page is still loading in the screenshot, call wait. \
+To draw, move or resize (a paint app, a slider, a file onto a folder) use drag with a path in screenshot pixels. \
+Earlier orders in this conversation are done: never repeat them; use them for \"it\", \"again\", \"the same\". \
+Risky actions (send, delete, buy) ask the user first; if a tool says the user said no, stop. Never type passwords. \
+When the last action of an order finishes it, give that action done: \"<one short sentence>\" (it saves a round \
+trip); else, when the order is done or cannot be done, call done. The sentence is in the language of the order.";
+
+/// The system prompt for the mode.
+pub fn system_for(vision: bool) -> &'static str {
+    if vision { SYSTEM_VISION } else { SYSTEM }
+}
+
 /// "modo agente: abre WhatsApp" -> Some("abre WhatsApp"); "modo agente" alone -> Some(""). None = not agent mode.
 pub fn task_in(text: &str) -> Option<String> {
     let w: Vec<&str> = text.split_whitespace().collect();
@@ -236,6 +261,36 @@ pub fn tools() -> Value {
         }
     }
     t
+}
+
+/// The tools for computer use: the same handlers, with no marks. Every answer carries a screenshot of the whole screen.
+pub fn vision_tools() -> Value {
+    let mut t = tools();
+    let v = t.as_array_mut().unwrap();
+    v.retain(|x| x["name"] != "list_elements");
+    for x in v.iter_mut() {
+        if let Some(p) = x["inputSchema"]["properties"].as_object_mut() {
+            p.remove("mark");
+        }
+        let d = match x["name"].as_str().unwrap_or("") {
+            "screenshot" => "The whole screen as a JPEG (at most 1280 px). Every other tool already answers with one: call it only when you need a fresh look without acting.",
+            "click" => "Click the point x,y (screenshot pixels). With modifiers it is a raw click (cmd+click opens in a new tab).",
+            "double_click" => "Double-click the point x,y (open a file, select a word).",
+            "right_click" => "Right-click the point x,y (the context menu).",
+            "mouse_move" => "Move the mouse to the point x,y (hover menus, tooltips).",
+            "drag" => "Press the left button at the first point, move through every point, release at the last: draw a line (2 points), a shape (a closed path), move or resize things. Points in screenshot pixels.",
+            "scroll" => "Scroll the front window, or at the point x,y.",
+            "wait" => "Wait for a page load: returns as soon as the screen stops changing, at most ms (max 5000), with a screenshot.",
+            _ => continue,
+        };
+        x["description"] = json!(d);
+    }
+    t
+}
+
+/// The tool list for the mode.
+pub fn tools_for(vision: bool) -> Value {
+    if vision { vision_tools() } else { tools() }
 }
 
 /// One tool result: text, an optional JPEG.
@@ -390,8 +445,8 @@ pub fn default_browser() -> Option<String> {
 }
 
 /// The front window's state in one line, for the model.
-fn state_line(s: &Screen, focus: &crate::ax::Field, changed: Option<bool>) -> String {
-    let (w, h) = img_size(frame(s));
+fn state_line(s: &Screen, focus: &crate::ax::Field, changed: Option<bool>, vision: bool) -> String {
+    let (w, h) = img_size(frame(s, vision));
     let mut l = format!("App: {}.", s.app);
     if !s.title.trim().is_empty() {
         l += &format!(" Window: “{}”.", s.title.trim());
@@ -455,8 +510,9 @@ fn same(a: &Screen, b: &Screen) -> bool {
     a.app == b.app && a.title == b.title && key(a) == key(b)
 }
 
-fn frame(s: &Screen) -> PtRect {
-    if s.window.w > 0.0 { s.window } else { s.display }
+/// The screenshot frame: the whole display in computer use (`vision`), else the front window.
+fn frame(s: &Screen, vision: bool) -> PtRect {
+    if s.window.w > 0.0 && !vision { s.window } else { s.display }
 }
 
 /// One order's tool handlers over the executor.
@@ -484,13 +540,18 @@ pub struct Agent<'a, 'b> {
     /// The screen whose marks the model last got (this order or the warm process's last one), and which of them.
     seen: Option<Screen>,
     shown: Vec<u32>,
+    /// Computer use (CommandSettings::agent_vision): the whole screen as a screenshot after every action, x,y only,
+    /// no marks for the model.
+    pub vision: bool,
+    /// Computer use: the screen with the order's first message.
+    pub first_image: Option<Vec<u8>>,
 }
 
 impl<'a, 'b> Agent<'a, 'b> {
     pub fn new(task: &str, confirm_risky: bool, ask: &'a mut Ask<'b>, desk: &'a mut dyn Desk, mem: &'a mut Memory) -> Self {
         // the agent picks its own targets: no "Which one?" per click
         let cfg = Cfg { confirm_risky, choose: false, max: STEP_CAP };
-        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false, first_tool: None, seen: None, shown: vec![] }
+        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false, first_tool: None, seen: None, shown: vec![], vision: false, first_image: None }
     }
 
     /// A pill line between actions.
@@ -504,6 +565,9 @@ impl<'a, 'b> Agent<'a, 'b> {
         match self.desk.read() {
             Ok(scr) => {
                 self.shot = Some(scr);
+                if self.vision {
+                    self.first_image = self.snap();
+                }
                 self.order_text()
             }
             Err(e) if e == "accessibility" => self.order_with("susurro has no Accessibility permission: call done and say so.".into()),
@@ -515,7 +579,7 @@ impl<'a, 'b> Agent<'a, 'b> {
     fn order_text(&mut self) -> String {
         let Some(scr) = self.shot.clone() else { return self.order_with("The screen cannot be read.".into()) };
         let f = self.desk.focused();
-        let now = format!("{}\n{}", state_line(&scr, &f, None), self.marks(&scr));
+        let now = format!("{}\n{}", state_line(&scr, &f, None, self.vision), self.marks(&scr));
         self.order_with(now)
     }
 
@@ -526,6 +590,10 @@ impl<'a, 'b> Agent<'a, 'b> {
     /// The marks for the model: the order's MARKS_MAX (`pick`) it has not got yet for this screen. A screen it saw
     /// already costs one line (Pablo: "why is it so slow": every order and answer re-sent 80 marks).
     fn marks(&mut self, scr: &Screen) -> String {
+        if self.vision {
+            self.seen = Some(scr.clone());
+            return if self.first_image.is_some() || self.calls > 0 { "The screenshot shows the screen now.".into() } else { "No screenshot: take one.".into() };
+        }
         if !self.seen.as_ref().is_some_and(|s| same(s, scr)) {
             self.seen = Some(scr.clone());
             let els = pick(&scr.els, &self.task, MARKS_MAX);
@@ -552,6 +620,10 @@ impl<'a, 'b> Agent<'a, 'b> {
             Err(e) => return Out::err(e),
         };
         let mut out = self.tool(name, args, mods);
+        // computer use: every answer shows the screen after it (no extra screenshot round trip)
+        if self.vision && out.image.is_none() && !["screenshot", "done"].contains(&name) && !self.desk.aborted() && !self.took_over {
+            out.image = self.snap();
+        }
         // an action that finishes the order ends it now (no done call, no round trip)
         if let Some(d) = args["done"].as_str().filter(|_| !out.error && name != "done") {
             self.done = Some(d.to_string());
@@ -641,7 +713,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         }
         let (Some(x), Some(y)) = (args["x"].as_f64(), args["y"].as_f64()) else { return Err(Out::err("Give mark, or x and y.")) };
         let scr = self.shot.as_ref().ok_or_else(|| Out::err("Take a screenshot first."))?;
-        Ok((to_points(frame(scr), (x, y)), format!("{x:.0},{y:.0}")))
+        Ok((to_points(frame(scr, self.vision), (x, y)), format!("{x:.0},{y:.0}")))
     }
 
     fn look(&mut self, image: bool) -> Out {
@@ -650,10 +722,23 @@ impl<'a, 'b> Agent<'a, 'b> {
             Err(e) if e == "accessibility" => return Out::err("susurro has no Accessibility permission. Call done."),
             Err(e) => return Out::err(e),
         };
-        let win = frame(&scr);
+        let win = frame(&scr, self.vision);
         let f = self.desk.focused();
-        let mut head = state_line(&scr, &f, None);
+        let mut head = state_line(&scr, &f, None, self.vision);
         let mut out = Out::default();
+        if image && self.vision {
+            match self.snap_of(win) {
+                Ok(b) => {
+                    head += " The image is the whole screen (x,y for the mouse tools are in its pixels).";
+                    out.image = Some(b);
+                }
+                Err(e) => head += &format!(" No image: {e}."),
+            }
+            out.text = head;
+            self.seen = Some(scr.clone());
+            self.shot = Some(scr);
+            return out;
+        }
         if image {
             // The marks window draws the numbers on screen: the capture shows them.
             let st = CommandStep {
@@ -687,6 +772,19 @@ impl<'a, 'b> Agent<'a, 'b> {
         out
     }
 
+    /// Computer use: the last read screen's display as the model's screenshot. None = no image (no permission, no read).
+    fn snap(&mut self) -> Option<Vec<u8>> {
+        let r = frame(self.shot.as_ref()?, true);
+        self.snap_of(r).inspect_err(|e| log::warn!("agent: screenshot: {e}")).ok()
+    }
+
+    fn snap_of(&mut self, r: PtRect) -> Result<Vec<u8>, String> {
+        if !self.desk.screen_ok() {
+            return Err("susurro has no Screen Recording permission".into());
+        }
+        self.desk.snapshot(r, IMG_MAX).map_err(|e| format!("{e:#}"))
+    }
+
     /// Waits until the screen stops changing, at most `max` ms (GUI round 1: a 3 s wait ran in full on a loaded page).
     /// Settled = two reads WAIT_POLL_MS apart are the same, and the screen changed since the last answer or
     /// WAIT_MIN_MS went by (a navigation that has not started yet).
@@ -708,7 +806,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         }
         let f = self.desk.focused();
         let Some(scr) = prev else { return Out::ok(format!("waited {slept} ms")) };
-        let t = format!("waited {slept} ms\n{}\n{}", state_line(&scr, &f, Some(start.as_ref().is_none_or(|b| !same(b, &scr)))), self.marks(&scr));
+        let t = format!("waited {slept} ms\n{}\n{}", state_line(&scr, &f, Some(start.as_ref().is_none_or(|b| !same(b, &scr))), self.vision), self.marks(&scr));
         self.shot = Some(scr);
         Out::ok(t)
     }
@@ -719,7 +817,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         match self.desk.read() {
             Ok(scr) => {
                 let f = self.desk.focused();
-                let t = format!("{}\n{}", state_line(&scr, &f, Some(before.is_none_or(|b| !same(b, &scr)))), self.marks(&scr));
+                let t = format!("{}\n{}", state_line(&scr, &f, Some(before.is_none_or(|b| !same(b, &scr))), self.vision), self.marks(&scr));
                 self.shot = Some(scr);
                 t
             }
@@ -809,7 +907,17 @@ impl<'a, 'b> Agent<'a, 'b> {
     /// A point click: the mark under it when there is one (its checks, its verify), else a raw click.
     fn click_point(&mut self, x: f64, y: f64) -> Out {
         let Some(scr) = self.shot.clone() else { return Out::err("Take a screenshot first.") };
-        let p = to_points(frame(&scr), (x, y));
+        let p = to_points(frame(&scr, self.vision), (x, y));
+        // computer use: a plain click where it points (the executor would draw the marks into the next screenshot);
+        // the element under it names the click, so the risky check still asks before "Delete"
+        if self.vision {
+            let under = command::snap(p, &scr.els).map(|e| e.mark.name.clone()).filter(|n| !n.trim().is_empty());
+            let what = match under {
+                Some(n) => format!("clicked “{n}” at {x:.0},{y:.0}"),
+                None => format!("clicked at {x:.0},{y:.0}"),
+            };
+            return self.raw(&what, Act::Click(Target::Point(p.0, p.1)), Some(p));
+        }
         if let Some(id) = command::snap(p, &scr.els).map(|e| e.mark.id) {
             return self.act(Action { op: "click".into(), target: Some(self.label(id)), ..Default::default() });
         }
@@ -822,7 +930,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         if px.len() < 2 {
             return Out::err("drag needs a path of 2 or more [x,y] points.");
         }
-        let pts: Vec<(f64, f64)> = px.iter().map(|p| to_points(frame(&scr), *p)).collect();
+        let pts: Vec<(f64, f64)> = px.iter().map(|p| to_points(frame(&scr, self.vision), *p)).collect();
         let (a, b) = (px[0], px[px.len() - 1]);
         let what = format!("dragged from {:.0},{:.0} to {:.0},{:.0} through {} points", a.0, a.1, b.0, b.1, px.len());
         self.raw(&what, Act::Drag(pts.clone(), mods), Some(pts[0]))
@@ -857,6 +965,8 @@ pub enum Msg {
 /// The run's MCP endpoint. Dropping it stops the accept loop.
 pub struct Server {
     pub url: String,
+    /// tools/list answers the computer-use tools.
+    pub vision: bool,
     pub token: String,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -874,7 +984,7 @@ fn token() -> String {
 }
 
 impl Server {
-    pub fn start(tx: mpsc::Sender<Msg>) -> std::io::Result<Server> {
+    pub fn start(tx: mpsc::Sender<Msg>, vision: bool) -> std::io::Result<Server> {
         let l = TcpListener::bind("127.0.0.1:0")?;
         let addr = l.local_addr()?;
         let (tok, stop) = (token(), Arc::new(AtomicBool::new(false)));
@@ -887,13 +997,13 @@ impl Server {
                 let Ok(c) = c else { continue };
                 let (t, tx) = (t.clone(), tx.clone());
                 std::thread::spawn(move || {
-                    if let Err(e) = serve(c, &t, &tx) {
+                    if let Err(e) = serve(c, &t, &tx, vision) {
                         log::debug!("agent mcp: {e}");
                     }
                 });
             }
         })?;
-        Ok(Server { url: format!("http://{addr}/mcp"), token: tok, addr, stop })
+        Ok(Server { url: format!("http://{addr}/mcp"), vision, token: tok, addr, stop })
     }
 
     /// The --mcp-config JSON for this server.
@@ -909,7 +1019,7 @@ impl Drop for Server {
     }
 }
 
-fn serve(c: TcpStream, token: &str, tx: &mpsc::Sender<Msg>) -> std::io::Result<()> {
+fn serve(c: TcpStream, token: &str, tx: &mpsc::Sender<Msg>, vision: bool) -> std::io::Result<()> {
     let mut r = BufReader::new(c.try_clone()?);
     let mut w = c;
     loop {
@@ -947,7 +1057,7 @@ fn serve(c: TcpStream, token: &str, tx: &mpsc::Sender<Msg>) -> std::io::Result<(
             (405, None) // no SSE stream: every answer is a JSON response
         } else {
             match serde_json::from_slice::<Value>(&body) {
-                Ok(req) => match rpc(&req, tx) {
+                Ok(req) => match rpc(&req, tx, vision) {
                     Some(v) => (200, Some(v)),
                     None => (202, None),
                 },
@@ -974,7 +1084,7 @@ fn respond(w: &mut TcpStream, status: u16, body: Option<Value>) -> std::io::Resu
 }
 
 /// One JSON-RPC message. None = a notification (202, no body).
-pub fn rpc(req: &Value, tx: &mpsc::Sender<Msg>) -> Option<Value> {
+pub fn rpc(req: &Value, tx: &mpsc::Sender<Msg>, vision: bool) -> Option<Value> {
     let id = req.get("id")?.clone();
     let p = &req["params"];
     let result: Result<Value, (i32, String)> = match req["method"].as_str().unwrap_or("") {
@@ -984,7 +1094,7 @@ pub fn rpc(req: &Value, tx: &mpsc::Sender<Msg>) -> Option<Value> {
             "serverInfo": { "name": "susurro", "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/list" => Ok(json!({ "tools": tools_for(vision) })),
         "tools/call" => {
             let (rtx, rrx) = mpsc::channel();
             let name = p["name"].as_str().unwrap_or("").to_string();
@@ -1017,6 +1127,8 @@ pub struct Opts {
     pub timeout: Duration,
     /// The rolling memory file (agent-memory.json). None = no memory.
     pub memory: Option<PathBuf>,
+    /// Computer use (CommandSettings::agent_vision).
+    pub vision: bool,
 }
 
 impl Opts {
@@ -1029,6 +1141,7 @@ impl Opts {
             base: crate::stt::OPENROUTER_BASE.into(),
             timeout: TIMEOUT,
             memory: Some(data_dir.join("agent-memory.json")),
+            vision: s.agent_vision,
         }
     }
 }
@@ -1069,6 +1182,7 @@ pub fn run(task: &str, o: &Opts, confirm_risky: bool, ask: &mut Ask, desk: &mut 
     let at = crate::history::now_ms();
     let past = o.memory.as_deref().map(|p| session(&load_memory(p), at)).unwrap_or_default();
     let mut ag = Agent::new(task, confirm_risky, ask, desk, mem);
+    ag.vision = o.vision && o.claude.is_some();
     ag.say(&format!("agent: {task}"));
     let first = ag.first_message();
     log::info!("agent: first look {} ms", t0.elapsed().as_millis());
@@ -1083,6 +1197,13 @@ pub fn run(task: &str, o: &Opts, confirm_risky: bool, ask: &mut Ask, desk: &mut 
                 End { status: CmdStatus::Setup, summary: String::new(), message: Some("key".into()), steps: 0 }
             } else {
                 ag.say(&format!("agent ({}): {task}", o.fallback_model));
+                // the fallback model reads the marks (it points badly at pixels): no computer use
+                let first = if ag.vision {
+                    (ag.vision, ag.seen, ag.first_image) = (false, None, None);
+                    ag.order_text()
+                } else {
+                    first
+                };
                 run_openrouter(&format!("{}{first}", ledger_text(&past, at)), o, &mut ag)
             }
         }
@@ -1122,6 +1243,8 @@ fn finish(ag: &Agent, why: Option<String>) -> End {
 struct Warm {
     bin: PathBuf,
     model: String,
+    /// Started with the computer-use tools and prompt: a change of the setting needs a new process.
+    vision: bool,
     child: Child,
     stdin: ChildStdin,
     rx: mpsc::Receiver<Msg>,
@@ -1152,11 +1275,11 @@ impl Warm {
     fn spawn(bin: &Path, o: &Opts) -> Result<Warm, String> {
         use std::process::{Command, Stdio};
         let (tx, rx) = mpsc::channel();
-        let srv = Server::start(tx.clone()).map_err(|e| format!("mcp server: {e}"))?;
+        let srv = Server::start(tx.clone(), o.vision).map_err(|e| format!("mcp server: {e}"))?;
         // An empty folder: no project CLAUDE.md, .mcp.json or settings to pick up.
         let dir = std::env::temp_dir().join("susurro-agent");
         let _ = std::fs::create_dir_all(&dir);
-        let system = format!("{SYSTEM}{}", browser_note(default_browser()));
+        let system = format!("{}{}", system_for(o.vision), browser_note(default_browser()));
         let mut child = Command::new(bin)
             .args(claude_args(&o.model, &system, &srv.config()))
             .current_dir(&dir)
@@ -1178,9 +1301,9 @@ impl Warm {
         let err = child.stderr.take().unwrap();
         std::thread::spawn(move || BufReader::new(err).lines().map_while(Result::ok).for_each(|l| log::warn!("agent: claude stderr: {l}")));
         let stdin = child.stdin.take().unwrap();
-        log::info!("agent: claude started (pid {}, {})", child.id(), o.model);
+        log::info!("agent: claude started (pid {}, {}{})", child.id(), o.model, if o.vision { ", computer use" } else { "" });
         reaper();
-        Ok(Warm { bin: bin.into(), model: o.model.clone(), child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![], known: 0 })
+        Ok(Warm { bin: bin.into(), model: o.model.clone(), vision: o.vision, child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![], known: 0 })
     }
 
     /// Reads what came between two orders (a late result, a tool call after done). false = the process is gone.
@@ -1196,8 +1319,14 @@ impl Warm {
         self.child.try_wait().is_ok_and(|s| s.is_none())
     }
 
-    fn send(&mut self, text: &str) -> std::io::Result<()> {
-        let m = json!({ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } });
+    /// One order. `image`: the screen as a JPEG (computer use).
+    fn send(&mut self, text: &str, image: Option<&[u8]>) -> std::io::Result<()> {
+        use base64::Engine;
+        let mut content = vec![json!({ "type": "text", "text": text })];
+        if let Some(b) = image {
+            content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(b) } }));
+        }
+        let m = json!({ "type": "user", "message": { "role": "user", "content": content } });
         writeln!(self.stdin, "{m}")?;
         self.stdin.flush()?;
         self.sent += 1;
@@ -1242,7 +1371,7 @@ pub fn prewarm(o: Opts) {
         }
         if let Some(i) = p.idle.iter().position(|w| w.bin == bin) {
             let w = &mut p.idle[i];
-            if w.model == o.model && w.settle() {
+            if w.model == o.model && w.vision == o.vision && w.settle() {
                 w.last = Instant::now();
                 return;
             }
@@ -1263,6 +1392,7 @@ fn take(bin: &Path, o: &Opts) -> Result<Warm, String> {
     drop(p);
     if let Some(mut w) = warm
         && w.model == o.model
+        && w.vision == o.vision
         && w.settle()
     {
         return Ok(w);
@@ -1320,7 +1450,7 @@ fn run_claude(bin: &Path, first: &str, past: &[Order], at: i64, o: &Opts, ag: &m
             (ag.seen, ag.shown) = (seen, shown);
         }
     };
-    if let Err(e) = w.send(&first) {
+    if let Err(e) = w.send(&first, ag.first_image.as_deref()) {
         release(bin);
         restore(ag, own);
         return Err(format!("claude stdin: {e}"));
@@ -1503,6 +1633,8 @@ mod tests {
         pub waits: Vec<Wait>,
         pub board: Vec<El>,
         pub jpeg: Vec<u8>,
+        /// The front window when it is not the whole display.
+        pub window: Option<PtRect>,
         pub abort: bool,
         pub secure: bool,
         /// Answer No to a confirm.
@@ -1530,8 +1662,9 @@ mod tests {
 
     impl Desk for Fake {
         fn read(&mut self) -> Result<Screen, String> {
-            let window = PtRect { x: 0.0, y: 0.0, w: 1568.0, h: 980.0 };
-            Ok(Screen { app: self.app.clone(), display: window, scale: 2.0, els: self.els.clone(), window, title: "untitled".into(), ..Default::default() })
+            let display = PtRect { x: 0.0, y: 0.0, w: 1568.0, h: 980.0 };
+            let window = self.window.unwrap_or(display);
+            Ok(Screen { app: self.app.clone(), display, scale: 2.0, els: self.els.clone(), window, title: "untitled".into(), ..Default::default() })
         }
         fn focused(&mut self) -> Field {
             Field { app: self.app.clone(), role: "AXTextField".into(), name: "Search".into(), secure: self.secure, ..Default::default() }
@@ -1807,6 +1940,54 @@ mod tests {
     }
 
     #[test]
+    fn computer_use_sees_the_whole_screen_after_every_action() {
+        // a window in the middle of the display: computer use points over the display, not the window
+        let (mut d, mut mem, mut ask) = (paint(), Memory::new(), no_jev);
+        d.window = Some(PtRect { x: 400.0, y: 200.0, w: 800.0, h: 600.0 });
+        let mut ag = Agent::new("dibuja una línea", false, &mut ask, &mut d, &mut mem);
+        ag.vision = true;
+        let m = ag.first_message();
+        assert_eq!(ag.first_image.as_deref(), Some(&b"\xff\xd8jpeg"[..]), "the order carries the screen");
+        assert!(m.contains("Screenshot frame: 1280x800 px.") && m.ends_with("The screenshot shows the screen now."), "no marks: {m}");
+        assert!(!m.contains("[1]"), "{m}");
+        let c = ag.call("click", &json!({ "x": 640, "y": 400 }));
+        assert!(!c.error && c.image.is_some() && !c.text.contains("marks"), "an action answers with a screenshot: {}", c.text);
+        let w = ag.call("wait", &json!({ "ms": 300 }));
+        assert!(w.image.is_some());
+        let s = ag.call("screenshot", &json!({}));
+        assert!(s.image.is_some() && s.text.contains("whole screen") && !s.text.contains("marks"), "{}", s.text);
+        assert!(!ag.call("key", &json!({ "combo": "cmd+t" })).image.is_none());
+        assert!(!ag.call("type", &json!({ "text": "hola" })).error);
+        assert!(!ag.call("scroll", &json!({ "dir": "down" })).error);
+        drop(ag);
+        let drawn: Vec<_> = d.steps.iter().filter(|st| st.status == CmdStatus::Marks).map(|st| st.instruction.clone()).collect();
+        assert!(drawn.is_empty(), "no numbers drawn on screen: {drawn:?}");
+        let k = 1568.0 / 1280.0;
+        assert_eq!(d.acts.first(), Some(&Act::Click(Target::Point(640.0 * k, 400.0 * k))), "x,y over the display");
+        // the tool list: no marks, no list_elements
+        let t = tools_for(true).to_string();
+        assert!(!t.contains("list_elements") && !t.contains("\"mark\"") && t.contains("whole screen"), "{t}");
+        assert!(tools_for(false).to_string().contains("list_elements"));
+        assert!(system_for(true).contains("computer use") && !system_for(false).contains("computer use"));
+    }
+
+    #[test]
+    fn computer_use_clicks_still_ask_before_a_risky_button() {
+        let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
+        d.els.push(el(4, "Delete", "button"));
+        d.deny = true;
+        let mut ag = Agent::new("borra", true, &mut ask, &mut d, &mut mem);
+        ag.vision = true;
+        ag.first_message();
+        let r = ag.el(4).map(|e| e.mark.rect).unwrap();
+        let k = 1280.0 / 1568.0;
+        let o = ag.call("click", &json!({ "x": (r.x + r.w / 2.0) * k, "y": (r.y + r.h / 2.0) * k }));
+        assert!(o.error && o.text.contains("said no"), "{}", o.text);
+        drop(ag);
+        assert!(d.acts.is_empty());
+    }
+
+    #[test]
     fn mouse_tools() {
         let (mut d, mut mem, mut ask) = (paint(), Memory::new(), no_jev);
         let mut ag = Agent::new("dibuja una línea", false, &mut ask, &mut d, &mut mem);
@@ -1970,7 +2151,7 @@ mod tests {
     #[test]
     fn mcp_over_http() {
         let (tx, rx) = mpsc::channel();
-        let srv = Server::start(tx).unwrap();
+        let srv = Server::start(tx, false).unwrap();
         // the exec side: answer one call
         std::thread::spawn(move || {
             if let Ok(Msg::Call(name, args, reply)) = rx.recv() {
@@ -2070,7 +2251,7 @@ for line in sys.stdin:
     }
 
     fn opts(claude: Option<PathBuf>, base: &str) -> Opts {
-        Opts { claude, model: "sonnet".into(), fallback_model: "google/gemini-3.5-flash-lite".into(), key: "sk-or".into(), base: base.into(), timeout: Duration::from_secs(20), memory: None }
+        Opts { claude, model: "sonnet".into(), fallback_model: "google/gemini-3.5-flash-lite".into(), key: "sk-or".into(), base: base.into(), timeout: Duration::from_secs(20), memory: None, vision: false }
     }
 
     /// The fake's log: (pid, system prompt, message) per order.

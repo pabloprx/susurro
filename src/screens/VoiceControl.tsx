@@ -234,6 +234,18 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
         <div className="sc-row">
           <div>
+            <div className="label">Computer use</div>
+            <div className="sub">How the agent sees your screen</div>
+          </div>
+          <span className="small">
+            {s.command.agent_vision
+              ? "On. It looks at a screenshot of the whole screen after every action and clicks where it sees things."
+              : "Off. It reads the numbered marks and takes a screenshot only to see pixels."}
+          </span>
+          <Toggle label="Computer use" on={s.command.agent_vision} onChange={(v) => save((x) => void (x.command.agent_vision = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
             <div className="label">Fast mode (beta)</div>
             <div className="sub">The planner plans each order, Jev picks the targets</div>
           </div>

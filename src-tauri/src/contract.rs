@@ -68,6 +68,10 @@ pub struct CommandSettings {
     pub agent_model: String,
     /// The OpenRouter vision model when the claude CLI is missing or not logged in.
     pub agent_fallback: String,
+    /// "Computer use" (on by default, Pablo 2026-10-19): the agent sees the whole screen in a screenshot after every
+    /// action and points at x,y, the way Claude's computer use works. Off = it reads the numbered marks (AX) and takes
+    /// a screenshot only for pixels.
+    pub agent_vision: bool,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -818,7 +822,7 @@ impl Default for CommandSettings {
     fn default() -> Self {
         // agent_model: sonnet, measured 2026-10-18 (GUI round 1, T1-T4, one run each): sonnet 25.5 s and every part
         // of every order; haiku 44.8 s, wandered in Finder (26.7 s) and skipped the new tab in JS Paint.
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: true, fast_mode: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into() }
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: true, fast_mode: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into(), agent_vision: true }
     }
 }
 
