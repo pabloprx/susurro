@@ -154,6 +154,31 @@ export type DictOpts = { fuzzy: boolean, };
 
 export type ElevenOpts = { model_id: string, send_keyterms: boolean, max_keyterms: number, };
 
+/**
+ * The screen-context card: the front app and what it shows, so an order can lean on it ("send this to Juanito").
+ */
+export type Glance = { app: string, 
+/**
+ * The front window's title (the page title in a browser, the chat in most messengers).
+ */
+window: string, 
+/**
+ * The focused element: "Message (text field)", "" = none.
+ */
+focus: string, 
+/**
+ * A draft in the focused field (its tail), "" = empty.
+ */
+draft: string, 
+/**
+ * The main items on screen (chats, links, buttons), at most glance::ITEMS.
+ */
+items: Array<string>, 
+/**
+ * One or two sentences about the screen from a vision model; None = not yet, or no OpenRouter key.
+ */
+summary: string | null, };
+
 export type HistoryItem = { id: number, created_at: number, 
 /**
  * Command rows: raw = the spoken instruction, final_text = what susurro did, error = why it stopped.
@@ -239,7 +264,11 @@ last_said: string,
  * "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
  * candidates are drawn.
  */
-numbers: boolean, };
+numbers: boolean, 
+/**
+ * Agent mode, F11 down: what is on screen, for the card on the right (glance.rs). None once an order runs.
+ */
+glance: Glance | null, };
 
 export type LlmProvider = "openrouter" | "local";
 

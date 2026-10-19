@@ -614,6 +614,25 @@ pub struct LiveState {
     /// "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
     /// candidates are drawn.
     pub numbers: bool,
+    /// Agent mode, F11 down: what is on screen, for the card on the right (glance.rs). None once an order runs.
+    pub glance: Option<Glance>,
+}
+
+/// The screen-context card: the front app and what it shows, so an order can lean on it ("send this to Juanito").
+#[derive(Default)]
+#[serde(default)]
+pub struct Glance {
+    pub app: String,
+    /// The front window's title (the page title in a browser, the chat in most messengers).
+    pub window: String,
+    /// The focused element: "Message (text field)", "" = none.
+    pub focus: String,
+    /// A draft in the focused field (its tail), "" = empty.
+    pub draft: String,
+    /// The main items on screen (chats, links, buttons), at most glance::ITEMS.
+    pub items: Vec<String>,
+    /// One or two sentences about the screen from a vision model; None = not yet, or no OpenRouter key.
+    pub summary: Option<String>,
 }
 
 /// One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.

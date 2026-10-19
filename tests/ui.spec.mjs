@@ -1623,6 +1623,23 @@ test.describe("marks window: live session (vc-feedback 9, 13)", () => {
     await expect(root(page).locator(".mark")).toHaveCount(0); // no AX read yet: HUD only
     await shot(page, "marks-live-listening");
   });
+  test("agent mode: one panel on the right with what is on screen and what it hears", async ({ page }) => {
+    await page.goto("/marks?state=live-glance");
+    const hud = root(page).locator(".hud.live");
+    await expect(hud.locator(".hud-row")).toContainText("LIVELISTENINGSlack · Ana Silva (DM) - Acme");
+    await expect(hud.locator(".glance-summary")).toHaveText("A Slack DM with Ana Silva; your draft about the trace is not sent yet.");
+    await expect(hud.locator(".glance .hud-line")).toHaveText(["FOCUSMessage to Ana Silva (text field)", "DRAFT“the trace is in the drive”", "SEEAna Silva# design# engineeringMaria LopezThreads"]);
+    await expect(hud.locator(".hud-line.heard")).toContainText("HEARDsend this to");
+    const b = await hud.boundingBox();
+    expect(b.x + b.width).toBeGreaterThan(1440 - 40); // on the right edge, not a header in the middle
+    await shot(page, "marks-live-glance");
+    // the summary is not there yet: the panel says it is looking
+    await page.evaluate(() => window.mock.live({ glance: { app: "Telegram", window: "Juanito", focus: "", draft: "", items: [], summary: null } }));
+    await expect(hud.locator(".glance-summary.pending")).toHaveText("Looking at the screen…");
+    // an order runs: Rust drops the glance, the panel shows the step
+    await page.evaluate(() => window.mock.live({ glance: null }));
+    await expect(hud.locator(".glance")).toHaveCount(0);
+  });
   test("live confirm and pick ask for a voice answer", async ({ page }) => {
     await page.goto("/marks?state=live-confirm");
     await expect(root(page).locator(".hud.warn .hud-q")).toHaveText("Press Return?");
@@ -1861,7 +1878,8 @@ test.describe("overlay", () => {
     ["cmd-acting", "v-cmd-acting", "CLICKAna Silva"],
     ["cmd-pick", "v-cmd-pick", "Which one?say its number"],
     ["cmd-confirm", "v-cmd-confirm", "Click “Send now”?say yes ·F2·esc"],
-    ["live", "v-cmd-live", "create a new tab and run the command"],
+    ["live", "v-cmd-listening", "CMD"], // agent mode: the words are in the marks panel, not the pill
+    ["live&fast", "v-cmd-live", "create a new tab and run the command"],
     ["live-acting", "v-cmd-acting", "CLICKAna Silva"],
     ["live-confirm", "v-cmd-confirm", "Press Return?say yes ·F2·esc"],
     ["live-pick", "v-cmd-pick", "Which one?say its number"],
@@ -1888,12 +1906,12 @@ test.describe("overlay", () => {
         await expect(pill(page).locator("canvas.wave.on")).toHaveCount(1);
       }
       await page.screenshot({ path: test.info().outputPath(`overlay-${state}.png`) });
-      if (state.startsWith("live") || state.startsWith("cmd-c") || state === "cmd-pick") await shot(page, `overlay-${state}`);
+      if (state.startsWith("live") || state.startsWith("cmd-c") || state === "cmd-pick") await shot(page, `overlay-${state.replace("&", "-")}`);
     });
   test("live session: the queue shows one dot per action; the pill stays 272 px while words arrive", async ({ page }) => {
     await page.goto("/overlay?state=live-acting");
     await expect(pill(page).getByLabel("2 queued")).toBeVisible();
-    await page.goto("/overlay?state=live");
+    await page.goto("/overlay?state=live&fast");
     await expect(pill(page)).toHaveClass(/\bv-cmd-live\b/);
     await expect(pill(page).getByLabel("1 queued")).toBeVisible();
     await page.waitForTimeout(400);
@@ -1921,7 +1939,7 @@ test.describe("overlay", () => {
         if (h && window.__seen.heard.at(-1) !== h) window.__seen.heard.push(h);
       }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
     });
-    await page.goto("/overlay?state=live-session");
+    await page.goto("/overlay?state=live-session&fast");
     await page.waitForFunction(() => window.__seen.views.includes("v-cmd-listening"));
     await expect(pill(page)).toHaveClass(/\bv-idle\b/, { timeout: 12000 });
     const seen = await page.evaluate(() => window.__seen);

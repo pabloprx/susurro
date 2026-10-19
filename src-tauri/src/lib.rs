@@ -9,6 +9,7 @@ pub mod command;
 pub mod contract;
 pub mod db;
 pub mod dictionary;
+pub mod glance;
 pub mod history;
 pub mod hotkey;
 pub mod jev;

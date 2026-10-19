@@ -197,7 +197,11 @@ pub enum Answer {
 
 /// The local yes / no words (VOICE_CONTROL_V2 2.2): 0 ms, $0. None = not a plain answer (ask the planner).
 pub fn yes_no(text: &str) -> Option<bool> {
-    const YES: [&str; 12] = ["sí", "si", "yes", "yeah", "yep", "confirm", "dale", "ok", "okay", "hazlo", "do it", "go"];
+    // "I confirm", "send it" (Pablo 2026-10-19: the send waits until he says "I confirm")
+    const YES: [&str; 20] = [
+        "sí", "si", "yes", "yeah", "yep", "confirm", "dale", "ok", "okay", "hazlo", "do it", "go", "i confirm", "confirmo", "confirmado", "send it",
+        "envíalo", "envialo", "mándalo", "mandalo",
+    ];
     const NO: [&str; 7] = ["no", "cancel", "stop", "para", "nope", "don't", "cancela"];
     let t = text.trim().trim_end_matches(['.', '!', ',', '?']).trim().to_lowercase();
     let t = t.trim_start_matches(['¡', '¿']);
@@ -437,6 +441,19 @@ pub fn return_asks(f: &Field) -> bool {
     let n = crate::text::norm(&f.name);
     let search = f.role == "AXSearchField" || ["search", "buscar", "busca", "find"].iter().any(|w| n.contains(w));
     chat && !search
+}
+
+/// The Return confirm in a chat or mail app says what it sends and where (Pablo 2026-10-19: "it does all the flow and
+/// confirms to me on the send part"). The draft's own "?" become "？": the pill cuts the question at the first "?".
+/// No readable draft = the plain question.
+pub fn send_question(f: &Field) -> String {
+    const PREVIEW: usize = 80;
+    let draft = f.value.as_deref().map(|v| v.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|v| !v.is_empty() && !f.secure);
+    let Some(d) = draft else { return "Press Return? Say yes · F11 · Esc".into() };
+    let d = d.replace('?', "？");
+    let d = if d.chars().count() > PREVIEW { format!("{}…", d.chars().take(PREVIEW).collect::<String>()) } else { d };
+    let at = if f.app.is_empty() { String::new() } else { format!(" in {}", f.app) };
+    format!("Send “{d}”{at}? Say yes · F11 · Esc")
 }
 
 /// A Return right after a jump palette (Slack / Discord / Claude cmd+k) opens what was typed; it sends nothing, so it
@@ -1506,8 +1523,8 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             let f = desk.focused();
             let enter = (code == 36 || code == 76) && return_asks(&f) && !after_palette(mem, &f);
             if enter || ((a.risky || trashes(code, flags, &f)) && cfg.confirm_risky) {
-                let (q, what) = if enter { ("Press Return? Say yes · F11 · Esc", "Return not pressed") } else { ("Do it? Say yes · F11 · Esc", "not done") };
-                if let Err(end) = r.confirm(desk, q, what) {
+                let (q, what) = if enter { (send_question(&f), "Return not pressed") } else { ("Do it? Say yes · F11 · Esc".to_string(), "not done") };
+                if let Err(end) = r.confirm(desk, &q, what) {
                     return end;
                 }
             }
@@ -3059,9 +3076,12 @@ mod tests {
         assert_eq!(statuses(&e), [CmdStatus::Done, CmdStatus::Done]);
         assert_eq!(d.waits, [Wait::Confirm]);
         assert_eq!(d.acts, [Act::Combo(36, 0)]);
-        assert!(d.steps.iter().any(|s| s.status == CmdStatus::Confirm && s.message.as_deref().is_some_and(|m| m.contains("Return"))));
+        let q: Vec<&str> = d.steps.iter().filter(|s| s.status == CmdStatus::Confirm).filter_map(|s| s.message.as_deref()).collect();
+        assert!(q.len() == 1 && q[0].starts_with("Send “hola” in "), "the confirm names what it sends: {q:?}");
         assert_eq!(yes_no("Sí."), Some(true));
         assert_eq!(yes_no("dale"), Some(true));
+        assert_eq!(yes_no("I confirm."), Some(true));
+        assert_eq!(yes_no("Envíalo."), Some(true));
         assert_eq!(yes_no("No."), Some(false));
         assert_eq!(yes_no("open slack"), None);
         // a terminal runs it at once (live log 2026-10-18: Return waited 10 s and stopped)
@@ -3095,6 +3115,17 @@ mod tests {
         for (field, want) in rows {
             assert_eq!(return_asks(&field), want, "{} {}", field.app, field.name);
         }
+    }
+
+    #[test]
+    fn send_question_names_the_draft_and_the_app() {
+        let f = |app: &str, value: Option<&str>, secure: bool| Field { app: app.into(), value: value.map(String::from), secure, ..Default::default() };
+        assert_eq!(send_question(&f("Telegram", Some("hola Juanito,\n¿vienes hoy?"), false)), "Send “hola Juanito, ¿vienes hoy？” in Telegram? Say yes · F11 · Esc");
+        assert_eq!(send_question(&f("Telegram", Some("   "), false)), "Press Return? Say yes · F11 · Esc");
+        assert_eq!(send_question(&f("Telegram", None, false)), "Press Return? Say yes · F11 · Esc");
+        assert_eq!(send_question(&f("Telegram", Some("secret"), true)), "Press Return? Say yes · F11 · Esc");
+        let long = send_question(&f("", Some(&"a".repeat(100)), false));
+        assert!(long.starts_with(&format!("Send “{}…”?", "a".repeat(80))), "{long}");
     }
 
     #[test]

@@ -20,8 +20,11 @@ CREATE TABLE dict(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL
 // v3: voice command rows next to dictations.
 "ALTER TABLE history ADD COLUMN kind TEXT NOT NULL DEFAULT 'dictation';",
 // v4: default dictionary words; `dictionary::seed` runs right after this step.
+"SELECT 1;",
+// v5: "PR" and "PRs"; `dictionary::seed_v5` runs right after this step.
 "SELECT 1;"];
 const SEED_STEP: usize = 3;
+const SEED_STEP_V5: usize = 4;
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -47,6 +50,9 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {}; COMMIT;", i + 1))?;
         if i == SEED_STEP {
             crate::dictionary::seed(conn);
+        }
+        if i == SEED_STEP_V5 {
+            crate::dictionary::seed_v5(conn);
         }
     }
     Ok(())
@@ -100,6 +106,20 @@ mod tests {
         c.execute("DELETE FROM dict WHERE text = 'Jev'", []).unwrap();
         migrate(&c).unwrap();
         assert!(!crate::dictionary::load(&c).unwrap().iter().any(|e| e.text == "Jev"));
+    }
+
+    #[test]
+    fn v5_seeds_pr_starred_on_a_v4_db() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("{} {} {} {} PRAGMA user_version = 4;", MIGRATIONS[0], MIGRATIONS[1], MIGRATIONS[2], MIGRATIONS[3])).unwrap();
+        migrate(&c).unwrap();
+        let es = crate::dictionary::load(&c).unwrap();
+        let pr = es.iter().find(|e| e.text == "PR").expect("PR seeded");
+        assert!(pr.starred && pr.aliases.contains(&"pe erre".to_string()), "{pr:?}");
+        assert!(es.iter().any(|e| e.text == "PRs"));
+        assert!(!es.iter().any(|e| e.text == "Jev"), "v4 seeds do not run again on a v4 db");
+        let d = crate::dictionary::Dictionary::new(es, Default::default());
+        assert_eq!(d.hints().terms.first().map(String::as_str), Some("PR"), "starred: first in the Whisper prompt");
     }
 
     #[test]
