@@ -563,6 +563,7 @@ impl Actor {
             grace_ms: self.grace.take(),
         };
         *CURRENT.lock().unwrap() = s.clone();
+        write_status(&self.state().data_dir, &s, self.last_text.as_deref());
         let _ = self.app.emit("session_state", s);
     }
 
@@ -1475,6 +1476,12 @@ impl Actor {
     fn tick(&mut self) -> bool {
         let now = Instant::now();
         self.pump();
+        if self.m.phase() == Phase::Idle && self.live.is_none() && self.recents.is_none() {
+            if let Some(text) = take_replay(&self.state().data_dir) {
+                log::info!("replay: {text:?}");
+                self.inject(text);
+            }
+        }
         if self.recents.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.close_recents(None);
         }
@@ -1513,6 +1520,28 @@ pub enum Ping {
 }
 
 /// The pill shows ~300 px of text: first line, 80 chars.
+// ---------- status.json / replay.txt (the Claude desktop mod reads and writes these) ----------
+
+/// `{data_dir}/status.json`: the SessionState, the last transcript and a timestamp. Temp file + rename, so a reader
+/// never sees half a file. A failed write only logs: the file is a view, not state.
+fn write_status(data_dir: &std::path::Path, s: &SessionState, last_text: Option<&str>) {
+    let mut v = serde_json::to_value(s).unwrap_or_default();
+    v["at"] = history::now_ms().into();
+    v["last_text"] = last_text.into();
+    let tmp = data_dir.join("status.json.tmp");
+    if let Err(e) = std::fs::write(&tmp, v.to_string()).and_then(|_| std::fs::rename(&tmp, data_dir.join("status.json"))) {
+        log::warn!("status.json: {e}");
+    }
+}
+
+/// `{data_dir}/replay.txt`: a voice order to run as if heard (the mod's Replay button). Read once, then removed.
+fn take_replay(data_dir: &std::path::Path) -> Option<String> {
+    let p = data_dir.join("replay.txt");
+    let text = std::fs::read_to_string(&p).ok()?;
+    let _ = std::fs::remove_file(&p);
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
 fn short(e: &str) -> String {
     let l = e.lines().next().unwrap_or(e);
     if l.chars().count() > 80 { format!("{}…", l.chars().take(79).collect::<String>()) } else { l.to_string() }
@@ -1556,6 +1585,23 @@ pub fn toast_action(state: State<'_, AppState>, toast_id: String, action_id: Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_file_and_replay_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("susurro-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = crate::contract::SessionState { phase: crate::contract::Phase::Acting, started_at: None, device: None, app: None, message: None, command: true, grace_ms: None };
+        super::write_status(&dir, &s, Some("hola"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap()).unwrap();
+        assert_eq!((v["phase"].as_str(), v["command"].as_bool(), v["last_text"].as_str()), (Some("acting"), Some(true), Some("hola")));
+        assert!(v["at"].as_i64().unwrap() > 0);
+
+        assert_eq!(super::take_replay(&dir), None, "no file");
+        std::fs::write(dir.join("replay.txt"), "  Open Edge.\n").unwrap();
+        assert_eq!(super::take_replay(&dir).as_deref(), Some("Open Edge."));
+        assert!(!dir.join("replay.txt").exists(), "read once");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
