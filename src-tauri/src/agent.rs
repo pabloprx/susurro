@@ -57,6 +57,10 @@ const LEDGER_STEPS: usize = 8;
 pub const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 /// After an action, before the screen is read again (exec's own settle already covers a click).
 const AFTER_MS: u64 = 120;
+/// Screenshots a warm conversation carries before it is retired for a fresh one (the ledger carries the orders).
+/// Every call re-reads the whole conversation: Pablo's session 2026-10-19 read ~141k cached tokens per call once the
+/// computer-use screenshots piled up.
+pub const IMAGES_MAX: u32 = 12;
 /// Actions one `steps` call takes (OSWorld-Human: grouping the actions on one screen halves the model calls).
 const STEPS_MAX: usize = 8;
 
@@ -578,13 +582,15 @@ pub struct Agent<'a, 'b> {
     pub vision: bool,
     /// Computer use: the screen with the order's first message.
     pub first_image: Option<Vec<u8>>,
+    /// Screenshots this order sent the model (the first one included).
+    pub images: u32,
 }
 
 impl<'a, 'b> Agent<'a, 'b> {
     pub fn new(task: &str, confirm_risky: bool, ask: &'a mut Ask<'b>, desk: &'a mut dyn Desk, mem: &'a mut Memory) -> Self {
         // the agent picks its own targets: no "Which one?" per click
         let cfg = Cfg { confirm_risky, choose: false, max: STEP_CAP };
-        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false, first_tool: None, seen: None, shown: vec![], vision: false, first_image: None }
+        Agent { cfg, task: task.into(), ask, desk, mem, step: 0, calls: 0, shot: None, done: None, capped: false, did: vec![], log: vec![], took_over: false, first_tool: None, seen: None, shown: vec![], vision: false, first_image: None, images: 0 }
     }
 
     /// A pill line between actions.
@@ -657,6 +663,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         if self.vision && out.image.is_none() && !["screenshot", "done"].contains(&name) && !self.desk.aborted() && !self.took_over {
             out.image = self.snap();
         }
+        self.images += out.image.is_some() as u32;
         // an action that finishes the order ends it now (no done call, no round trip)
         if let Some(d) = args["done"].as_str().filter(|_| !out.error && name != "done") {
             self.done = Some(d.to_string());
@@ -1338,6 +1345,8 @@ struct Warm {
     shown: Vec<u32>,
     /// The newest ledger order this conversation knows (it ran it, or got it in a message): 0 = none.
     known: i64,
+    /// Screenshots in this conversation: past IMAGES_MAX it is retired.
+    images: u32,
 }
 
 impl Drop for Warm {
@@ -1383,7 +1392,7 @@ impl Warm {
         let stdin = child.stdin.take().unwrap();
         log::info!("agent: claude started (pid {}, {}{})", child.id(), o.model, if o.vision { ", computer use" } else { "" });
         reaper();
-        Ok(Warm { bin: bin.into(), model: o.model.clone(), vision: o.vision, child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![], known: 0 })
+        Ok(Warm { bin: bin.into(), model: o.model.clone(), vision: o.vision, child, stdin, rx, _srv: srv, sent: 0, results: 0, last: Instant::now(), seen: None, shown: vec![], known: 0, images: 0 })
     }
 
     /// Reads what came between two orders (a late result, a tool call after done). false = the process is gone.
@@ -1609,7 +1618,12 @@ fn run_claude(bin: &Path, first: &str, past: &[Order], at: i64, o: &Opts, ag: &m
     log::info!("{line}");
     #[cfg(test)]
     println!("{line}");
-    if keep && !result.as_ref().is_some_and(|r| r.0) {
+    w.images += ag.images + ag.first_image.is_some() as u32;
+    let full = w.images > IMAGES_MAX;
+    if full {
+        log::info!("agent: claude pid {} carries {} screenshots: a fresh conversation for the next order", w.child.id(), w.images);
+    }
+    if keep && !full && !result.as_ref().is_some_and(|r| r.0) {
         (w.seen, w.shown) = (ag.seen.clone(), ag.shown.clone());
         // no tool call: the fallback may take the order, and its actions reach this conversation with the next one
         w.known = if ag.calls > 0 { at } else { past.last().map_or(w.known, |p| p.at.max(w.known)) };
@@ -1617,6 +1631,9 @@ fn run_claude(bin: &Path, first: &str, past: &[Order], at: i64, o: &Opts, ag: &m
     } else {
         release(bin);
         drop(w);
+        if full {
+            prewarm(o.clone()); // its start overlaps the time until the next order
+        }
     }
     // a prose answer with no tool call ("hola") is an answer, not a failure
     if ag.calls == 0 && !ag.desk.aborted() && why.is_none() && !matches!(result, Some((false, _))) {
@@ -2039,6 +2056,10 @@ mod tests {
         assert!(!ag.call("key", &json!({ "combo": "cmd+t" })).image.is_none());
         assert!(!ag.call("type", &json!({ "text": "hola" })).error);
         assert!(!ag.call("scroll", &json!({ "dir": "down" })).error);
+        assert_eq!(ag.images, 6, "every screenshot sent counts toward retiring the conversation");
+        let b = ag.call("steps", &json!({ "steps": [{ "tool": "key", "args": { "combo": "cmd+l" } }, { "tool": "type", "args": { "text": "x.com" } }] }));
+        assert!(!b.error && b.image.is_some());
+        assert_eq!(ag.images, 7, "one screenshot for the whole steps call");
         drop(ag);
         let drawn: Vec<_> = d.steps.iter().filter(|st| st.status == CmdStatus::Marks).map(|st| st.instruction.clone()).collect();
         assert!(drawn.is_empty(), "no numbers drawn on screen: {drawn:?}");

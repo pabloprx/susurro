@@ -1502,9 +1502,10 @@ pub fn exec(a: &Action, step: u32, order: u32, cfg: &Cfg, ask: &mut Ask, desk: &
             if crate::paste::blocked_combo(code, flags) {
                 return r.fail(desk, CmdStatus::Blocked, &format!("{keys} is blocked for voice control"));
             }
-            // Return sends in chat and mail apps, whatever the planner says; elsewhere it runs at once.
+            // Return sends in chat and mail apps, whatever the planner says; elsewhere it runs at once. shift+return
+            // is a new line in those composers: no confirm (Pablo's log 2026-10-19: it timed out, the agent retried).
             let f = desk.focused();
-            let enter = (code == 36 || code == 76) && return_asks(&f) && !after_palette(mem, &f);
+            let enter = (code == 36 || code == 76) && flags & crate::paste::SHIFT == 0 && return_asks(&f) && !after_palette(mem, &f);
             if enter || ((a.risky || trashes(code, flags, &f)) && cfg.confirm_risky) {
                 let (q, what) = if enter { ("Press Return? Say yes · F11 · Esc", "Return not pressed") } else { ("Do it? Say yes · F11 · Esc", "not done") };
                 if let Err(end) = r.confirm(desk, q, what) {
@@ -3064,6 +3065,12 @@ mod tests {
         assert_eq!(yes_no("dale"), Some(true));
         assert_eq!(yes_no("No."), Some(false));
         assert_eq!(yes_no("open slack"), None);
+        // shift+return is a new line in the composer: no confirm
+        let (mut d, mut mem) = (slack(), Memory::new());
+        let e = run_all(&[key("shift+return")], &mut d, &mut mem);
+        assert_eq!(statuses(&e), [CmdStatus::Done]);
+        assert!(d.waits.is_empty());
+        assert_eq!(d.acts, [Act::Combo(36, crate::paste::SHIFT)]);
         // a terminal runs it at once (live log 2026-10-18: Return waited 10 s and stopped)
         let (mut d, mut mem) = (ghostty(), Memory::new());
         let e = run_all(&[typ("ls", None), key("return")], &mut d, &mut mem);
