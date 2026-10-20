@@ -1,6 +1,58 @@
 # susurro
 
-System-wide voice dictation for macOS. Plan: `PLAN.md`. UI spec: `DESIGN.md`.
+System-wide voice dictation for macOS: hold a key, speak, and the text is pasted into whatever app you are in. It also has an optional voice-control mode that drives your Mac by voice. Plan: `PLAN.md`. UI spec: `DESIGN.md`.
+
+## Requirements
+
+- macOS 11 or later. Apple Silicon is recommended (local Whisper runs on Metal).
+- Xcode Command Line Tools: `xcode-select --install`
+- Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- Bun and CMake (CMake builds whisper.cpp): `brew install oven-sh/bun/bun cmake`
+
+## Install (build from source)
+
+```sh
+git clone https://github.com/pabloprx/susurro && cd susurro
+./install.sh
+```
+
+`install.sh` builds the release app, signs it, copies it to `/Applications/susurro.app` and opens it. The first build takes several minutes. Run it again to update after a `git pull`; `./install.sh --fresh` wipes settings, history, keys and permission grants first.
+
+### Signing
+
+macOS ties the permission grants to the app's signature. `install.sh` picks, in order: `SUSURRO_SIGNING_IDENTITY`, the identity in `src-tauri/tauri.conf.json` if your Mac has it, your first "Apple Development" identity, or an ad hoc signature.
+
+- With an Apple Development identity, grants survive rebuilds. A free one works: sign in to Xcode with your Apple ID (Xcode > Settings > Accounts > Manage Certificates > +). List yours with `security find-identity -v -p codesigning`.
+- Ad hoc also works, but macOS asks for the permissions again after every rebuild.
+
+## First run
+
+Onboarding walks you through these permissions (System Settings > Privacy & Security):
+
+| Permission | Why |
+| --- | --- |
+| Microphone | Record while you hold the key. |
+| Accessibility | Paste the text (Cmd+V) into the focused app. Without it the text stays on the clipboard. |
+| Input Monitoring | The global hotkeys. macOS may ask you to relaunch susurro after granting it. |
+| Screen Recording | Voice control only: read the screen to find what to click. |
+| Automation | Voice control only: read and click links in your browser. |
+
+Onboarding also downloads a small Whisper model (60 MB) to start right away, then the recommended one (about 575 MB) in the background. Switch models in Providers. Models, settings, history and keys live in `~/Library/Application Support/app.susurro.desktop/`.
+
+Default keys: hold **F1** to dictate, double-tap for hands-free, **Ctrl+F1** for recent dictations. Change them in Shortcuts.
+
+## API keys (all optional)
+
+Dictation works fully offline with local Whisper; no key is needed. Keys unlock cloud providers, entered in the Providers screen:
+
+| Key | Unlocks | Get one |
+| --- | --- | --- |
+| OpenRouter | Cloud transcription (MAI-Transcribe), LLM text cleanup, the voice-control planner | openrouter.ai/keys |
+| ElevenLabs | Scribe transcription, including realtime | elevenlabs.io (Developers > API keys) |
+| OpenAI | OpenAI realtime transcription | platform.openai.com/api-keys |
+| Local STT / LLM | Your own OpenAI-compatible server (LM Studio, llama.cpp) | none |
+
+The voice agent (Voice Control > Agent mode) runs your local [Claude Code](https://claude.com/claude-code) CLI (`claude -p`) under your own Claude login; no Anthropic API key is stored in susurro. Set `SUSURRO_CLAUDE` if `claude` is not in `~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin`.
 
 ## Dev commands
 

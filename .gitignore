@@ -14,3 +14,8 @@ playwright-report/
 CLAUDE.local.md
 .claude/worktrees/
 scripts/e2e/lib/countdown-bin
+
+# Local secrets
+.env
+.env.*
+keys.json
