@@ -8,6 +8,7 @@
 // No router, no store: the command_step + command_live listeners, like the pill.
 import { useEffect, useState, type CSSProperties } from "react";
 import { api, isTauri, on, type CommandStep, type LiveState, type Mark, type PtRect, type Settings } from "../lib/api";
+import type { Glance } from "../lib/contract.gen";
 import { isPick, keysOf, opOf, pendingQuestion, VERB } from "../lib/format";
 import "../styles/tokens.css";
 import "../styles/marks.css";
@@ -136,18 +137,60 @@ function Brackets({ r, d, warn, linger }: { r: PtRect; d: PtRect; warn: boolean;
 /** Top-center card: step counter + verb + instruction + Esc, and below it the pick list or the confirm question. */
 const LIVE_VERB: Partial<Record<CommandStep["status"], string>> = { marks: "LOOKING", pick: "WHICH ONE?", thinking: "PLANNING", queued: "NEXT", done: "DONE" };
 
-/** Live session, before its first step: what it hears and what is queued. */
+/** Live session, before its first step: one panel on the right (Pablo 2026-10-19: "the header doesn't help, and what I
+ *  said is at the bottom, not related"): what is on screen (glance.rs, agent mode), what it hears, what is queued. */
 function LiveHud({ live }: { live: LiveState }) {
+  const g = live.glance;
   return (
     <div className="hud live" role="status" aria-live="polite">
       <div className="hud-row">
         <span className="hud-step">LIVE</span>
         <span className="hud-verb">LISTENING</span>
+        {g?.app && (
+          <span className="hud-what glance-app">
+            <b>{g.app}</b>
+            {g.window && g.window !== g.app && <span className="glance-window"> · {g.window}</span>}
+          </span>
+        )}
         <span className="hud-esc">
           <kbd>esc</kbd> stops
         </span>
       </div>
+      {g && <OnScreen g={g} />}
       <Stream live={live} />
+    </div>
+  );
+}
+
+/** What is on screen: the summary, the focus, a draft, the main items. Rust drops it once an order runs. */
+function OnScreen({ g }: { g: Glance }) {
+  return (
+    <div className="glance">
+      <p className={`glance-summary${g.summary ? "" : " pending"}`}>{g.summary || "Looking at the screen…"}</p>
+      {g.focus && (
+        <div className="hud-line">
+          <span className="hud-k">FOCUS</span>
+          <span className="hud-v">{g.focus}</span>
+        </div>
+      )}
+      {g.draft && (
+        <div className="hud-line">
+          <span className="hud-k">DRAFT</span>
+          <span className="hud-v">“{g.draft}”</span>
+        </div>
+      )}
+      {g.items.length > 0 && (
+        <div className="hud-line">
+          <span className="hud-k">SEE</span>
+          <span className="hud-q-list">
+            {g.items.map((it) => (
+              <span key={it} className="q-chip">
+                {it}
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

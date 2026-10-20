@@ -79,12 +79,16 @@ type Step = CommandStep & { at: number };
 /** A live session (VOICE_CONTROL_V2 1): on, or still draining its queue after the key went up. */
 const isLive = (l: LiveState | null): l is LiveState => !!l && (l.on || l.queue.length > 0);
 
-function viewOf(s: SessionState, step: Step | null, live: LiveState | null): View {
+/** Agent mode: the marks window's panel on the right shows the heard words with the screen context (Pablo
+ *  2026-10-19: "what I said at the bottom is not related to the rest"), so the pill does not repeat them. */
+const wordsInPanel = (s: Settings | null) => !!s && s.command.agent && !s.command.fast_mode;
+
+function viewOf(s: SessionState, step: Step | null, live: LiveState | null, panel = false): View {
   if (isLive(live)) {
     if (isPick(live.pending) || step?.status === "pick") return "cmd-pick";
     if (live.pending || step?.status === "confirm") return "cmd-confirm";
     if (live.paused) return "cmd-paused";
-    if (live.buffer.trim()) return "cmd-live";
+    if (live.buffer.trim() && !panel) return "cmd-live";
     if (step && CMD_LIVE[step.status]) return CMD_LIVE[step.status]!;
     return "cmd-listening";
   }
@@ -213,7 +217,7 @@ export default function Overlay() {
 
   // session -> shown view, with the holds for done / copied / error
   useEffect(() => {
-    const target = viewOf(sess, step, live);
+    const target = viewOf(sess, step, live, wordsInPanel(settings));
     const hold = HOLD[shown.view];
     if (target === "idle" && hold && shown.view !== "idle") {
       const left = shown.since + hold - Date.now();

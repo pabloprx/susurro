@@ -593,14 +593,31 @@ pub const SEEDS: &[(&str, &[&str])] = &[
     ("cachai", &[]),
 ];
 
+/// Default words added by db v5 (Pablo 2026-10-19: "PR, PR, PR... the transcriber got it wrong every time"): "PR"
+/// (pull request) as Whisper hears it said in Spanish ("pe erre") and in English ("pee are", "Pierre"). Starred, so it
+/// leads the Whisper prompt and the keyterms (the newest first among starred words: "PR" goes in last).
+pub const SEEDS_V5: &[(&str, &[&str])] = &[
+    ("PRs", &["pe erres", "pi ars", "piars", "pee ars"]),
+    ("PR", &["pe erre", "pe ere", "pi ar", "pi are", "piar", "pee are", "pee ar", "Pierre"]),
+];
+
 pub fn seed_input(text: &str, aliases: &[&str]) -> DictEntryInput {
     DictEntryInput { id: None, kind: DictKind::Word, text: text.into(), aliases: aliases.iter().map(|a| a.to_string()).collect(), expansion: None, exact_only: false, starred: false }
 }
 
 /// Adds the SEEDS that do not clash with an entry (validate refuses a text or correction already in use).
 pub fn seed(conn: &Connection) {
-    for (text, aliases) in SEEDS {
-        if let Err(e) = upsert(conn, &seed_input(text, aliases)) {
+    seed_with(conn, SEEDS, false);
+}
+
+/// db v5: SEEDS_V5, starred.
+pub fn seed_v5(conn: &Connection) {
+    seed_with(conn, SEEDS_V5, true);
+}
+
+fn seed_with(conn: &Connection, list: &[(&str, &[&str])], starred: bool) {
+    for (text, aliases) in list {
+        if let Err(e) = upsert(conn, &DictEntryInput { starred, ..seed_input(text, aliases) }) {
             log::info!("dictionary seed {text} skipped: {e}");
         }
     }
@@ -684,6 +701,26 @@ mod tests {
     }
     fn dict() -> Dictionary {
         Dictionary::new(sample(), DictOpts { fuzzy: true })
+    }
+
+    #[test]
+    fn pr_seeds_fix_the_spoken_forms() {
+        let es: Vec<DictEntry> = SEEDS_V5.iter().enumerate().map(|(i, (t, a))| w(i as i64 + 1, t, a)).collect();
+        let d = Dictionary::new(es, DictOpts { fuzzy: true, ..Default::default() });
+        for (heard, want) in [
+            ("Abre el pe erre de susurro", "Abre el PR de susurro"),
+            ("revisa el pr que mandé", "revisa el PR que mandé"),
+            ("I opened a pee are for it", "I opened a PR for it"),
+            ("merge the Pierre please", "merge the PR please"),
+            ("check the P.R.", "check the PR."),
+            ("los pi ars de hoy", "los PRs de hoy"),
+            ("tengo dos pe erres abiertos", "tengo dos PRs abiertos"),
+            // other words stay
+            ("the price is right", "the price is right"),
+            ("vamos a pie", "vamos a pie"),
+        ] {
+            assert_eq!(d.apply(heard).text, want, "{heard}");
+        }
     }
 
     #[test]

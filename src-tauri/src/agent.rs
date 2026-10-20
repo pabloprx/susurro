@@ -63,6 +63,8 @@ const AFTER_MS: u64 = 120;
 pub const IMAGES_MAX: u32 = 12;
 /// Actions one `steps` call takes (OSWorld-Human: grouping the actions on one screen halves the model calls).
 const STEPS_MAX: usize = 8;
+/// read_text answers with at most this many characters of each part (the field, the window).
+const TEXT_MAX: usize = 12_000;
 
 pub const SYSTEM: &str = "You control the user's Mac with the susurro tools, and only with them. The user talks; each \
 user message is one spoken order plus the screen as it is now: the front app, the window, the focus and the numbered \
@@ -97,6 +99,10 @@ act on the real mouse. \
 Earlier orders in this conversation, and the ones listed under \"Done earlier in this session\", are done: never \
 repeat their actions (a stopped order stopped after the actions listed), unless the user asks again; use them for \
 \"it\", \"again\", \"the same\", \"continue\". \
+To copy a part of the text on screen (\"copy from X to the first period\", \"paste that paragraph in Slack\"): \
+read_text, take exactly that part of its answer, then copy_text it (it stays on the user's clipboard) or type it \
+where the order says to paste it; never copy text by retyping it from a screenshot. \
+The dark susurro panel at the top right of the screen is susurro's own overlay: ignore it and never click it. \
 Risky actions (send, delete, buy) ask the user first; if a tool says the user said no, stop. Never type passwords. \
 When the last action of an order finishes it, give that action done: \"<one short sentence>\" (it saves a round \
 trip); else, when the order is done or cannot be done, call done. The sentence is in the language of the order.";
@@ -126,6 +132,10 @@ In Finder (and in an Open or Save dialog) go to a folder with cmd+shift+g, type 
 If a page is still loading in the screenshot, call wait. \
 To draw, move or resize (a paint app, a slider, a file onto a folder) use drag with a path in screenshot pixels. \
 Earlier orders in this conversation are done: never repeat them; use them for \"it\", \"again\", \"the same\". \
+To copy a part of the text on screen (\"copy from X to the first period\", \"paste that paragraph in Slack\"): \
+read_text, take exactly that part of its answer, then copy_text it (it stays on the user's clipboard) or type it \
+where the order says to paste it; never copy text by retyping it from a screenshot. \
+The dark susurro panel at the top right of the screen is susurro's own overlay: ignore it and never click it. \
 Risky actions (send, delete, buy) ask the user first; if a tool says the user said no, stop. Never type passwords. \
 When the last action of an order finishes it, give that action done: \"<one short sentence>\" (it saves a round \
 trip); else, when the order is done or cannot be done, call done. The sentence is in the language of the order.";
@@ -294,6 +304,11 @@ pub fn tools() -> Value {
             x["inputSchema"]["properties"]["done"] = done.clone();
         }
     }
+    // copying a described part of the screen's text (Pablo 2026-10-19: "copy this section, from X to the first dot,
+    // and paste it"): exact words from AX + on-device OCR, not retyped from a screenshot
+    let v = t.as_array_mut().unwrap();
+    v.push(json!({ "name": "read_text", "description": "The text of the front window, top to bottom (on-device OCR), and the full text of the focused field. To copy or quote a part of what is on screen exactly.", "inputSchema": none }));
+    v.push(json!({ "name": "copy_text", "description": "Put this text on the user's clipboard (it stays there; cmd+v pastes it). Take it from read_text to copy a part of the screen exactly.", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "done": done }, "required": ["text"] } }));
     t
 }
 
@@ -552,6 +567,33 @@ fn frame(s: &Screen, vision: bool) -> PtRect {
     if s.window.w > 0.0 && !vision { s.window } else { s.display }
 }
 
+/// The first `max` characters of `s`, "…" when cut.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
+}
+
+/// Vision lines in reading order: rows top to bottom (a line whose top is within half a line of the row's first is in
+/// that row), each row left to right.
+pub fn ocr_text(lines: &[crate::ocr::Line]) -> String {
+    // Vision boxes: origin bottom-left, so the top is 1 - y - h
+    let mut v: Vec<(f64, f64, f64, &str)> = lines.iter().map(|(t, (x, y, _, h))| (1.0 - y - h, *x, *h, t.trim())).filter(|l| !l.3.is_empty()).collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut rows: Vec<Vec<(f64, f64, f64, &str)>> = vec![];
+    for l in v {
+        match rows.last_mut() {
+            Some(r) if (l.0 - r[0].0).abs() < r[0].2.min(l.2) / 2.0 => r.push(l),
+            _ => rows.push(vec![l]),
+        }
+    }
+    rows.iter_mut()
+        .flat_map(|r| {
+            r.sort_by(|a, b| a.1.total_cmp(&b.1));
+            r.iter().map(|l| l.3)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One order's tool handlers over the executor.
 pub struct Agent<'a, 'b> {
     cfg: Cfg,
@@ -660,7 +702,7 @@ impl<'a, 'b> Agent<'a, 'b> {
         };
         let mut out = self.tool(name, args, mods);
         // computer use: every answer shows the screen after it (no extra screenshot round trip)
-        if self.vision && out.image.is_none() && !["screenshot", "done"].contains(&name) && !self.desk.aborted() && !self.took_over {
+        if self.vision && out.image.is_none() && !["screenshot", "done", "read_text", "copy_text"].contains(&name) && !self.desk.aborted() && !self.took_over {
             out.image = self.snap();
         }
         self.images += out.image.is_some() as u32;
@@ -730,6 +772,8 @@ impl<'a, 'b> Agent<'a, 'b> {
                 }
                 self.act(Action { op: "open_app".into(), app: Some(named), ..Default::default() })
             }
+            "read_text" => self.read_text(),
+            "copy_text" => self.copy_text(&s("text").unwrap_or_default()),
             n => Out::err(format!("unknown tool {n}")),
         }
     }
@@ -778,6 +822,45 @@ impl<'a, 'b> Agent<'a, 'b> {
             last.text = format!("{}\n{}", done.join("\n"), last.text);
         }
         last
+    }
+
+    /// `read_text`: the focused field's text and the front window's OCR lines in reading order. Secure fields are
+    /// never read (Field.value is None for them).
+    fn read_text(&mut self) -> Out {
+        let scr = match self.desk.read() {
+            Ok(s) => s,
+            Err(e) if e == "accessibility" => return Out::err("susurro has no Accessibility permission. Call done."),
+            Err(e) => return Out::err(e),
+        };
+        let win = frame(&scr, false);
+        let f = self.desk.focused();
+        let mut parts = vec![];
+        if let Some(v) = f.value.as_deref().filter(|v| !f.secure && !v.trim().is_empty()) {
+            let what = if f.name.is_empty() { f.role.as_str() } else { f.name.as_str() };
+            parts.push(format!("The focused field ({what}) holds:\n{}", clip(v, TEXT_MAX)));
+        }
+        match self.desk.ocr(win) {
+            Ok(lines) if !lines.is_empty() => parts.push(format!("The text on the window ({}), top to bottom:\n{}", scr.app, clip(&ocr_text(&lines), TEXT_MAX))),
+            Ok(_) => parts.push("No text found on the window.".into()),
+            Err(e) => parts.push(format!("The window could not be read as text: {e:#}.")),
+        }
+        self.shot = Some(scr);
+        Out::ok(parts.join("\n\n"))
+    }
+
+    /// `copy_text`: the text stays on the clipboard (no restore), like a cmd+c.
+    fn copy_text(&mut self, text: &str) -> Out {
+        if text.is_empty() {
+            return Out::err("copy_text needs the text: take it from read_text.");
+        }
+        if !self.next_step() {
+            return Out::err("Step cap reached. Call done.");
+        }
+        self.desk.set_clipboard(text);
+        let what = format!("copied “{}”", clip(text, 60));
+        self.did.push(what.clone());
+        self.remember(&what, true);
+        Out::ok(format!("Copied {} characters to the clipboard: cmd+v pastes them.", text.chars().count()))
     }
 
     /// "[12] Send (button, main)": the target text the executor grounds (planner style), else the bare number.
@@ -1740,6 +1823,11 @@ mod tests {
         pub paused: bool,
         /// Every sleep, in ms.
         pub slept: u64,
+        /// What OCR reads, and the focused field's text.
+        pub lines: Vec<crate::ocr::Line>,
+        pub value: Option<String>,
+        /// What set_clipboard left.
+        pub clip: Option<String>,
     }
 
     fn el(id: u32, name: &str, role: &str) -> El {
@@ -1764,7 +1852,7 @@ mod tests {
             Ok(Screen { app: self.app.clone(), display, scale: 2.0, els: self.els.clone(), window, title: "untitled".into(), ..Default::default() })
         }
         fn focused(&mut self) -> Field {
-            Field { app: self.app.clone(), role: "AXTextField".into(), name: "Search".into(), secure: self.secure, ..Default::default() }
+            Field { app: self.app.clone(), role: "AXTextField".into(), name: "Search".into(), secure: self.secure, value: self.value.clone(), ..Default::default() }
         }
         fn set_selection(&mut self, _: usize, _: usize) -> bool {
             false
@@ -1772,7 +1860,12 @@ mod tests {
         fn clipboard(&mut self) -> (Option<String>, isize) {
             (None, 0)
         }
-        fn set_clipboard(&mut self, _: &str) {}
+        fn set_clipboard(&mut self, s: &str) {
+            self.clip = Some(s.into());
+        }
+        fn ocr(&mut self, _: PtRect) -> anyhow::Result<Vec<crate::ocr::Line>> {
+            Ok(self.lines.clone())
+        }
         fn type_text(&mut self, s: &str) -> anyhow::Result<String> {
             self.typed.push(s.into());
             Ok(s.into())
@@ -1819,6 +1912,40 @@ mod tests {
 
     fn no_jev(_: &Value, _: &Value) -> anyhow::Result<crate::jev::Reply> {
         anyhow::bail!("no Jev in agent tests")
+    }
+
+    #[test]
+    fn read_text_then_copy_a_part_of_it() {
+        let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
+        // two columns on one row, Vision boxes (origin bottom-left): the left one first, then the line below
+        d.lines = vec![
+            ("Pagar antes del viernes.".into(), (0.1, 0.70, 0.3, 0.03)),
+            ("Hola Juan, te mando la factura. Saludos".into(), (0.1, 0.80, 0.5, 0.03)),
+            ("Inbox".into(), (0.7, 0.805, 0.1, 0.03)),
+        ];
+        d.value = Some("borrador".into());
+        let mut ag = Agent::new("copia desde Hola hasta el primer punto", true, &mut ask, &mut d, &mut mem);
+        let r = ag.call("read_text", &json!({}));
+        assert!(!r.error && r.image.is_none(), "{}", r.text);
+        assert!(r.text.contains("(Search) holds:\nborrador"), "{}", r.text);
+        assert!(r.text.contains("top to bottom:\nHola Juan, te mando la factura. Saludos\nInbox\nPagar antes del viernes."), "{}", r.text);
+        assert_eq!(ag.step, 0, "reading is not a step");
+        let r = ag.call("copy_text", &json!({ "text": "Hola Juan, te mando la factura.", "done": "Copiado." }));
+        assert!(!r.error, "{}", r.text);
+        assert_eq!(ag.done.as_deref(), Some("Copiado."));
+        assert!(ag.call("copy_text", &json!({ "text": "" })).error);
+        drop(ag);
+        assert_eq!(d.clip.as_deref(), Some("Hola Juan, te mando la factura."));
+    }
+
+    #[test]
+    fn read_text_never_reads_a_password_field() {
+        let (mut d, mut mem, mut ask) = (chat(), Memory::new(), no_jev);
+        (d.secure, d.value) = (true, Some("hunter2".into()));
+        let mut ag = Agent::new("lee", true, &mut ask, &mut d, &mut mem);
+        let r = ag.call("read_text", &json!({}));
+        assert!(!r.text.contains("hunter2"), "{}", r.text);
+        assert!(r.text.contains("No text found"), "{}", r.text);
     }
 
     #[test]
@@ -1891,7 +2018,7 @@ mod tests {
     fn schema_names_and_required() {
         let t = tools();
         let names: Vec<&str> = t.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["screenshot", "list_elements", "click", "double_click", "right_click", "mouse_move", "drag", "type", "key", "scroll", "open_app", "wait", "done", "steps"]);
+        assert_eq!(names, ["screenshot", "list_elements", "click", "double_click", "right_click", "mouse_move", "drag", "type", "key", "scroll", "open_app", "wait", "done", "steps", "read_text", "copy_text"]);
         for x in t.as_array().unwrap() {
             assert_eq!(x["inputSchema"]["type"], "object", "{}", x["name"]);
             assert!(x["description"].as_str().unwrap().len() > 10);
@@ -2295,7 +2422,7 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(post(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), true).0, 202);
         let v: Value = serde_json::from_str(&post(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), true).1).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 16);
         let v: Value = serde_json::from_str(&post(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "click", "arguments": { "mark": 2 } } }), true).1).unwrap();
         assert_eq!(v["id"], 3);
         assert_eq!(v["result"]["content"][0]["text"], "click {\"mark\":2}");
@@ -2480,7 +2607,7 @@ for line in sys.stdin:
         assert_eq!(d.acts, [Act::Click(Target::Mark(2))]);
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0]["model"], "google/gemini-3.5-flash-lite");
-        assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 16);
         assert_eq!(seen[0]["tools"][2]["function"]["name"], "click");
         assert!(seen[0]["messages"][1]["content"].as_str().unwrap().contains("[2] Send"), "the first message has the screen");
         // the second request carries the tool answer and the screenshot as a user image

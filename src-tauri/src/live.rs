@@ -57,6 +57,9 @@ static OWN_AT: AtomicI64 = AtomicI64::new(0);
 /// Pablo's input within this long after one of susurro's own events is susurro's.
 const OWN_MS: i64 = 300;
 
+/// Bumped at every session start and whenever an order runs: a late read or summary for an older card is dropped.
+static GLANCE_GEN: AtomicU32 = AtomicU32::new(0);
+
 /// The marks drawn on screen now (their numbers are what Pablo says). Set by every draw.
 static BOARD: Mutex<Vec<crate::ax::El>> = Mutex::new(Vec::new());
 /// The executor runs a step: only its own reads draw the marks (a pick list must not change under Pablo).
@@ -94,6 +97,56 @@ fn refresh_board(app: &AppHandle) {
     let Some(front) = crate::paste::target_app() else { return };
     if let Some(tree) = crate::ax::mac::read(front.pid) {
         draw_board(app, &crate::ax::collect(&tree.root, tree.window), tree.window);
+    }
+}
+
+/// Agent mode, F11 down: the screen-context card (glance.rs) on the right while Pablo talks, then its summary when
+/// there is an OpenRouter key. The screenshot for the summary is taken before the card shows, so it never shows it.
+#[cfg(target_os = "macos")]
+fn show_glance(app: AppHandle, key: String, cfg: CommandSettings) {
+    use crate::command::Desk;
+    let generation = GLANCE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let current = move || GLANCE_GEN.load(Ordering::SeqCst) == generation;
+    let spawned = std::thread::Builder::new().name("cmd-glance".into()).spawn(move || {
+        let mut desk = command::mac::Real::new(app.clone());
+        let Ok(scr) = desk.read() else { return };
+        let f = desk.focused();
+        let g = crate::glance::local(&scr.app, &scr.title, &f, &scr.els);
+        let win = if scr.window.w > 0.0 { scr.window } else { scr.display };
+        let jpeg = (!key.is_empty() && desk.screen_ok()).then(|| desk.snapshot(win, crate::glance::SUMMARY_PX).ok()).flatten();
+        if !current() {
+            return;
+        }
+        draw_board(&app, &scr.els, scr.window);
+        update(&app, |l| {
+            if l.on {
+                l.glance = Some(g.clone());
+            }
+        });
+        let Some(jpeg) = jpeg else { return };
+        let spanish = app.state::<AppState>().settings.read().unwrap().language == "es";
+        match crate::glance::summarize(crate::stt::OPENROUTER_BASE, &key, &cfg.agent_fallback, &jpeg, &g, spanish) {
+            Ok(t) if current() => update(&app, |l| {
+                if let Some(x) = l.glance.as_mut() {
+                    x.summary = Some(t);
+                }
+            }),
+            Ok(_) => {}
+            Err(e) => log::info!("live: no glance summary: {e:#}"),
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("live: glance thread: {e}");
+    }
+}
+
+/// An order runs: the card goes first, so the agent's first screenshot does not show it.
+fn drop_glance(app: &AppHandle) {
+    GLANCE_GEN.fetch_add(1, Ordering::SeqCst);
+    if LIVE.lock().unwrap().glance.is_some() {
+        update(app, |l| l.glance = None);
+        // the marks window repaints before the agent looks
+        std::thread::sleep(Duration::from_millis(80));
     }
 }
 
@@ -159,6 +212,19 @@ pub fn user_input(app: &AppHandle, hard: bool, click: Option<(f64, f64)>) {
     if pause || hide {
         update(app, |l| (l.took_over, l.paused) = (true, paused()));
     }
+}
+
+/// "don't do anything now, let me review" said alone (Pablo 2026-10-19): an order that does nothing, so the words
+/// never reach the agent as a task; the next order goes on in the same conversation.
+pub fn hold_word(text: &str) -> bool {
+    const W: [&str; 16] = [
+        "dont do anything", "dont do anything now", "dont do nothing", "dont do nothing now", "let me review", "let me review it",
+        "let me check", "no hagas nada", "no hagas nada ahora", "no hagas nada todavia", "dejame revisar", "dejame revisarlo",
+        "deja que lo revise", "espera que lo reviso", "hold on", "wait let me review",
+    ];
+    let t = crate::text::norm(text).replace(['\'', '’'], "");
+    let t = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+    W.contains(&t.as_str())
 }
 
 /// "continue" and friends: resume a paused queue without a new order.
@@ -740,6 +806,10 @@ pub fn start(app: AppHandle, key: String, cfg: CommandSettings, rate: u32) -> Ha
     update(&app, |l| *l = LiveState { on: true, ..Default::default() });
     #[cfg(target_os = "macos")]
     crate::platform::macos::watch_user_input(&app, true);
+    #[cfg(target_os = "macos")]
+    if cfg.agent && !cfg.fast_mode {
+        show_glance(app.clone(), key.clone(), cfg.clone());
+    }
     let (tx, rx) = mpsc::channel();
     let queue = Arc::new(Queue::default());
     let ctl = Arc::new(Ctl::default());
@@ -790,6 +860,11 @@ fn live_loop(
     #[cfg(not(target_os = "macos"))]
     let apps: Vec<String> = vec![];
     let mut planner = |text: &str, last: bool, pending: Option<&str>| -> anyhow::Result<Plan> {
+        // "let me review": nothing to do, and nothing for the agent to take as a task
+        if pending.is_none() && hold_word(text) {
+            log::info!("live: {text:?} = hold, nothing runs");
+            return Ok(Plan { complete: true, ..Default::default() });
+        }
         // "modo agente: <task>": the whole task goes to agent mode, no planner. Held for the next words until a pause.
         if let Some(p) = crate::agent::plan(text, last).filter(|_| cfg.agent && pending.is_none()) {
             log::info!("live: agent mode {:?}", p.actions.first().and_then(|a| a.text.as_deref()));
@@ -1160,6 +1235,7 @@ fn exec_loop(app: AppHandle, queue: Arc<Queue>, key: String, settings: CommandSe
                     continue;
                 }
                 step += 1;
+                drop_glance(&app);
                 let mut mem = MEMORY.lock().unwrap().clone();
                 if order != last_order {
                     last_order = order;
@@ -1832,6 +1908,15 @@ mod tests {
         let click = |t: &str| Action { op: "click".into(), target: Some(t.into()), ..Default::default() };
         assert!(search_click(&click("Buscar (combo box, main)")) && search_click(&click("[5] Search (search field, top)")) && search_click(&click("the search box")));
         assert!(!search_click(&click("Pablo (tú, disponible) (row, sidebar)")) && !search_click(&ty("search")));
+    }
+
+    #[test]
+    fn hold_words() {
+        for w in ["Don't do anything now.", "Let me review it.", "No hagas nada.", "Déjame revisar", "dont do nothing now"] {
+            assert!(hold_word(w), "{w}");
+        }
+        assert!(!hold_word("don't do anything in Slack, open Telegram"), "a real order goes on");
+        assert!(!hold_word("revisa el PR"));
     }
 
     #[test]

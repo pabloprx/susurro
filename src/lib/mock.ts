@@ -2,7 +2,7 @@
 // audio_level streams, device hot-plug, pipeline phases, model download progress, permission grants.
 // URL flags: ?onboarding (fresh install, onboarding flow), ?empty (fresh install, empty states), ?needscreen (the last
 // voice command needed Screen Recording), /marks?state=marks|aim|pick|confirm (voice-control marks window),
-// /overlay|/marks?state=live|live-acting|live-done|live-confirm|live-pick|live-paused|live-session (voice control v2),
+// /overlay|/marks?state=live|live-acting|live-done|live-confirm|live-pick|live-paused|live-glance|live-session (voice control v2),
 // /overlay?state=recents|recents-picked (the Ctrl+ptt list; 1-9, Cmd+1-9, Esc work in the page),
 // /overlay?state=cmd-listening|cmd-thinking|cmd-acting|cmd-pick|cmd-confirm|cmd-done|cmd-stopped|cmd-unsure|cmd-blocked|cmd-setup,
 // /overlay?state=idle|hover|listening|handsfree|warning|processing|done|copied|fixax|nofield|error|notice (freeze one pill state).
@@ -57,6 +57,8 @@ let settings: C.Settings = {
   command: { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14", planner_model: "openai/gpt-6-luna", auto_click: false, stt: null, agent: true, fast_mode: false, agent_model: "sonnet", agent_fallback: "google/gemini-3.5-flash-lite", agent_vision: true },
 };
 
+// ?fast: Fast mode (the planner) instead of agent mode; the live pill then shows the heard words itself
+if (new URLSearchParams(location.search).has("fast")) settings.command.fast_mode = true;
 let pillRect: C.PtRect | null = null;
 let keys: C.KeyStatus = { elevenlabs: false, openai: false, openrouter: !fresh, local_stt: false, local_llm: false };
 
@@ -845,7 +847,7 @@ async function command(instruction = "open my DM with Ana", risky = false) {
 }
 
 // ---------------- voice control v2: live session (VOICE_CONTROL_V2 1, 3) ----------------
-const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, paused: false, last_said: "", numbers: false };
+const LIVE_OFF: C.LiveState = { on: false, buffer: "", queue: [], pending: null, took_over: false, paused: false, last_said: "", numbers: false, glance: null };
 let liveNow: C.LiveState = LIVE_OFF;
 const live = (p: Partial<C.LiveState>) => mockEmit("command_live", (liveNow = { ...liveNow, on: true, ...p }));
 const ago = (ms: number) => T0 - ms;
@@ -870,6 +872,20 @@ const remember = (e: C.MemoryEntry) => (memory = [...memory, e].slice(-50));
 /** One frozen live state per name (?state= on /overlay and /marks). */
 const LIVE_STATES: Record<string, { live: Partial<C.LiveState>; step?: C.CommandStep }> = {
   live: { live: { buffer: "create a new tab and run the command", queue: ["⌘T"], last_said: "run the command" } },
+  "live-glance": {
+    live: {
+      buffer: "send this to",
+      last_said: "send this to",
+      glance: {
+        app: "Slack",
+        window: "Ana Silva (DM) - Acme",
+        focus: "Message to Ana Silva (text field)",
+        draft: "the trace is in the drive",
+        items: ["Ana Silva", "# design", "# engineering", "Maria Lopez", "Threads"],
+        summary: "A Slack DM with Ana Silva; your draft about the trace is not sent yet.",
+      },
+    },
+  },
   "live-acting": {
     live: { buffer: "", queue: ["type “hello there”", "⏎"], last_said: "and type hello there" },
     step: cmd("aim", { instruction: "open my DM with Ana", op: "click", action: "click", target: 27, marks: MARKS, order: 1 }),
