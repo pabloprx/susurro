@@ -348,7 +348,9 @@ pub fn watch_activations() {
 pub fn frontmost_app() -> Option<AppRef> {
     #[cfg(target_os = "macos")]
     return mac::frontmost_app();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux::frontmost_app();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     None
 }
 
@@ -402,7 +404,35 @@ pub fn paste_ex(text: &str, o: &PasteOpts, target: Option<&AppRef>) -> (PasteOut
         }
         (PasteOutcome::Pasted, text)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        use crate::platform::linux;
+        #[cfg(debug_assertions)]
+        if let Some(why) = crate::test_hooks::paste_blocked() {
+            log::warn!("test paste guard: {why}; not pasting {} chars", text.chars().count());
+            return (PasteOutcome::CopiedOnly, text.into());
+        }
+        let _ = target; // no reliable way to raise another app's window from here (Wayland forbids it)
+        let front = linux::frontmost_app();
+        let old = if o.restore_clipboard { linux::clipboard_text() } else { None };
+        if !linux::write_text(text) {
+            return (PasteOutcome::CopiedOnly, text.into());
+        }
+        // let the clipboard owner settle before the target app asks for it
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let shift = linux::is_terminal(front.as_ref().and_then(|f| f.bundle_id.as_deref()));
+        log::info!("paste: window {:?} (terminal: {shift})", front.as_ref().and_then(|f| f.bundle_id.as_deref()));
+        if !linux::key(linux::Key::Paste { shift }) {
+            // nothing can type here (no wtype/ydotool/xdotool): the text stays on the clipboard
+            return (PasteOutcome::CopiedOnly, text.into());
+        }
+        if let Some(old) = old.filter(|old| old != text) {
+            let bundle = front.as_ref().and_then(|f| f.bundle_id.as_deref());
+            linux::restore_later(text.to_string(), old, restore_delay(bundle, o.restore_delay_ms));
+        }
+        (PasteOutcome::Pasted, text.into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (o, target);
         (PasteOutcome::CopiedOnly, text.into())
@@ -416,6 +446,8 @@ pub fn press_enter() {
     }
     #[cfg(target_os = "macos")]
     mac::key(36, core_graphics::event::CGEventFlags::empty()); // kVK_Return
+    #[cfg(target_os = "linux")]
+    crate::platform::linux::key(crate::platform::linux::Key::Return);
 }
 
 /// `EventField::EVENT_SOURCE_USER_DATA` of every event susurro posts: the user-input monitor skips them.
@@ -536,7 +568,16 @@ pub fn clipboard() -> (Option<String>, isize) {
         let pb = mac::general();
         return (pb.stringForType(unsafe { objc2_app_kit::NSPasteboardTypeString }).map(|s| s.to_string()), pb.changeCount());
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        // no change counter on Linux: a hash of the text stands in for it (a copy of the same text reads as no copy)
+        use std::hash::{Hash, Hasher};
+        let t = crate::platform::linux::clipboard_text();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        t.hash(&mut h);
+        return (t, h.finish() as isize);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     (None, 0)
 }
 
@@ -544,7 +585,9 @@ pub fn clipboard() -> (Option<String>, isize) {
 pub fn copy(text: &str) {
     #[cfg(target_os = "macos")]
     mac::write_text(&mac::general(), text, false);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    crate::platform::linux::write_text(text);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = text;
 }
 
@@ -554,7 +597,9 @@ pub fn clipboard_text() -> Option<String> {
     return mac::general()
         .stringForType(unsafe { objc2_app_kit::NSPasteboardTypeString })
         .map(|s| s.to_string());
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux::clipboard_text();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     None
 }
 

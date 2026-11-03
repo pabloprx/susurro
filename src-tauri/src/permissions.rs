@@ -118,8 +118,24 @@ fn open(url: &str) {
 pub fn accessibility_trusted() -> bool {
     #[cfg(target_os = "macos")]
     return mac::accessibility();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux::can_type();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     false
+}
+
+/// Linux has no per-app grants for the mic or typing, so onboarding never waits here. Without a typing
+/// helper (wtype, ydotool or xdotool) dictations land on the clipboard, and spawn_watcher says so once.
+#[cfg(target_os = "linux")]
+fn linux_status() -> Permissions {
+    Permissions {
+        microphone: PermState::Granted,
+        accessibility: true,
+        input_monitoring: true,
+        fn_key_free: None,
+        needs_relaunch: false,
+        screen_recording: false,
+    }
 }
 
 /// Live status: every call asks TCC again (AXIsProcessTrusted, preflight, AV status). `with_fn` also runs
@@ -141,7 +157,9 @@ fn status(with_fn: bool) -> Permissions {
 pub fn permissions_status() -> Result<Permissions, String> {
     #[cfg(target_os = "macos")]
     return Ok(status(true));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return Ok(linux_status());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Err("not supported on this OS".into())
 }
 
@@ -178,7 +196,16 @@ pub fn spawn_watcher(app: tauri::AppHandle) {
             }
         })
         .expect("spawn perm-watch");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if !crate::platform::linux::can_type() {
+            let tool = if crate::platform::linux::wayland() { "wtype or ydotool" } else { "xdotool" };
+            log::warn!("no typing helper found: dictations go to the clipboard only");
+            crate::session::toast(&app, None, "ax-missing", crate::contract::ToastKind::Warn, &format!("Install {tool} so susurro can paste. Until then, text goes to your clipboard"), &[], 10_000);
+        }
+    });
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = app;
 }
 

@@ -32,8 +32,19 @@ pub mod text;
 pub mod tray;
 pub mod web;
 pub mod platform {
+    #[cfg(target_os = "linux")]
+    pub mod linux;
     #[cfg(target_os = "macos")]
     pub mod macos;
+
+    /// The overlay page reports the pill's rect; only the macOS hit test uses it (Linux's overlay is click-through).
+    #[tauri::command]
+    pub fn set_pill_rect(rect: crate::contract::PtRect) {
+        #[cfg(target_os = "macos")]
+        macos::set_pill_rect(rect);
+        #[cfg(not(target_os = "macos"))]
+        let _ = rect;
+    }
 }
 
 use contract::Settings;
@@ -125,6 +136,9 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("overlay") {
                 let _ = w.show();
             }
+            // after show: GTK has no GdkWindow for a hidden window, and the input shape needs one
+            #[cfg(target_os = "linux")]
+            platform::linux::setup_overlay(h);
             // The transparent window area must not take clicks: only the pill does (Pablo's bug, 2026-10-17).
             #[cfg(target_os = "macos")]
             platform::macos::spawn_hit_test(h);
@@ -179,7 +193,7 @@ pub fn run() {
             permissions::request_permission,
             permissions::relaunch_app,
             hotkey::hotkey_capture,
-            platform::macos::set_pill_rect,
+            platform::set_pill_rect,
             command::command_log,
             live::command_memory,
             live::command_memory_clear,

@@ -1,6 +1,6 @@
 # susurro
 
-System-wide voice dictation for macOS: hold a key, speak, and the text is pasted into whatever app you are in. It also has an optional voice-control mode that drives your Mac by voice. Plan: `PLAN.md`. UI spec: `DESIGN.md`.
+System-wide voice dictation for macOS and Linux: hold a key, speak, and the text is pasted into whatever app you are in. On macOS it also has an optional voice-control mode that drives your Mac by voice ([Linux](#linux) is dictation only). Plan: `PLAN.md`. UI spec: `DESIGN.md`.
 
 ## Requirements
 
@@ -24,6 +24,23 @@ macOS ties the permission grants to the app's signature. `install.sh` picks, in 
 
 - With an Apple Development identity, grants survive rebuilds. A free one works: sign in to Xcode with your Apple ID (Xcode > Settings > Accounts > Manage Certificates > +). List yours with `security find-identity -v -p codesigning`.
 - Ad hoc also works, but macOS asks for the permissions again after every rebuild.
+
+## Linux
+
+Dictation works on Linux: talk key, recording, local Whisper (CPU) or the cloud providers, cleanup, dictionary, history and paste. Voice control, agent mode and modifier-only talk keys (Fn, Right Option) are macOS-only.
+
+```sh
+git clone https://github.com/pabloprx/susurro && cd susurro
+./install-linux.sh --deps   # first time: installs WebKitGTK, ALSA, cmake, xdotool/wtype (apt, dnf or pacman)
+./install-linux.sh          # later: rebuild and reinstall
+```
+
+It installs `~/.local/bin/susurro` and a menu entry, then starts it. Hold F1 and talk. Settings, keys and models live in `~/.local/share/app.susurro.desktop`. `bun tauri build` makes a .deb, .rpm and AppImage instead.
+
+- **X11:** works fully. Paste needs `xdotool`. Terminals get Ctrl+Shift+V, every other app Ctrl+V.
+- **Wayland:** paste works with `wtype` (wlroots compositors, KDE) or `ydotool` (GNOME; start `ydotoold` first). The talk key does not: Wayland lets no app listen for a global key, so it fires only while an X11 app is focused. Pick the X11 session at login for now.
+- No typing helper installed: each dictation lands on the clipboard and susurro tells you so once at startup.
+- Local Whisper runs on the CPU. Pick a small model (base or small) on older machines.
 
 ## First run
 

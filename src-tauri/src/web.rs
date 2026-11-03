@@ -297,9 +297,12 @@ fn open_menu(bundle: &str) {
     let _ = std::process::Command::new("/usr/bin/open").args(["-b", bundle]).status();
     for _ in 0..20 {
         if let Some(f) = crate::paste::frontmost_app().filter(|f| f.bundle_id.as_deref() == Some(bundle)) {
+            #[cfg(target_os = "macos")]
             if !crate::ax::mac::open_menu_with(f.pid, "Developer") {
                 log::warn!("web guide: no menu with Developer in {bundle}");
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = f;
             return;
         }
         std::thread::sleep(Duration::from_millis(100));

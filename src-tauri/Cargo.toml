@@ -30,13 +30,17 @@ cpal = "0.18"
 rubato = "5"
 audioadapter-buffers = "5.2"
 hound = "3.5"
-whisper-rs = { version = "0.16", features = ["metal"] }
+whisper-rs = "0.16"
 reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 keyring = "4"
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] } # Apple GPU; Linux builds run on the CPU
 core-graphics = { version = "0.25", features = ["highsierra"] } # highsierra: CGEventCreateScrollWheelEvent2
 core-foundation = "0.10"
 objc2 = "0.6"

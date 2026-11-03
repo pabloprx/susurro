@@ -16,6 +16,15 @@ use std::sync::{LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "macos")]
+const COPIED_MSG: &str = "Copied: press ⌘V to paste";
+#[cfg(not(target_os = "macos"))]
+const COPIED_MSG: &str = "Copied: press Ctrl+V to paste";
+#[cfg(target_os = "macos")]
+const NO_FIELD_MSG: &str = "No text field. Copied: press ⌘V to paste";
+#[cfg(not(target_os = "macos"))]
+const NO_FIELD_MSG: &str = "No text field. Copied: press Ctrl+V to paste";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionCmd {
     PttDown,
@@ -583,7 +592,12 @@ impl Actor {
     /// hide it so Cmd+V reaches the app behind it.
     fn step_aside(&self) {
         if paste::frontmost_app().is_some_and(|a| a.pid == std::process::id() as i32) {
+            #[cfg(target_os = "macos")]
             let _ = self.app.hide();
+            #[cfg(not(target_os = "macos"))]
+            if let Some(w) = self.app.get_webview_window("main") {
+                let _ = w.hide();
+            }
             std::thread::sleep(Duration::from_millis(300));
         }
     }
@@ -723,13 +737,13 @@ impl Actor {
                             opts.restore_clipboard = false;
                             let msg = match paste::paste(&t, &opts, Some(&target)) {
                                 PasteOutcome::Pasted => "Pasted, and it is on your clipboard",
-                                _ => "Copied: press ⌘V to paste",
+                                _ => COPIED_MSG,
                             };
                             toast(&self.app, None, "copy-last", ToastKind::Info, msg, &[], 2500);
                         }
                         None => {
                             paste::copy(&t);
-                            toast(&self.app, None, "copy-last", ToastKind::Info, "Copied: press ⌘V to paste", &[], 2500);
+                            toast(&self.app, None, "copy-last", ToastKind::Info, COPIED_MSG, &[], 2500);
                         }
                     },
                     None => toast(&self.app, None, "copy-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
@@ -1202,7 +1216,7 @@ impl Actor {
             }
             None => {
                 paste::copy(&item.final_text);
-                let msg = if copy { "Copied" } else { "Copied: press ⌘V to paste" };
+                let msg = if copy { "Copied" } else { COPIED_MSG };
                 toast(&self.app, None, "recents", ToastKind::Info, msg, &[], 2500);
             }
         }
@@ -1357,7 +1371,7 @@ impl Actor {
                 HistoryStatus::Copied
             }
             PasteOutcome::NoField => {
-                toast(&self.app, None, "no-field", ToastKind::Info, "No text field. Copied: press ⌘V to paste", &[], 5000);
+                toast(&self.app, None, "no-field", ToastKind::Info, NO_FIELD_MSG, &[], 5000);
                 HistoryStatus::Copied
             }
         };
@@ -1380,7 +1394,7 @@ impl Actor {
                 // Nothing but susurro seen since launch: never paste into susurro itself.
                 None => {
                     paste::copy(&t);
-                    toast(&self.app, None, "paste-last", ToastKind::Info, "Copied: press ⌘V to paste", &[], 3000);
+                    toast(&self.app, None, "paste-last", ToastKind::Info, COPIED_MSG, &[], 3000);
                 }
             },
             None => toast(&self.app, None, "paste-last", ToastKind::Info, "Nothing to paste yet", &[], 3000),
