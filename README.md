@@ -41,6 +41,36 @@ Onboarding also downloads a small Whisper model (60 MB) to start right away, the
 
 Default keys: hold **F1** to dictate, double-tap for hands-free, **Ctrl+F1** for recent dictations. Change them in Shortcuts.
 
+## Setup guide: pick how it transcribes
+
+Choose one. You can switch any time in **Providers**, and you can mix them (local Whisper as the fallback when the network is down).
+
+### Option A: local Whisper (free, private, offline)
+
+1. Finish onboarding. It downloads the quick-start model (`base`, 60 MB) and then the recommended one (`large-v3-turbo q5_0`, about 575 MB) in the background.
+2. Open **Providers**, pick **Local Whisper**, and choose the model. Use a multilingual model if you speak anything other than English: the `.en` models turn other languages into English.
+3. Hold **F1** in any text field, speak, release. Done. No account, no key, nothing leaves your Mac.
+
+### Option B: OpenRouter (cloud, best accuracy, needs a key)
+
+1. Create a key at [openrouter.ai/keys](https://openrouter.ai/keys) and add a few dollars of credit.
+2. Open **Providers**, paste it into the **OpenRouter** key row at the bottom, and save. Keys are stored only on your Mac, in `keys.json` (mode 600).
+3. Pick **OpenRouter** as the transcription provider and choose a model (MAI-Transcribe is the default). Press **Test** to check it.
+4. Optional: in **Cleanup**, choose OpenRouter to have an LLM fix punctuation and filler words.
+
+ElevenLabs and OpenAI keys work the same way in Providers if you prefer their realtime transcription.
+
+### Voice control and the desktop agent (optional)
+
+The agent drives your Mac by voice: open apps, click, type, search, copy text from the screen, send messages (it asks before anything risky).
+
+1. Install [Claude Code](https://claude.com/claude-code) and log in once in a terminal: run `claude` and follow the login. The agent uses your own Claude subscription; susurro stores no Anthropic key.
+2. Grant **Screen Recording** and **Automation** when asked (System Settings > Privacy & Security).
+3. Open **Voice Control**, turn it on, and check that **Agent mode** is on. **Computer use** (on by default) makes it look at the whole screen after each action.
+4. Hold the voice-control key (**F2** by default, change it in Voice Control), say an order, release. Try "abre Safari y busca recetas de pasta" or "open YouTube and search lo-fi music". Press **Esc** or say "stop" to stop it.
+
+Without Claude Code installed or logged in, the agent falls back to OpenRouter (it needs the OpenRouter key from Option B).
+
 ## API keys (all optional)
 
 Dictation works fully offline with local Whisper; no key is needed. Keys unlock cloud providers, entered in the Providers screen:
