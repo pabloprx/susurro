@@ -31,7 +31,6 @@ pub fn over_pill(mouse: (f64, f64), win: PtRect, pill: PtRect) -> bool {
 }
 
 /// set_pill_rect: the overlay page reports the pill's current rect on every state or size change.
-#[tauri::command]
 pub fn set_pill_rect(rect: PtRect) {
     *PILL.lock().unwrap() = Some(rect);
 }
