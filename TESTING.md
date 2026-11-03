@@ -61,9 +61,84 @@ These items also need a human:
 - The fn key. The tests never post fn events, because the system owns fn. Hold fn in TextEdit, Slack and a terminal.
 - The look of the overlay on the real screen, and the system prompts in onboarding from a fresh signed build.
 
+## Streaming transcription (local whisper)
+
+While you hold the key, `audio::Chunker` cuts the audio at pauses (350 ms after at least 3 s, a hard cut at the quietest 100 ms after 20 s). `whisper_local::Stream` transcribes each chunk on one worker thread, with the previous chunk's last words as the prompt. At the release only the tail is left. Cloud providers stay single-shot (a chunked upload was not measured: it costs money and needs keys).
+
+Bench: `SUSURRO_WHISPER_THREADS=6 cargo run --release --manifest-path src-tauri/Cargo.toml --example stream_bench -- ~/.cache/susurro/ggml-large-v3-turbo-q5_0.bin`. It feeds the audio in real time (100 ms pieces, like the session tick) and times the release to the final STT text. The cleanup LLM and the paste are not in it (they are the same for both modes).
+
+Measured 2026-10-17, Mac Studio M4 Max, large-v3-turbo q5_0, 6 threads, another release build compiling at the same time:
+
+| Clip | Audio | Mode | Chunks | Release to text | WER |
+|------|-------|------|--------|-----------------|-----|
+| long.wav, 14 s padding trimmed | 46.6 s | single-shot | 1 | 888 ms | 0.033 |
+| long.wav, 14 s padding trimmed | 46.6 s | streaming | 3 | 244 ms | 0.026 |
+| that clip x3, 0.6 s gaps | 140.9 s | single-shot | 1 | 2644 ms | 0.033 |
+| that clip x3, 0.6 s gaps | 140.9 s | streaming | 9 | 241 ms | 0.026 |
+
+The word lists are the same length in both modes (151 and 453 words): no word lost or doubled at a cut. The one difference is "Ugart" (single-shot) against "Ugarte" (streaming). One run each: the numbers are not a median.
+
+Re-run 2026-10-17 (review), same Mac and command, idle machine, 3 runs: median release to text 874 / 260 ms (long.wav single / streaming) and 2664 / 252 ms (x3). Same WER and chunk counts. The app adds the hands-free grace (default 400 ms, checked on the 100 ms tick) before the STT starts; the bench does not include it.
+
+## Latency per STT path (next-queue 5)
+
+`src-tauri/tests/latency_bench.rs` plays each e2e fixture at real-time pace (100 ms of audio every 100 ms, as the session tick sends it) and times the release to the final STT text. The cleanup LLM and the paste are not in it: they are the same for every path.
+
+```
+SUSURRO_TEST_MODEL=~/.cache/susurro/ggml-large-v3-turbo-q5_0.bin SUSURRO_WHISPER_THREADS=6 OPENROUTER_API_KEY=.. ELEVENLABS_API_KEY=.. \
+  cargo test --release --manifest-path src-tauri/Cargo.toml --test latency_bench -- --ignored --nocapture --test-threads=1
+```
+
+Measured 2026-10-17, Mac Studio M4 Max, home network, median of 3 (the run values in brackets):
+
+| Path | en_snippet (2.0 s) | es_accents (4.9 s) | en_numbers (8.7 s) |
+|------|-------------------|--------------------|--------------------|
+| Local turbo streaming (large-v3-turbo q5_0, 6 threads) | 354 ms [354, 351, 373] | 369 ms [404, 369, 357] | 400 ms [400, 377, 432] |
+| MAI-Transcribe 2 batch (OpenRouter) | 695 ms [1692, 695, 689] | 737 ms [752, 735, 737] | 768 ms [1259, 768, 755] |
+| Scribe v2 batch (ElevenLabs) | 590 ms [590, 616, 565] | 646 ms [813, 646, 571] | 1005 ms [1065, 1005, 668] |
+| Scribe v2 Realtime (WebSocket, commit at the release) | 198 ms [193, 209, 198] | 210 ms [205, 219, 210] | 208 ms [191, 208, 257] |
+
+Text quality on these clips: all four paths got every word. Scribe batch wrote "five five five zero one nine nine" for "555-0199"; Scribe Realtime wrote "a las 3:00 p.m." for "a las 3" (an added "p.m."). One sample each, so these are anecdotes, not a WER.
+
+Voice control cuts (`command_chunks`, the COMMAND cuts, one run): Scribe Realtime answers a commit 197-259 ms after the cut (3 cuts). MAI answers a cut chunk in 724-2116 ms (3 chunks; 2116 ms was a 7 s chunk).
+
+Defaults from these numbers (Pablo's explicit choices stay as they are):
+- Voice control: `command.stt` = auto = Scribe Realtime when an ElevenLabs key is saved (about 3x faster per order than MAI), else the dictation provider. Partials show in the pill; each commit (a 300 ms pause) goes to the planner. If the socket fails twice, the unanswered audio and the rest of the session go to MAI (or Scribe batch).
+- Dictation: the default stays Local Whisper streaming (0.35-0.4 s, free, offline, no key at install). Scribe Realtime (0.2 s) is the fastest choice when an ElevenLabs key is saved; MAI (0.7 s) is the slowest of the four. A failed realtime stream runs the clip single-shot on MAI (or Scribe batch).
+- Not measured: the ElevenLabs realtime price per hour, long dictations over 36 s on Scribe Realtime (the server commits by itself there), and the release to paste in the real app (no GUI test while Pablo uses the Mac).
+
 ## Known limits (2026-10-17)
 
 - base.en writes "Francisco Ugarte" in `long.wav`. The dictionary does not change it on purpose: a fuzzy match must not flip a gendered name.
 - large-v3-turbo writes "en su pavase" for "en Supabase" in Spanish. The dictionary does not glue a common word ("su") to a split word, on purpose.
 - Posted hotkey chords work only on F20 on this Mac (not F13-F19).
 - If `tauri build` fails in whisper-rs-sys with "'path' is unavailable: introduced in macOS 10.15", the CMake cache is from the old deployment target. Run `cargo clean --manifest-path src-tauri/Cargo.toml -p whisper-rs-sys` once (add `--target-dir` for the e2e target dirs).
+
+## Agent v2 (voice control)
+
+Every F11 order goes to the agent (`agent.rs`): Pablo's `claude -p`, one warm stream-json process, susurro's MCP tools. Trivial orders run with no LLM (`agent::local_intent`). The planner path is the setting "Fast mode (beta)".
+
+Unit tests (in `bun run check`): a fake desk and a fake `claude` script (Python). They cover the warm process across orders, the rolling memory in a new process, the mouse tools (a JS Paint line is a drag), the take-over stop, the local intents and the v8 settings migration.
+
+Real CLI, fake desk (no clicks): `SMOKE_MODEL=sonnet cargo test --manifest-path src-tauri/Cargo.toml --lib agent::tests::smoke_real_claude -- --ignored --nocapture`.
+
+The test hook for GUI tests (debug builds, `SUSURRO_TEST_CONTROL`):
+- `POST /command {"text": "...", "auto_confirm": true}` runs an order as if heard after F11 (no mic, no STT). `auto_confirm` answers every confirm with yes.
+- `GET /state` has `command_log` (the steps), `live`, `agent` (the warm process) and `agent_memory`.
+- `SUSURRO_TEST_PASTE_TARGET` takes a list: `com.docker.docker,com.electron.dockerdesktop`.
+
+Real GUI runs, 2026-10-18, one run each (not a median), from POST /command to the session end, Spanish orders. Every run passed.
+
+| Task | sonnet | haiku |
+|------|--------|-------|
+| JS Paint: draw a line (new process) | 3.29 s | 5.55 s |
+| JS Paint: "draw the same again, moved" (same process: it remembered the first line) | 2.88 s | 5.14 s |
+| Finder: new folder in ~/susurro-tests | 4.93 s | 5.13 s |
+| Slack Automatization: type and send | 3.28 s | 3.91 s |
+| Docker Desktop: create a volume | 7.04 s | 5.59 s |
+| Total | 21.42 s | 25.32 s |
+
+The default model stays sonnet. The fake-desk smoke gave the same order: sonnet 1.8 s and 1.0 s per order, haiku 2.3 s and 7.4 s.
+An action can end the order (`done` on the action): this saved one model round trip, about 1.5 s per order (smoke: 3.2 s -> 1.8 s).
+
+Command STT: local Whisper large-v3-turbo q5_0, 6 threads, `whisper_bench` on 4 short Spanish orders (0.8-2.4 s of audio): 318-328 ms each, warm. One error: "prueba del agente" -> "prueba de la gente".

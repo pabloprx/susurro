@@ -1,7 +1,7 @@
 // DESIGN 6.3. Two backend kinds (Word, Snippet), three tabs (Words, Corrections = Word aliases, Snippets).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, ArrowDownToLine, ArrowRight, ArrowUpFromLine, Pencil, Plus, Search, Star, Trash2 } from "lucide-react";
-import { api, type DictEntry, type DictEntryInput } from "../lib/api";
+import { api, on, type DictEntry, type DictEntryInput } from "../lib/api";
 import { settingsStore } from "../lib/store";
 import { S } from "../lib/strings";
 import { Empty, Label, Popover, Segmented, Sheet, Title, toast } from "../ui";
@@ -25,7 +25,12 @@ export default function Dictionary() {
   const settings = settingsStore.use();
 
   const load = () => api.dictList().then(setList);
-  useEffect(() => void load(), []);
+  useEffect(() => {
+    void load();
+    // A word added from a learn toast (learn.rs) while this screen is open.
+    const off = on("toast", (t) => t.id === "learn-added" && t.kind === "success" && void load());
+    return () => void off.then((f) => f());
+  }, []);
   useEffect(() => {
     // Arrow keys on the tab radios keep focus there (DESIGN 9.4); a click or the first load focuses the add field.
     if (tab !== "snippets" && document.activeElement?.getAttribute("role") !== "radio") addRef.current?.focus();
@@ -98,24 +103,27 @@ export default function Dictionary() {
     a.download = "susurro-dictionary.json";
     a.click();
   };
-  const importJson = async (file: File) => {
-    let rows: DictEntry[];
-    try {
-      rows = JSON.parse(await file.text());
-      if (!Array.isArray(rows)) throw 0;
-    } catch {
-      return toast("That file is not a susurro dictionary export (JSON list).", { kind: "error" });
-    }
+  const [imp, setImp] = useState<{ name: string; rows: ImportRow[] } | null>(null);
+  const pickFile = async (file: File) => {
+    const rows = parseImport(file.name, await file.text());
+    if (!rows) return toast("Use a susurro export (.json), a Wispr Flow dictionary (.csv) or one word per line (.txt).", { kind: "error" });
+    setImp({ name: file.name, rows: classify(rows, all) });
+  };
+  const runImport = async (rows: ImportRow[]) => {
+    setImp(null);
+    let cur = [...all];
     let added = 0;
-    let dup = 0;
-    let bad = 0;
-    for (const r of rows) {
+    let bad = rows.filter((r) => r.status === "invalid").length;
+    const dup = rows.filter((r) => r.status === "duplicate").length;
+    for (const r of rows.filter((r) => r.status === "new")) {
+      // A correction for a word that exists (or came earlier in the file) joins that word.
+      const target = r.kind === "word" && r.aliases.length ? cur.find((e) => e.kind === "word" && norm(e.text) === norm(r.text)) : undefined;
       try {
-        await api.dictUpsert(fresh(r.kind === "snippet" ? "snippet" : "word", String(r.text ?? ""), Array.isArray(r.aliases) ? r.aliases : [], r.expansion ?? null));
+        const saved = await api.dictUpsert(target ? { ...input(target), aliases: [...target.aliases, ...r.aliases] } : fresh(r.kind, r.text, r.aliases, r.expansion));
+        cur = [...cur.filter((e) => e.id !== saved.id), saved];
         added++;
-      } catch (e) {
-        if (/already|exists|duplicate/i.test(String(e))) dup++;
-        else bad++;
+      } catch {
+        bad++;
       }
     }
     await load();
@@ -147,7 +155,7 @@ export default function Dictionary() {
             <button className="btn ghost sm" onClick={exportJson} disabled={!all.length}>
               <ArrowUpFromLine size={14} strokeWidth={1.5} /> Export
             </button>
-            <input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={(e) => e.target.files?.[0] && importJson(e.target.files[0])} />
+            <input ref={fileRef} type="file" accept=".json,.csv,.txt,application/json,text/csv,text/plain" hidden onChange={(e) => (e.target.files?.[0] && pickFile(e.target.files[0]), (e.target.value = ""))} />
           </>
         }
       />
@@ -318,6 +326,7 @@ export default function Dictionary() {
         </>
       )}
 
+      <ImportSheet imp={imp} onClose={() => setImp(null)} onImport={runImport} />
       <SnippetSheet
         entry={sheet}
         onClose={() => setSheet(null)}
@@ -329,6 +338,125 @@ export default function Dictionary() {
         }}
       />
     </>
+  );
+}
+
+// ---------- import: susurro JSON, Wispr Flow CSV, plain text ----------
+
+type ImportRow = { kind: DictEntry["kind"]; text: string; aliases: string[]; expansion: string | null; status: "new" | "duplicate" | "invalid"; why?: string };
+type Raw = Omit<ImportRow, "status"> & { why?: string };
+const invalidRow = (text: string, why: string): Raw => ({ kind: "word", text, aliases: [], expansion: null, why });
+
+/** One CSV line -> fields (RFC 4180 quotes, "" = a literal quote). null = unterminated quote. */
+function csvFields(line: string): string[] | null {
+  const out: string[] = [];
+  let f = "";
+  let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === '"' && line[i + 1] === '"') (f += '"'), i++;
+      else if (c === '"') q = false;
+      else f += c;
+    } else if (c === '"' && !f.trim()) (q = true), (f = "");
+    else if (c === ",") out.push(f), (f = "");
+    else f += c;
+  }
+  return q ? null : [...out, f];
+}
+
+/** File -> rows. Wispr Flow dictionary CSV (docs.wisprflow.ai bulk import): `word` or `misspelling,correction`,
+ *  no header; a correction over 60 chars becomes a snippet here. Wispr snippets JSON: [{name, text}]. */
+function parseImport(name: string, body: string): Raw[] | null {
+  if (/\.json$/i.test(name) || /^\s*\[/.test(body)) {
+    let rows: unknown;
+    try {
+      rows = JSON.parse(body);
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(rows)) return null;
+    return rows.map((r: Record<string, unknown>) =>
+      typeof r?.name === "string" && typeof r?.text === "string"
+        ? { kind: "snippet", text: r.name.trim(), aliases: [], expansion: r.text, why: undefined }
+        : { kind: r?.kind === "snippet" ? "snippet" : "word", text: String(r?.text ?? "").trim(), aliases: Array.isArray(r?.aliases) ? r.aliases.map(String) : [], expansion: typeof r?.expansion === "string" ? r.expansion : null },
+    );
+  }
+  const lines = body.split(/\r?\n/).filter((l) => l.trim());
+  if (/\.txt$/i.test(name)) return lines.map((l) => ({ kind: "word", text: l.trim(), aliases: [], expansion: null }));
+  return lines.map((l): Raw => {
+    const f = csvFields(l);
+    if (!f) return invalidRow(l.trim(), "Unterminated quote");
+    const v = f.map((x) => x.trim()).filter(Boolean);
+    if (!v.length) return invalidRow(l.trim(), "Empty row");
+    if (v.length > 2) return invalidRow(l.trim(), "More than 2 columns");
+    if (v.length === 1) return { kind: "word", text: v[0], aliases: [], expansion: null };
+    const [heard, write] = v;
+    if (write.length > 60) return { kind: "snippet", text: heard, aliases: [], expansion: write };
+    return { kind: "word", text: write, aliases: [heard], expansion: null };
+  });
+}
+
+/** new / duplicate (case- and accent-insensitive, against the dictionary and earlier rows) / invalid. */
+function classify(rows: Raw[], list: DictEntry[]): ImportRow[] {
+  const taken = new Map<string, DictEntry["kind"] | "alias">();
+  for (const e of list) {
+    taken.set(norm(e.text), e.kind);
+    for (const a of e.aliases) taken.set(norm(a), "alias");
+  }
+  const form = (t: string) => (!t ? "Empty" : t.length > 60 ? "Over 60 characters" : !/[\p{L}\p{N}]/u.test(t) ? "No letter or number" : null);
+  return rows.map((r): ImportRow => {
+    const why = r.why ?? form(r.text) ?? r.aliases.map(form).find(Boolean) ?? (r.kind === "snippet" && !(r.expansion ?? "").trim() ? "No expansion" : r.kind === "snippet" && (r.expansion ?? "").length > 4000 ? "Expansion over 4000 characters" : null);
+    if (why) return { ...r, status: "invalid", why };
+    const heard = r.aliases.filter((a) => norm(a) !== norm(r.text));
+    if (!heard.length || r.kind === "snippet") {
+      if (taken.has(norm(r.text))) return { ...r, status: "duplicate" };
+      taken.set(norm(r.text), r.kind);
+      return { ...r, aliases: [], status: "new" };
+    }
+    // A correction row: new if it brings a heard form the dictionary does not have yet.
+    const add = heard.filter((a) => !taken.has(norm(a)));
+    if (!add.length) return { ...r, status: "duplicate" };
+    const t = taken.get(norm(r.text));
+    if (t && t !== "word") return { ...r, status: "invalid", why: t === "snippet" ? `“${r.text}” is a snippet` : `“${r.text}” is a correction` };
+    taken.set(norm(r.text), "word");
+    for (const a of add) taken.set(norm(a), "alias");
+    return { ...r, aliases: add, status: "new" };
+  });
+}
+
+function ImportSheet({ imp, onClose, onImport }: { imp: { name: string; rows: ImportRow[] } | null; onClose: () => void; onImport: (rows: ImportRow[]) => void }) {
+  const rows = imp?.rows ?? [];
+  const n = (s: ImportRow["status"]) => rows.filter((r) => r.status === s).length;
+  const count = n("new");
+  const shown = [...rows].sort((a, b) => +(a.status !== "new") - +(b.status !== "new")).slice(0, 300);
+  return (
+    <Sheet open={!!imp} onClose={onClose} title={`Import ${imp?.name ?? ""}`}>
+      <p className="small" aria-label="Import summary">
+        {count} new · {n("duplicate")} duplicates · {n("invalid")} invalid
+      </p>
+      {!count && rows.length > 0 && <p className="small">All {rows.length} items already exist in your dictionary or are invalid.</p>}
+      <div className="rows import-rows">
+        {shown.map((r, i) => (
+          <div key={i} className={`row import-row ${r.status}`}>
+            <span className="ellipsis" style={{ flex: 1 }}>
+              {r.kind === "snippet" ? `${r.text} → ${(r.expansion ?? "").slice(0, 40)}` : r.aliases.length ? `${r.aliases.join(", ")} → ${r.text}` : r.text}
+            </span>
+            <span className="tag">{r.status === "invalid" ? r.why : r.status}</span>
+          </div>
+        ))}
+      </div>
+      <div className="sheet-foot">
+        <button className="btn ghost" onClick={onClose}>
+          {count ? "Cancel" : "Done"}
+        </button>
+        {count > 0 && (
+          <button className="btn primary" onClick={() => onImport(rows)}>
+            Import {count} {count === 1 ? "item" : "items"}
+          </button>
+        )}
+      </div>
+    </Sheet>
   );
 }
 

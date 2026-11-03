@@ -215,6 +215,7 @@ pub fn validate(b: &Hotkeys) -> Result<(), Vec<String>> {
         ("Paste last", Some(b.paste_last.as_str())),
         ("Copy last", Some(b.copy_last.as_str())),
         ("Voice control", Some(b.command.trim()).filter(|s| !s.is_empty())),
+        ("Recents", Some(b.recents.trim()).filter(|s| !s.is_empty())),
     ];
     let mut errs = vec![];
     let mut seen: Vec<(String, &str)> = vec![];
@@ -286,6 +287,14 @@ impl ModMachine {
     }
 }
 
+/// The keys of an open recents list: 1-9 paste row N, Cmd+1-9 copy it, the cancel key closes.
+pub fn recents_keys(b: &Hotkeys) -> Vec<(String, SessionCmd)> {
+    let mut v: Vec<(String, SessionCmd)> = (1..=9).map(|n| (n.to_string(), SessionCmd::RecentPick { n, copy: false })).collect();
+    v.extend((1..=9).map(|n| (format!("Cmd+{n}"), SessionCmd::RecentPick { n, copy: true })));
+    v.push((b.cancel.clone(), SessionCmd::RecentsClose));
+    v
+}
+
 // ---------- runtime ----------
 
 /// Esc is live while recording, while a command acts, and while a command's speech is transcribed (so Esc stops it
@@ -336,6 +345,8 @@ struct Inner {
     capture_gen: AtomicU64,
     /// The cancel shortcut is registered (session is Recording or Locked).
     cancel_on: AtomicBool,
+    /// The recents list is open: 1-9, Cmd+1-9 and Esc are registered.
+    recents_on: AtomicBool,
     tap_started: AtomicBool,
     /// Error from the last register_all for the ptt combo.
     ptt_error: Mutex<Option<String>>,
@@ -346,6 +357,7 @@ impl Inner {
     fn send(&self, cmd: SessionCmd) {
         let off = self.paused.load(Ordering::Relaxed) || self.capturing.load(Ordering::Relaxed);
         if passes(off, &cmd) {
+            crate::session::stamp(&cmd);
             let _ = self.tx.send(cmd);
         }
     }
@@ -386,11 +398,17 @@ impl Inner {
             }
         }
         let mut rest = vec![(b.paste_last.clone(), SessionCmd::PasteLast), (b.copy_last.clone(), SessionCmd::CopyLast)];
+        if !b.recents.trim().is_empty() {
+            rest.push((b.recents.trim().to_string(), SessionCmd::Recents));
+        }
         if let Some(h) = hands_free(&b) {
             rest.push((h.to_string(), SessionCmd::Toggle));
         }
         if self.cancel_on.load(Ordering::Relaxed) {
             rest.push((b.cancel.clone(), SessionCmd::Cancel));
+        }
+        if self.recents_on.load(Ordering::Relaxed) {
+            rest.extend(recents_keys(&b));
         }
         for (s, cmd) in rest {
             if let Err(e) = self.bind(&s, Some(cmd), None) {
@@ -448,6 +466,25 @@ impl Inner {
         }
     }
 
+    /// The recents list opened or closed: its temporary keys go on or off (the app in front keeps the focus).
+    fn set_recents(self: &Arc<Self>, on: bool) {
+        if self.recents_on.swap(on, Ordering::Relaxed) == on || self.capturing.load(Ordering::Relaxed) {
+            return;
+        }
+        let b = self.b.lock().unwrap().clone();
+        for (s, cmd) in recents_keys(&b) {
+            // Esc may be the cancel key: while recording it stays bound (recents only open when idle).
+            let r = if on {
+                self.bind(&s, Some(cmd), None)
+            } else {
+                parse(&s).map_err(anyhow::Error::msg).and_then(|p| Ok(self.app.global_shortcut().unregister(p.canonical().as_str())?))
+            };
+            if let Err(e) = r {
+                log::warn!("recents key {s}: {e}");
+            }
+        }
+    }
+
     fn ensure_tap(self: &Arc<Self>) {
         if self.tap_started.swap(true, Ordering::Relaxed) {
             return;
@@ -491,6 +528,7 @@ pub fn start(app: &AppHandle, b: &Hotkeys, tx: mpsc::Sender<SessionCmd>) -> anyh
         capturing: AtomicBool::new(false),
         capture_gen: AtomicU64::new(0),
         cancel_on: AtomicBool::new(false),
+        recents_on: AtomicBool::new(false),
         tap_started: AtomicBool::new(false),
         ptt_error: Mutex::new(None),
         last_status: Mutex::new(None),
@@ -524,6 +562,10 @@ impl HotkeyHandle {
             }
         }
         r
+    }
+
+    pub fn set_recents(&self, on: bool) {
+        self.inner.set_recents(on);
     }
 
     pub fn paused(&self) -> bool {
@@ -682,15 +724,35 @@ mod tests {
             ptt: ptt.into(),
             hands_free: hf.map(Into::into),
             double_tap: true,
+            hands_free_grace_ms: 400,
             cancel: cancel.into(),
             paste_last: paste.into(),
             copy_last: "Ctrl+Cmd+C".into(),
             command: "F2".into(),
+            recents: String::new(),
         }
     }
 
     fn err(h: Hotkeys) -> String {
         validate(&h).unwrap_err().join("; ")
+    }
+
+    #[test]
+    fn recents_keys_parse_for_global_shortcut() {
+        let keys = recents_keys(&Hotkeys::default());
+        assert_eq!(keys.len(), 19);
+        for (s, _) in &keys {
+            let p = parse(s).unwrap();
+            assert!(p.canonical().parse::<Shortcut>().is_ok(), "{s}");
+        }
+        assert_eq!(keys[0].1, SessionCmd::RecentPick { n: 1, copy: false });
+        assert_eq!(keys[17].1, SessionCmd::RecentPick { n: 9, copy: true });
+        let mut h = Hotkeys::default();
+        h.recents = "Ctrl+F12".into();
+        h.ptt = "F12".into();
+        assert_eq!(validate(&h), Ok(()));
+        h.paste_last = "Ctrl+F12".into();
+        assert!(validate(&h).unwrap_err()[0].contains("Recents"));
     }
 
     #[test]
@@ -709,6 +771,15 @@ mod tests {
         assert!(parse("Ctrl+Bogus").is_err());
         assert!(parse("V+Cmd").is_err());
         assert!(parse("Ctrl++V").is_err());
+    }
+
+    #[test]
+    fn supr_is_forward_delete() {
+        // global-hotkey 0.8 maps Code::Delete to 0x75 = kVK_ForwardDelete (fn+⌫ on Apple keyboards), not ⌫ (0x33).
+        assert_eq!(validate(&hk("Delete", None, "Escape", "Ctrl+Cmd+V")), Ok(()));
+        let sc: Shortcut = parse("Delete").unwrap().canonical().parse().unwrap();
+        assert_eq!(sc.key, tauri_plugin_global_shortcut::Code::Delete);
+        assert!(sc.mods.is_empty());
     }
 
     #[test]

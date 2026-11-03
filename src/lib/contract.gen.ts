@@ -12,13 +12,14 @@ export type CleanupLevel = "none" | "light" | "medium";
 export type CleanupSettings = { level: CleanupLevel, provider: LlmProvider, openrouter_model: string, local_base_url: string, local_model: string, timeout_ms: number, };
 
 /**
- * marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
- * confirm = a risky step waits for the command key (Esc stops).
+ * marks = numbered marks are up, the target is being grounded. pick = "Which one?" (the top 3 in `choices`).
+ * confirm = a risky step or Return waits for a yes (voice, or the command key; Esc stops).
  */
-export type CmdStatus = "thinking" | "marks" | "aim" | "pick" | "confirm" | "done" | "stopped" | "unsure" | "blocked" | "setup" | "error";
+export type CmdStatus = "queued" | "thinking" | "marks" | "aim" | "pick" | "confirm" | "done" | "stopped" | "unsure" | "blocked" | "setup" | "error";
 
 /**
- * Voice control: hold the command key, say what to do, Jev picks the action and the target.
+ * Voice control: hold or double-tap the command key and talk; the planner LLM writes the actions while you speak,
+ * Jev grounds each click target on the screen (VOICE_CONTROL_V2).
  */
 export type CommandSettings = { 
 /**
@@ -26,29 +27,71 @@ export type CommandSettings = {
  */
 enabled: boolean, 
 /**
- * Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+ * Ask for a yes (voice, or the command key) before a step that sends, deletes or buys. Return always asks.
  */
 confirm_risky: boolean, 
 /**
- * Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+ * Pinned: Jev answers can shift between releases. "typesafe/jev-1.14". Jev only grounds click targets now.
  */
-model: string, };
+model: string, 
+/**
+ * The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
+ * spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
+ */
+planner_model: string, 
+/**
+ * "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
+ * choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
+ */
+auto_click: boolean, 
+/**
+ * The STT for commands. None = auto: the dictation provider (an order is heard the way a dictation is).
+ */
+stt: SttProvider | null, 
+/**
+ * Agent mode (on by default): every order goes to the local Claude Code CLI (`claude -p`, the subscription
+ * login) driving the Mac through susurro's own tools (agent.rs), except the trivial ones (agent::local_intent).
+ */
+agent: boolean, 
+/**
+ * "Fast mode (beta)": the old planner path (orders go through the planner; agent mode only on "modo agente: ..."
+ * or an order that failed twice).
+ */
+fast_mode: boolean, 
+/**
+ * The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
+ */
+agent_model: string, 
+/**
+ * The OpenRouter vision model when the claude CLI is missing or not logged in.
+ */
+agent_fallback: string, 
+/**
+ * "Computer use" (on by default, Pablo 2026-10-19): the agent sees the whole screen in a screenshot after every
+ * action and points at x,y, the way Claude's computer use works. Off = it reads the numbered marks (AX) and takes
+ * a screenshot only for pixels.
+ */
+agent_vision: boolean, };
 
 /**
  * Payload of `command_step` (all windows) and a row of `command_log`.
  */
 export type CommandStep = { instruction: string, 
 /**
- * 1-based; 0 = the fast path (no screen read).
+ * 1-based action number in the live session.
  */
-step: number, max: number, status: CmdStatus, 
+step: number, 
 /**
- * click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
- * copy_last | new_tab | close_tab | back | forward | reload | done
+ * v1 step cap; 0 in a live session.
+ */
+max: number, status: CmdStatus, 
+/**
+ * What the executor did: click | focus_and_type | scroll_up | scroll_down | press_key | open_app | copy | paste |
+ * select_typed | delete_typed
  */
 action: string | null, 
 /**
- * open_app: the app; press_key: the key; focus_and_type: the text.
+ * open_app: the app; press_key: the combo; focus_and_type: the text; select/delete_typed: the typed text.
  */
 detail: string | null, 
 /**
@@ -64,13 +107,29 @@ marks: Array<Mark>,
  */
 target: number | null, 
 /**
- * pick: the top 3 (mark id, confidence).
+ * pick: the top 3 (mark id, confidence). Pick mode (`choose`): 3 to 5, numbered 1.. in this order.
  */
-choices: Array<[number, number]>, latency_ms: number, cost_usd: number, 
+choices: Array<[number, number]>, 
+/**
+ * Pick mode ("Clicks: I choose"): the choices are numbered by place (1..5), not by mark id.
+ */
+choose: boolean, 
+/**
+ * Pick mode: Jev is sure of choice 1, it is highlighted and "sí" takes it.
+ */
+preselect: boolean, latency_ms: number, cost_usd: number, 
 /**
  * unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
  */
-message: string | null, };
+message: string | null, 
+/**
+ * Live session: the planner op (key | type | click | open_app | select_typed | delete_typed | copy | paste | scroll).
+ */
+op?: string, 
+/**
+ * Live session: the order (one planner reply) this action belongs to, 1-based. 0 = none.
+ */
+order: number, };
 
 export type DayStat = { 
 /**
@@ -95,6 +154,31 @@ export type DictOpts = { fuzzy: boolean, };
 
 export type ElevenOpts = { model_id: string, send_keyterms: boolean, max_keyterms: number, };
 
+/**
+ * The screen-context card: the front app and what it shows, so an order can lean on it ("send this to Juanito").
+ */
+export type Glance = { app: string, 
+/**
+ * The front window's title (the page title in a browser, the chat in most messengers).
+ */
+window: string, 
+/**
+ * The focused element: "Message (text field)", "" = none.
+ */
+focus: string, 
+/**
+ * A draft in the focused field (its tail), "" = empty.
+ */
+draft: string, 
+/**
+ * The main items on screen (chats, links, buttons), at most glance::ITEMS.
+ */
+items: Array<string>, 
+/**
+ * One or two sentences about the screen from a vision model; None = not yet, or no OpenRouter key.
+ */
+summary: string | null, };
+
 export type HistoryItem = { id: number, created_at: number, 
 /**
  * Command rows: raw = the spoken instruction, final_text = what susurro did, error = why it stopped.
@@ -118,21 +202,73 @@ export type HotkeyStatus = { binding: string, active: boolean, error?: string, }
  * "RightControl", "LeftControl", "RightShift", "LeftShift") use the CGEventTap and work only for ptt;
  * anything else is an accelerator combo for global-shortcut.
  */
-export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, cancel: string, paste_last: string, 
+export type Hotkeys = { ptt: string, hands_free: string | null, double_tap: boolean, 
+/**
+ * After a hold is released, a press within this window continues hands-free (0-1500, 0 = off).
+ * The release itself never waits: the text pastes at once. Also the double-tap window.
+ */
+hands_free_grace_ms: number, cancel: string, paste_last: string, 
 /**
  * Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
  */
 copy_last: string, 
 /**
  * Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+ * Double-tap (or hold, release, press again in the grace) = a hands-free live command session.
  */
-command: string, };
+command: string, 
+/**
+ * Opens the recents list (the last 9 dictations; 1-9 pastes, Cmd+1-9 copies). Default "Ctrl+" + the ptt F-key.
+ */
+recents: string, };
 
-export type KeyName = "elevenlabs" | "openrouter" | "local_stt" | "local_llm";
+export type KeyName = "elevenlabs" | "openai" | "openrouter" | "local_stt" | "local_llm";
 
-export type KeyStatus = { elevenlabs: boolean, openrouter: boolean, local_stt: boolean, local_llm: boolean, };
+export type KeyStatus = { elevenlabs: boolean, openai: boolean, openrouter: boolean, local_stt: boolean, local_llm: boolean, };
 
 export type KnownDevice = { id: string, name: string, kind: DeviceKind, last_seen: number, };
+
+/**
+ * Payload of `command_live` (overlay, marks, main): the live command session.
+ */
+export type LiveState = { 
+/**
+ * A live session runs (recording or draining its queue).
+ */
+on: boolean, 
+/**
+ * Words heard but not planned yet (the order is not complete).
+ */
+buffer: string, 
+/**
+ * Short labels of the queued actions, next first: "⌘T", "type “ls”", "⏎".
+ */
+queue: Array<string>, 
+/**
+ * The question that waits for a voice answer: "Press Return? Say yes · F11 · Esc", "Which one? 4, 7 or 9".
+ */
+pending: string | null, 
+/**
+ * Pablo moved the mouse or typed: the marks hide until the next order.
+ */
+took_over: boolean, 
+/**
+ * Pablo pressed a key or clicked: the queue waits (no more actions) until his next spoken order.
+ */
+paused: boolean, 
+/**
+ * The last chunk of text heard.
+ */
+last_said: string, 
+/**
+ * "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
+ * candidates are drawn.
+ */
+numbers: boolean, 
+/**
+ * Agent mode, F11 down: what is on screen, for the card on the right (glance.rs). None once an order runs.
+ */
+glance: Glance | null, };
 
 export type LlmProvider = "openrouter" | "local";
 
@@ -155,6 +291,21 @@ region: string, };
 export type Match = { start: number, end: number, entry_id: number, how: MatchHow, };
 
 export type MatchHow = "exact" | "squashed" | "fuzzy" | "snippet";
+
+export type MemKind = "said" | "typed" | "deleted" | "copied" | "pasted" | "clicked" | "key" | "opened" | "failed";
+
+/**
+ * One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.
+ */
+export type MemoryEntry = { 
+/**
+ * ms since the epoch.
+ */
+at: number, kind: MemKind, text: string, app: string, 
+/**
+ * The field name or role it went into ("" = none).
+ */
+field: string, };
 
 export type MicSelection = "auto" | { "device": { id: string, } };
 
@@ -191,7 +342,7 @@ price_hour: number | null,
  */
 keywords: boolean, 
 /**
- * The default pick (microsoft/mai-transcribe-2).
+ * The default pick (DEFAULT_OPENROUTER_STT for STT, DEFAULT_OPENROUTER_CLEANUP for chat).
  */
 recommended: boolean, };
 
@@ -202,7 +353,11 @@ export type PasteOpts = { restore_clipboard: boolean,
  * Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
  * 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
  */
-restore_delay_ms: number, press_enter_command: boolean, };
+restore_delay_ms: number, 
+/**
+ * "press enter" / "presenter" / "dale enter" / "enviar" at the end of a dictation: dropped, then Return.
+ */
+press_enter_command: boolean, };
 
 export type PermKind = "microphone" | "accessibility" | "input_monitoring" | "fn_key" | "screen_recording";
 
@@ -233,6 +388,19 @@ export type ProviderTest = { ok: boolean, latency_ms: number, text: string, erro
  */
 export type PtRect = { x: number, y: number, w: number, h: number, };
 
+/**
+ * Payload of `recents` (overlay): the recents list. Empty items = closed.
+ */
+export type Recents = { 
+/**
+ * Newest first, at most 9 dictation rows. Status copied / failed = it did not land in a field.
+ */
+items: Array<HistoryItem>, 
+/**
+ * 1-9: this row was just pasted or copied (the overlay flashes it, then the list closes).
+ */
+picked: number | null, };
+
 export type RecordingOpts = { 
 /**
  * 600 s = 19.2 MB as s16 WAV, under the 25 MB multipart cap.
@@ -250,7 +418,11 @@ message: string | null,
 /**
  * Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
  */
-command: boolean, };
+command: boolean, 
+/**
+ * Recording, just after a hold was released: the overlay counts this down ("tap again for hands-free").
+ */
+grace_ms?: number, };
 
 export type Settings = { version: number, onboarded: boolean, 
 /**
@@ -264,20 +436,32 @@ command: CommandSettings, };
 
 export type Stats = { words_total: number, words_7d: number, sessions_7d: number, wpm: number, minutes_saved: number, daily: Array<DayStat>, };
 
-export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter";
+export type SttProvider = "whisper_local" | "openai_compat" | "elevenlabs" | "openrouter" | "elevenlabs_realtime" | "openai_realtime";
 
 export type SttSettings = { provider: SttProvider, whisper_model: string, openai_compat: OpenAiCompat, elevenlabs: ElevenOpts, openrouter_model: string, 
 /**
  * Cloud STT fails -> whisper local, if a model is downloaded.
  */
-local_fallback: boolean, };
+local_fallback: boolean, 
+/**
+ * MAI-Transcribe's own "clean" style (drops fillers). Independent of the LLM cleanup.
+ */
+mai_clean: boolean, };
 
-export type Style = "formal" | "casual" | "very_casual" | "excited";
+export type Style = "formal" | "casual" | "very_casual" | "excited" | "lowercase";
 
 /**
  * One global style + bundle ids that get Raw (no LLM, no style rules, corrections kept).
  */
-export type Styles = { style: Style, raw_apps: Array<string>, };
+export type Styles = { style: Style, raw_apps: Array<string>, 
+/**
+ * Drop the Spanish opening marks ¿ ¡ (? and ! stay). Pablo does not write them when chatting.
+ */
+strip_inverted: boolean, 
+/**
+ * Bundle ids that keep ¿ ¡ even with `strip_inverted` on.
+ */
+inverted_apps: Array<string>, };
 
 export type Toast = { id: string, kind: ToastKind, text: string, actions: Array<ToastActionDef>, ttl_ms: number, };
 

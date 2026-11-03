@@ -75,6 +75,18 @@ pub fn spawn_hit_test(app: &AppHandle) {
         .expect("spawn overlay-hit");
 }
 
+/// The pill in CG global points (top-left origin, y down). None = no pill. OCR drops the text it reads there: the
+/// pill shows Pablo's own words ("click “Comercial X”"), never a target.
+pub fn pill_rect() -> Option<PtRect> {
+    let (win, pill) = ((*OVERLAY_FRAME.lock().unwrap())?, (*PILL.lock().unwrap())?);
+    Some(pill_cg(win, pill, core_graphics::display::CGDisplay::main().bounds().size.height))
+}
+
+/// Pure: the pill (page rect, y down from the window top) in a Cocoa window frame `win` -> CG global points.
+pub fn pill_cg(win: PtRect, pill: PtRect, main_h: f64) -> PtRect {
+    PtRect { x: win.x + pill.x, y: main_h - (win.y + win.h) + pill.y, w: pill.w, h: pill.h }
+}
+
 /// CG global rect (top-left origin, y down) -> Cocoa frame (bottom-left origin of the main screen, y up).
 pub fn cg_to_cocoa(r: PtRect, main_h: f64) -> PtRect {
     PtRect { x: r.x, y: main_h - (r.y + r.h), w: r.w, h: r.h }
@@ -109,6 +121,62 @@ pub fn show_marks(app: &AppHandle, display: Option<PtRect>) {
     });
     if let Err(e) = r {
         log::warn!("show_marks: {e}");
+    }
+}
+
+std::thread_local! {
+    /// The NSEvent global monitor of a live session (main thread only).
+    static MONITOR: std::cell::RefCell<Option<objc2::rc::Retained<objc2::runtime::AnyObject>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Pablo's own mouse and keys while a live command session runs (VOICE_CONTROL_V2 3): an NSEvent global monitor
+/// for MouseMoved | LeftMouseDown | RightMouseDown | ScrollWheel | KeyDown. Global key events need Accessibility,
+/// which voice control has already; no Input Monitoring prompt. Installed at the session start, removed at its end.
+/// Unverified on macOS 26 until Pablo runs it: the first hit logs "live: Pablo took over".
+pub fn watch_user_input(app: &AppHandle, on: bool) {
+    use objc2_app_kit::{NSEventMask, NSEventType};
+    let app2 = app.clone();
+    let bound: Vec<u16> = {
+        let s = app.state::<crate::AppState>().settings.read().unwrap().hotkeys.clone();
+        [s.command.as_str(), s.cancel.as_str(), s.ptt.as_str()].iter().filter_map(|b| b.rsplit('+').next().and_then(crate::paste::keycode)).collect()
+    };
+    let r = app.run_on_main_thread(move || {
+        MONITOR.with(|m| {
+            let mut m = m.borrow_mut();
+            if let Some(old) = m.take() {
+                // SAFETY: the object came from addGlobalMonitorForEventsMatchingMask on this thread.
+                unsafe { NSEvent::removeMonitor(&old) };
+            }
+            if !on {
+                return;
+            }
+            let moved = std::cell::Cell::new(0.0f64);
+            let block = block2::RcBlock::new(move |e: std::ptr::NonNull<NSEvent>| {
+                // SAFETY: AppKit hands the block a live event for the duration of the call.
+                let e = unsafe { e.as_ref() };
+                let ty = e.r#type();
+                let user_data = e.CGEvent().map(|c| objc2_core_graphics::CGEvent::integer_value_field(Some(&c), objc2_core_graphics::CGEventField(42))).unwrap_or(0);
+                let key = (ty == NSEventType::KeyDown).then(|| e.keyCode());
+                // susurro's own tagged moves (click_at jumps the cursor) must not count toward Pablo's 6 pt.
+                if ty == NSEventType::MouseMoved && user_data != crate::paste::SUSURRO_TAG {
+                    moved.set(moved.get() + e.deltaX().abs() + e.deltaY().abs());
+                }
+                if crate::live::is_users(user_data, key, &bound, if key.is_some() { 0.0 } else if ty == NSEventType::MouseMoved { moved.get() } else { 99.0 }) {
+                    moved.set(0.0);
+                    // a left click's spot (CG global points): it may answer a pick
+                    let at = (ty == NSEventType::LeftMouseDown).then(|| e.CGEvent().map(|c| objc2_core_graphics::CGEvent::location(Some(&c)))).flatten().map(|p| (p.x, p.y));
+                    crate::live::user_input(&app2, ty != NSEventType::MouseMoved && ty != NSEventType::ScrollWheel, at);
+                }
+            });
+            let mask = NSEventMask::MouseMoved | NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::ScrollWheel | NSEventMask::KeyDown;
+            *m = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+            if m.is_none() {
+                log::warn!("live: the user-input monitor did not install (Accessibility?)");
+            }
+        });
+    });
+    if let Err(e) = r {
+        log::warn!("watch_user_input: {e}");
     }
 }
 
@@ -176,6 +244,14 @@ mod tests {
 
     const WIN: PtRect = PtRect { x: 500.0, y: 40.0, w: 360.0, h: 64.0 }; // Cocoa: bottom edge 40 pt above the screen bottom
     const PILL: PtRect = PtRect { x: 80.0, y: 10.0, w: 200.0, h: 36.0 }; // page px, from the window top
+
+    #[test]
+    fn pill_in_cg_points() {
+        // main screen 900 pt tall: the window top is at Cocoa y 104 = CG y 796; the pill starts 10 pt below it
+        assert_eq!(pill_cg(WIN, PILL, 900.0), PtRect { x: 580.0, y: 806.0, w: 200.0, h: 36.0 });
+        // the same pill seen by over_pill (Cocoa y 58..94) = CG y 806..842
+        assert!(over_pill((680.0, 900.0 - 824.0), WIN, PILL));
+    }
 
     #[test]
     fn hit_only_on_the_pill() {

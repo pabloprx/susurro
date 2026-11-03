@@ -1,6 +1,6 @@
 //! `{app_data_dir}/settings.json`: load with defaults, atomic save, version migration.
 
-use crate::contract::{DEFAULT_OPENROUTER_STT, Hotkeys, JEV_MODEL, MicSettings, PasteOpts, SETTINGS_VERSION, Settings};
+use crate::contract::{CleanupLevel, DEFAULT_OPENROUTER_CLEANUP, DEFAULT_OPENROUTER_STT, DEFAULT_PLANNER, Hotkeys, JEV_MODEL, MicSettings, PasteOpts, SETTINGS_VERSION, Settings, SttProvider};
 use std::path::Path;
 
 /// Missing file -> defaults. Corrupt file -> renamed to `settings.json.bad` (kept for the user), defaults.
@@ -48,8 +48,49 @@ fn migrate(mut s: Settings) -> Settings {
             s.hotkeys.command.clear();
         }
     }
+    // v4: an empty cleanup model left cleanup off with no sign of it.
+    if s.version < 4 && s.cleanup.openrouter_model.trim().is_empty() {
+        s.cleanup.openrouter_model = DEFAULT_OPENROUTER_CLEANUP.into();
+    }
+    // v5 (vc-feedback 12, 17; VOICE_CONTROL_V2 4.1, 4.3): the recents key follows an F-key ptt (F12 -> Ctrl+F12);
+    // the old 400 ms grace was too short; MAI cleans by itself, so the LLM cleanup goes off once (he can turn it on).
+    if s.version < 5 {
+        let ptt = s.hotkeys.ptt.trim();
+        if ptt.len() >= 2 && ptt.len() <= 3 && ptt.starts_with(['F', 'f']) && ptt[1..].parse::<u8>().is_ok() {
+            s.hotkeys.recents = format!("Ctrl+{}", ptt.to_uppercase());
+        }
+        if crate::hotkey::validate(&s.hotkeys).is_err() && crate::hotkey::validate(&Hotkeys { recents: String::new(), ..s.hotkeys.clone() }).is_ok() {
+            s.hotkeys.recents.clear();
+        }
+        if s.hotkeys.hands_free_grace_ms == 400 {
+            s.hotkeys.hands_free_grace_ms = Hotkeys::default().hands_free_grace_ms;
+        }
+        if is_mai(&s) {
+            s.cleanup.level = CleanupLevel::None;
+        }
+    }
+    // v6 (next-queue 3): "press enter" at the end of a dictation is on by default; older files had it off.
+    if s.version < 6 {
+        s.paste.press_enter_command = true;
+    }
+    // v7: the planner is DEFAULT_PLANNER (gpt-oss-120b on Cerebras: Pablo picked speed, `.lo/planner-bench.md`).
+    if s.version < 7 {
+        s.command.planner_model = DEFAULT_PLANNER.into();
+    }
+    // v8 (agent v2, Pablo 2026-10-18): agent mode on for everyone, the planner only as "Fast mode (beta)"; the
+    // command STT goes back to auto (local Whisper when downloaded: "use local Whisper for the commands").
+    if s.version < 8 {
+        s.command.agent = true;
+        s.command.fast_mode = false;
+        s.command.stt = None;
+    }
     s.version = SETTINGS_VERSION;
     s
+}
+
+/// The STT is MAI-Transcribe on OpenRouter.
+pub fn is_mai(s: &Settings) -> bool {
+    s.stt.provider == SttProvider::OpenRouter && s.stt.openrouter_model.starts_with("microsoft/mai-transcribe")
 }
 
 /// Write to `settings.json.tmp`, then rename: a crash never leaves a half-written file.
@@ -75,6 +116,10 @@ fn merge(cur: &Settings, mut new: Settings) -> Settings {
     new.mic = MicSettings { show_virtual: new.mic.show_virtual, ..cur.mic.clone() };
     // The Jev model is pinned (never ~latest): the page cannot change it.
     new.command.model = JEV_MODEL.into();
+    if new.command.planner_model.trim().is_empty() {
+        new.command.planner_model = DEFAULT_PLANNER.into();
+    }
+    new.hotkeys.hands_free_grace_ms = new.hotkeys.hands_free_grace_ms.min(1500);
     new
 }
 
@@ -254,13 +299,23 @@ mod tests {
         let s = load(&p);
         assert_eq!(s.hotkeys.command, "F2");
         assert_eq!(s.stt.openrouter_model, "microsoft/mai-transcribe-2");
-        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into() }, "opt-in, also for migrated users");
-        assert_eq!(s.version, 3);
+        assert_eq!(s.command, CommandSettings { enabled: false, confirm_risky: true, model: "typesafe/jev-1.14".into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, ..Default::default() }, "opt-in, also for migrated users");
+        assert_eq!(s.version, SETTINGS_VERSION);
         // A picked model is kept; a v3 user may clear it on purpose.
         std::fs::write(&p, r#"{"version":2,"stt":{"openrouter_model":"openai/whisper-1"}}"#).unwrap();
         assert_eq!(load(&p).stt.openrouter_model, "openai/whisper-1");
         std::fs::write(&p, r#"{"version":3,"stt":{"openrouter_model":""}}"#).unwrap();
         assert_eq!(load(&p).stt.openrouter_model, "");
+    }
+
+    #[test]
+    fn v3_gets_a_cleanup_model() {
+        let p = tmp_dir("v4mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":3,"cleanup":{"provider":"openrouter","openrouter_model":""}}"#).unwrap();
+        assert_eq!(load(&p).cleanup.openrouter_model, DEFAULT_OPENROUTER_CLEANUP);
+        std::fs::write(&p, r#"{"version":3,"cleanup":{"openrouter_model":"openai/gpt-4.1-mini"}}"#).unwrap();
+        assert_eq!(load(&p).cleanup.openrouter_model, "openai/gpt-4.1-mini", "a picked model is kept");
+        assert_eq!(Settings::default().cleanup.openrouter_model, DEFAULT_OPENROUTER_CLEANUP);
     }
 
     #[test]
@@ -286,13 +341,107 @@ mod tests {
     }
 
     #[test]
+    fn v7_sets_the_default_planner_once_and_clicks_default_to_i_choose() {
+        let p = tmp_dir("v7mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":6,"command":{"enabled":true,"planner_model":"openai/gpt-6-luna"}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!(s.command.planner_model, "openai/gpt-oss-120b");
+        assert!(!s.command.auto_click, "I choose is the default");
+        // once: a later pick of another model stays
+        let mut s2 = s.clone();
+        s2.command.planner_model = "openai/gpt-6-luna".into();
+        save(&p, &s2).unwrap();
+        assert_eq!(load(&p).command.planner_model, "openai/gpt-6-luna");
+    }
+
+    #[test]
+    fn v8_turns_agent_mode_on_and_the_command_stt_to_auto_once() {
+        let p = tmp_dir("v8mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":7,"command":{"enabled":true,"agent":false,"stt":"openrouter","agent_model":"sonnet","auto_click":true}}"#).unwrap();
+        let s = load(&p);
+        assert!(s.command.agent && !s.command.fast_mode);
+        assert_eq!(s.command.stt, None, "auto = local Whisper");
+        assert!(s.command.enabled && s.command.auto_click, "his other choices stay");
+        assert_eq!(s.command.agent_model, "sonnet");
+        // once: a later choice stays
+        let mut s2 = s.clone();
+        (s2.command.fast_mode, s2.command.stt) = (true, Some(SttProvider::ElevenLabsRealtime));
+        save(&p, &s2).unwrap();
+        let s3 = load(&p);
+        assert!(s3.command.fast_mode);
+        assert_eq!(s3.command.stt, Some(SttProvider::ElevenLabsRealtime));
+        assert!(Settings::default().command.agent, "new installs too");
+    }
+
+    #[test]
+    fn v5_recents_grace_and_mai_cleanup() {
+        let p = tmp_dir("v5mig").join("settings.json");
+        // Pablo's v4 file (2026-10-17): F12 ptt, 400 ms grace, MAI + light cleanup.
+        std::fs::write(&p, r#"{"version":4,"hotkeys":{"ptt":"F12","hands_free_grace_ms":400,"copy_last":"Shift+F12","command":"F11"},
+            "stt":{"provider":"openrouter","openrouter_model":"microsoft/mai-transcribe-2"},"cleanup":{"level":"light"},
+            "command":{"enabled":true}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!(s.hotkeys.recents, "Ctrl+F12");
+        assert_eq!(s.hotkeys.hands_free_grace_ms, 1000, "v5_moves_400_to_the_new_default");
+        assert_eq!(s.cleanup.level, CleanupLevel::None, "v5_turns_cleanup_off_for_mai_once");
+        assert!(s.stt.mai_clean, "MAI clean stays on");
+        assert_eq!((s.hotkeys.ptt.as_str(), s.hotkeys.copy_last.as_str(), s.hotkeys.command.as_str()), ("F12", "Shift+F12", "F11"), "his keys stay");
+        assert!(s.command.enabled && s.command.planner_model == DEFAULT_PLANNER);
+        assert_eq!(crate::hotkey::validate(&s.hotkeys), Ok(()));
+        // once: a v5 user who turns cleanup back on keeps it
+        let mut s2 = s.clone();
+        s2.cleanup.level = CleanupLevel::Light;
+        save(&p, &s2).unwrap();
+        assert_eq!(load(&p).cleanup.level, CleanupLevel::Light);
+        // other values stay; a non-F ptt keeps the default recents; not MAI = cleanup kept
+        std::fs::write(&p, r#"{"version":4,"hotkeys":{"ptt":"RightOption","hands_free_grace_ms":700},"stt":{"provider":"elevenlabs"},"cleanup":{"level":"medium"}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!((s.hotkeys.hands_free_grace_ms, s.hotkeys.recents.as_str(), s.cleanup.level.clone()), (700, "Ctrl+F1", CleanupLevel::Medium));
+        // a recents key already used elsewhere starts unbound
+        std::fs::write(&p, r#"{"version":4,"hotkeys":{"ptt":"F5","paste_last":"Ctrl+F5"}}"#).unwrap();
+        assert_eq!(load(&p).hotkeys.recents, "");
+    }
+
+    #[test]
+    fn settings_planner_model_roundtrip_and_grace_clamp() {
+        let mut page = Settings::default();
+        page.command.planner_model = "anthropic/claude-haiku-5.5".into();
+        page.hotkeys.hands_free_grace_ms = 9000;
+        let m = merge(&Settings::default(), page);
+        assert_eq!(m.command.planner_model, "anthropic/claude-haiku-5.5");
+        assert_eq!(m.hotkeys.hands_free_grace_ms, 1500);
+        let mut page = Settings::default();
+        page.command.planner_model = " ".into();
+        assert_eq!(merge(&Settings::default(), page).command.planner_model, DEFAULT_PLANNER);
+        let p = tmp_dir("planner").join("settings.json");
+        let mut s = Settings::default();
+        s.command.planner_model = "openai/gpt-6-luna".into();
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p).command.planner_model, "openai/gpt-6-luna");
+    }
+
+    #[test]
+    fn v6_turns_press_enter_on_once() {
+        let p = tmp_dir("v6mig").join("settings.json");
+        std::fs::write(&p, r#"{"version":5,"paste":{"press_enter_command":false}}"#).unwrap();
+        let s = load(&p);
+        assert!(s.paste.press_enter_command && s.styles.strip_inverted);
+        let mut s2 = s.clone();
+        s2.paste.press_enter_command = false;
+        save(&p, &s2).unwrap();
+        assert!(!load(&p).paste.press_enter_command, "a v6 user who turns it off keeps it off");
+    }
+
+    #[test]
     fn wire_names_are_snake_case() {
         let j = serde_json::to_value(Settings::default()).unwrap();
         assert_eq!(j["stt"]["provider"], "whisper_local");
         assert_eq!(j["cleanup"]["provider"], "openrouter");
         assert_eq!(j["mic"]["selection"], "auto");
         assert_eq!(j["styles"]["style"], "formal");
+        assert_eq!(serde_json::to_value(Style::Lowercase).unwrap(), "lowercase");
         let d = serde_json::to_value(MicSelection::Device { id: "x".into() }).unwrap();
         assert_eq!(d, serde_json::json!({"device": {"id": "x"}}));
     }
 }
+

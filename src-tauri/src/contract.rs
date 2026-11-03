@@ -40,15 +40,38 @@ pub struct Settings {
     pub command: CommandSettings,
 }
 
-/// Voice control: hold the command key, say what to do, Jev picks the action and the target.
+/// Voice control: hold or double-tap the command key and talk; the planner LLM writes the actions while you speak,
+/// Jev grounds each click target on the screen (VOICE_CONTROL_V2).
 #[serde(default)]
 pub struct CommandSettings {
     /// Off = the command key is not registered.
     pub enabled: bool,
-    /// Ask for a 2nd press of the command key before a step Jev rates as destructive or as sending a message.
+    /// Ask for a yes (voice, or the command key) before a step that sends, deletes or buys. Return always asks.
     pub confirm_risky: bool,
-    /// Pinned: Jev answers can shift between releases. "typesafe/jev-1.14".
+    /// Pinned: Jev answers can shift between releases. "typesafe/jev-1.14". Jev only grounds click targets now.
     pub model: String,
+    /// The planner LLM on OpenRouter (any chat model id; `list_models("chat")` lists them). It turns the
+    /// spoken order into actions. Default DEFAULT_PLANNER (`.lo/planner-bench.md`).
+    pub planner_model: String,
+    /// "Clicks: Auto": click the target Jev picks (the confidence gates ask only when unsure). Off (default) = "I
+    /// choose": every click shows the top 3-5 targets as numbered choices and waits for Pablo's pick.
+    pub auto_click: bool,
+    /// The STT for commands. None = auto: the dictation provider (an order is heard the way a dictation is).
+    pub stt: Option<SttProvider>,
+    /// Agent mode (on by default): every order goes to the local Claude Code CLI (`claude -p`, the subscription
+    /// login) driving the Mac through susurro's own tools (agent.rs), except the trivial ones (agent::local_intent).
+    pub agent: bool,
+    /// "Fast mode (beta)": the old planner path (orders go through the planner; agent mode only on "modo agente: ..."
+    /// or an order that failed twice).
+    pub fast_mode: bool,
+    /// The Claude Code model for agent mode: an alias ("sonnet", "opus") or a full model id. Empty = its default.
+    pub agent_model: String,
+    /// The OpenRouter vision model when the claude CLI is missing or not logged in.
+    pub agent_fallback: String,
+    /// "Computer use" (on by default, Pablo 2026-10-19): the agent sees the whole screen in a screenshot after every
+    /// action and points at x,y, the way Claude's computer use works. Off = it reads the numbered marks (AX) and takes
+    /// a screenshot only for pixels.
+    pub agent_vision: bool,
 }
 
 /// One binding per action. Modifier-only bindings ("Fn", "RightOption", "LeftOption", "RightCommand", "LeftCommand",
@@ -59,12 +82,18 @@ pub struct Hotkeys {
     pub ptt: String,
     pub hands_free: Option<String>,
     pub double_tap: bool,
+    /// After a hold is released, a press within this window continues hands-free (0-1500, 0 = off).
+    /// The release itself never waits: the text pastes at once. Also the double-tap window.
+    pub hands_free_grace_ms: u32,
     pub cancel: String,
     pub paste_last: String,
     /// Copies the last transcript to the clipboard (Wispr: Ctrl+Cmd+C).
     pub copy_last: String,
     /// Hold for voice control (default "F2"). A global-shortcut combo, never modifier-only. "" = none.
+    /// Double-tap (or hold, release, press again in the grace) = a hands-free live command session.
     pub command: String,
+    /// Opens the recents list (the last 9 dictations; 1-9 pastes, Cmd+1-9 copies). Default "Ctrl+" + the ptt F-key.
+    pub recents: String,
 }
 
 #[serde(default)]
@@ -123,6 +152,8 @@ pub struct SttSettings {
     pub openrouter_model: String,
     /// Cloud STT fails -> whisper local, if a model is downloaded.
     pub local_fallback: bool,
+    /// MAI-Transcribe's own "clean" style (drops fillers). Independent of the LLM cleanup.
+    pub mai_clean: bool,
 }
 
 #[serde(default)]
@@ -149,6 +180,14 @@ pub enum SttProvider {
     /// OpenRouter's JSON transcription API (stt/openrouter.rs): dictionary words go as provider options.
     #[serde(rename = "openrouter")]
     OpenRouter,
+    /// ElevenLabs Scribe v2 Realtime over a WebSocket (stt/scribe_rt.rs): the words arrive while you speak.
+    /// Batch paths (Retry, the fallback) use MAI when an OpenRouter key exists, else Scribe v2 batch.
+    #[serde(rename = "elevenlabs_realtime")]
+    ElevenLabsRealtime,
+    /// OpenAI realtime transcription (gpt-live-transcribe) over a WebSocket, the same session code as Scribe
+    /// Realtime (stt/scribe_rt.rs). Key: KeyName::Openai. Batch paths as Scribe Realtime.
+    #[serde(rename = "openai_realtime")]
+    OpenAiRealtime,
 }
 
 #[serde(default)]
@@ -180,6 +219,10 @@ pub enum LlmProvider {
 pub struct Styles {
     pub style: Style,
     pub raw_apps: Vec<String>,
+    /// Drop the Spanish opening marks ¿ ¡ (? and ! stay). Pablo does not write them when chatting.
+    pub strip_inverted: bool,
+    /// Bundle ids that keep ¿ ¡ even with `strip_inverted` on.
+    pub inverted_apps: Vec<String>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -188,6 +231,8 @@ pub enum Style {
     Casual,
     VeryCasual,
     Excited,
+    /// No capital letters anywhere (dictionary words and acronyms keep theirs); periods and commas stay.
+    Lowercase,
 }
 
 #[serde(default)]
@@ -201,6 +246,7 @@ pub struct PasteOpts {
     /// Wait before the old clipboard goes back. Slow (Electron) apps get at least 1500 ms (paste.rs).
     /// 500 ms follows Wispr; the real per-app values need to be measured (PLAN 12).
     pub restore_delay_ms: u32,
+    /// "press enter" / "presenter" / "dale enter" / "enviar" at the end of a dictation: dropped, then Return.
     pub press_enter_command: bool,
 }
 
@@ -287,6 +333,10 @@ pub struct SessionState {
     pub message: Option<String>,
     /// Recording / Processing / Acting belong to a voice command (the command key), not a dictation.
     pub command: bool,
+    /// Recording, just after a hold was released: the overlay counts this down ("tap again for hands-free").
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_ms: Option<u32>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -390,6 +440,7 @@ pub struct ModelProgress {
 
 pub struct KeyStatus {
     pub elevenlabs: bool,
+    pub openai: bool,
     pub openrouter: bool,
     pub local_stt: bool,
     pub local_llm: bool,
@@ -399,6 +450,7 @@ pub struct KeyStatus {
 #[serde(rename_all = "snake_case")]
 pub enum KeyName {
     Elevenlabs,
+    Openai,
     Openrouter,
     LocalStt,
     LocalLlm,
@@ -457,7 +509,7 @@ pub struct OrModel {
     pub price_hour: Option<f64>,
     /// The model gets the dictionary words as provider options (MAI phrase list, ElevenLabs keyterms).
     pub keywords: bool,
-    /// The default pick (microsoft/mai-transcribe-2).
+    /// The default pick (DEFAULT_OPENROUTER_STT for STT, DEFAULT_OPENROUTER_CLEANUP for chat).
     pub recommended: bool,
 }
 
@@ -483,10 +535,12 @@ pub struct Mark {
     pub region: String,
 }
 
-/// marks = numbered marks are up, Jev is choosing. pick = "Which one?" (the top 3 in `choices`).
-/// confirm = a risky step waits for the command key (Esc stops).
+/// marks = numbered marks are up, the target is being grounded. pick = "Which one?" (the top 3 in `choices`).
+/// confirm = a risky step or Return waits for a yes (voice, or the command key; Esc stops).
 #[serde(rename_all = "snake_case")]
 pub enum CmdStatus {
+    /// The action waits in the live session's queue.
+    Queued,
     Thinking,
     Marks,
     Aim,
@@ -505,14 +559,15 @@ pub enum CmdStatus {
 #[serde(default)]
 pub struct CommandStep {
     pub instruction: String,
-    /// 1-based; 0 = the fast path (no screen read).
+    /// 1-based action number in the live session.
     pub step: u32,
+    /// v1 step cap; 0 in a live session.
     pub max: u32,
     pub status: CmdStatus,
-    /// click | double_click | focus_and_type | scroll_up | scroll_down | press_key | open_app | paste_last |
-    /// copy_last | new_tab | close_tab | back | forward | reload | done
+    /// What the executor did: click | focus_and_type | scroll_up | scroll_down | press_key | open_app | copy | paste |
+    /// select_typed | delete_typed
     pub action: Option<String>,
-    /// open_app: the app; press_key: the key; focus_and_type: the text.
+    /// open_app: the app; press_key: the combo; focus_and_type: the text; select/delete_typed: the typed text.
     pub detail: Option<String>,
     /// The display the marks window covers, global points.
     pub display: PtRect,
@@ -520,12 +575,98 @@ pub struct CommandStep {
     pub marks: Vec<Mark>,
     /// The chosen mark (aim, confirm).
     pub target: Option<u32>,
-    /// pick: the top 3 (mark id, confidence).
+    /// pick: the top 3 (mark id, confidence). Pick mode (`choose`): 3 to 5, numbered 1.. in this order.
     pub choices: Vec<(u32, f32)>,
+    /// Pick mode ("Clicks: I choose"): the choices are numbered by place (1..5), not by mark id.
+    pub choose: bool,
+    /// Pick mode: Jev is sure of choice 1, it is highlighted and "sí" takes it.
+    pub preselect: bool,
     pub latency_ms: u32,
     pub cost_usd: f64,
     /// unsure / blocked / stopped / error text. setup: "screen_recording" | "key" | "accessibility".
     pub message: Option<String>,
+    /// Live session: the planner op (key | type | click | open_app | select_typed | delete_typed | copy | paste | scroll).
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Live session: the order (one planner reply) this action belongs to, 1-based. 0 = none.
+    pub order: u32,
+}
+
+/// Payload of `command_live` (overlay, marks, main): the live command session.
+#[derive(Default)]
+#[serde(default)]
+pub struct LiveState {
+    /// A live session runs (recording or draining its queue).
+    pub on: bool,
+    /// Words heard but not planned yet (the order is not complete).
+    pub buffer: String,
+    /// Short labels of the queued actions, next first: "⌘T", "type “ls”", "⏎".
+    pub queue: Vec<String>,
+    /// The question that waits for a voice answer: "Press Return? Say yes · F11 · Esc", "Which one? 4, 7 or 9".
+    pub pending: Option<String>,
+    /// Pablo moved the mouse or typed: the marks hide until the next order.
+    pub took_over: bool,
+    /// Pablo pressed a key or clicked: the queue waits (no more actions) until his next spoken order.
+    pub paused: bool,
+    /// The last chunk of text heard.
+    pub last_said: String,
+    /// "muestra los números": every mark shows its number (vc-feedback 22). Off = only the target and the tied
+    /// candidates are drawn.
+    pub numbers: bool,
+    /// Agent mode, F11 down: what is on screen, for the card on the right (glance.rs). None once an order runs.
+    pub glance: Option<Glance>,
+}
+
+/// The screen-context card: the front app and what it shows, so an order can lean on it ("send this to Juanito").
+#[derive(Default)]
+#[serde(default)]
+pub struct Glance {
+    pub app: String,
+    /// The front window's title (the page title in a browser, the chat in most messengers).
+    pub window: String,
+    /// The focused element: "Message (text field)", "" = none.
+    pub focus: String,
+    /// A draft in the focused field (its tail), "" = empty.
+    pub draft: String,
+    /// The main items on screen (chats, links, buttons), at most glance::ITEMS.
+    pub items: Vec<String>,
+    /// One or two sentences about the screen from a vision model; None = not yet, or no OpenRouter key.
+    pub summary: Option<String>,
+}
+
+/// One thing susurro did (or heard) in voice control. RAM only, newest last, 50 max.
+pub struct MemoryEntry {
+    /// ms since the epoch.
+    pub at: i64,
+    pub kind: MemKind,
+    pub text: String,
+    pub app: String,
+    /// The field name or role it went into ("" = none).
+    pub field: String,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum MemKind {
+    Said,
+    Typed,
+    Deleted,
+    Copied,
+    Pasted,
+    Clicked,
+    Key,
+    Opened,
+    Failed,
+}
+
+/// Payload of `recents` (overlay): the recents list. Empty items = closed.
+#[derive(Default)]
+#[serde(default)]
+pub struct Recents {
+    /// Newest first, at most 9 dictation rows. Status copied / failed = it did not land in a field.
+    pub items: Vec<HistoryItem>,
+    /// 1-9: this row was just pasted or copied (the overlay flashes it, then the list closes).
+    pub picked: Option<u32>,
 }
 
 /// dBFS, throttled to 30 Hz.
@@ -544,9 +685,25 @@ pub struct Navigate {
 
 /// v2: the default ptt became F1; a stored "Fn" moves to it once, and the old 350 ms restore delay becomes 500.
 /// v3: voice control (hotkeys.command = "F2"), and an empty OpenRouter STT model becomes MAI-Transcribe 2.
-pub const SETTINGS_VERSION: u32 = 3;
+/// v4: an empty OpenRouter cleanup model becomes DEFAULT_OPENROUTER_CLEANUP (empty = cleanup silently off).
+/// v5: hotkeys.recents ("Ctrl+" + an F-key ptt), the old 400 ms grace becomes 1000, LLM cleanup off once for MAI STT.
+/// v6: "press enter" at the end of a dictation is on by default (turned on once for older files).
+pub const SETTINGS_VERSION: u32 = 8;
 pub const DEFAULT_OPENROUTER_STT: &str = "microsoft/mai-transcribe-2";
+/// Cheap and fast, keeps the words: 0.7 s warm on a short cleanup, $0.10/$0.40 per M tokens
+/// (measured 2026-10-17 vs claude-haiku-5.5, gemini-3.1-flash-lite, gpt-4.1-nano).
+pub const DEFAULT_OPENROUTER_CLEANUP: &str = "google/gemini-2.5-flash-lite";
 pub const JEV_MODEL: &str = "typesafe/jev-1.14";
+/// `.lo/planner-bench.md` (2026-10-17): fastest of the models with every plan right (0.78 s p50, 60/60 same effect),
+/// Cerebras first, then Groq and SambaNova, with reasoning low (planner.rs `extra_for`).
+pub const DEFAULT_PLANNER: &str = "openai/gpt-oss-120b";
+
+impl SttProvider {
+    /// A WebSocket provider: words while you speak (stt/scribe_rt.rs).
+    pub fn realtime(&self) -> bool {
+        matches!(self, SttProvider::ElevenLabsRealtime | SttProvider::OpenAiRealtime)
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -577,10 +734,12 @@ impl Default for Hotkeys {
             ptt: "F1".into(),
             hands_free: None,
             double_tap: true,
+            hands_free_grace_ms: 1000,
             cancel: "Escape".into(),
             paste_last: "Ctrl+Cmd+V".into(),
             copy_last: "Ctrl+Cmd+C".into(),
             command: "F2".into(),
+            recents: "Ctrl+F1".into(),
         }
     }
 }
@@ -606,6 +765,7 @@ impl Default for SttSettings {
             elevenlabs: ElevenOpts::default(),
             openrouter_model: DEFAULT_OPENROUTER_STT.into(),
             local_fallback: true,
+            mai_clean: true,
         }
     }
 }
@@ -627,7 +787,7 @@ impl Default for CleanupSettings {
         Self {
             level: CleanupLevel::Light,
             provider: LlmProvider::OpenRouter,
-            openrouter_model: String::new(),
+            openrouter_model: DEFAULT_OPENROUTER_CLEANUP.into(),
             local_base_url: "http://127.0.0.1:1234/v1".into(),
             local_model: String::new(),
             timeout_ms: 8000,
@@ -637,7 +797,7 @@ impl Default for CleanupSettings {
 
 impl Default for Styles {
     fn default() -> Self {
-        Self { style: Style::Formal, raw_apps: vec![] }
+        Self { style: Style::Formal, raw_apps: vec![], strip_inverted: true, inverted_apps: vec![] }
     }
 }
 
@@ -649,7 +809,7 @@ impl Default for DictOpts {
 
 impl Default for PasteOpts {
     fn default() -> Self {
-        Self { restore_clipboard: true, restore_delay_ms: 500, press_enter_command: false }
+        Self { restore_clipboard: true, restore_delay_ms: 500, press_enter_command: true }
     }
 }
 
@@ -673,13 +833,15 @@ impl Default for PrivacyOpts {
 
 impl Default for SessionState {
     fn default() -> Self {
-        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None, command: false }
+        Self { phase: Phase::Idle, started_at: None, device: None, app: None, message: None, command: false, grace_ms: None }
     }
 }
 
 impl Default for CommandSettings {
     fn default() -> Self {
-        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into() }
+        // agent_model: sonnet, measured 2026-10-18 (GUI round 1, T1-T4, one run each): sonnet 25.5 s and every part
+        // of every order; haiku 44.8 s, wandered in Finder (26.7 s) and skipped the new tab in JS Paint.
+        Self { enabled: false, confirm_risky: true, model: JEV_MODEL.into(), planner_model: DEFAULT_PLANNER.into(), auto_click: false, stt: None, agent: true, fast_mode: false, agent_model: "sonnet".into(), agent_fallback: "google/gemini-3.5-flash-lite".into(), agent_vision: true }
     }
 }
 

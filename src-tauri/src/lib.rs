@@ -1,6 +1,7 @@
 //! Tauri builder, plugins, AppState, windows, invoke_handler. Written once in WP0 (PLAN 1.1).
 //! Later WPs edit only the bodies of their own modules. WP5 adds its setup calls (marked below).
 
+pub mod agent;
 pub mod audio;
 pub mod ax;
 pub mod cleanup;
@@ -8,21 +9,28 @@ pub mod command;
 pub mod contract;
 pub mod db;
 pub mod dictionary;
+pub mod glance;
 pub mod history;
 pub mod hotkey;
 pub mod jev;
+pub mod learn;
+pub mod live;
 pub mod models;
+pub mod ocr;
 pub mod paste;
 pub mod permissions;
 pub mod pipeline;
+pub mod planner;
 pub mod secrets;
 pub mod session;
 pub mod settings;
+pub mod slash;
 pub mod stt;
 #[cfg(debug_assertions)]
 pub mod test_hooks;
 pub mod text;
 pub mod tray;
+pub mod web;
 pub mod platform {
     #[cfg(target_os = "macos")]
     pub mod macos;
@@ -102,6 +110,7 @@ pub fn run() {
                 data_dir,
             });
             let h = app.handle();
+            learn::init(h);
             session::spawn(h.clone(), rx);
             audio::spawn_monitor(h.clone());
             app.manage(hotkey::start(h, &hotkeys, hotkey_tx)?);
@@ -172,6 +181,8 @@ pub fn run() {
             hotkey::hotkey_capture,
             platform::macos::set_pill_rect,
             command::command_log,
+            live::command_memory,
+            live::command_memory_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building susurro");
@@ -180,6 +191,10 @@ pub fn run() {
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
             show_main(app);
+        }
+        // the agent's warm claude process never outlives the app
+        if let tauri::RunEvent::Exit = event {
+            agent::kill();
         }
         let _ = (app, event);
     });

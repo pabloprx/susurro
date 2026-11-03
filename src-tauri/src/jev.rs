@@ -1,6 +1,6 @@
 //! TypeSafe Jev through OpenRouter's Decisions API (`.lo/jev-research.md`): typed questions in, typed answers out.
 //! `POST https://openrouter.ai/api/alpha/decisions`, Bearer = the OpenRouter key. Four question types: noul,
-//! choice, score, box. Jev returns no text. One retry on 429 / 529 (the docs say: back off and retry).
+//! choice, score, box. Jev returns no text. 429 / 5xx: send_json retries (the docs say: back off and retry).
 
 use crate::stt::{http, send_json};
 use base64::Engine;
@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 pub const DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
 const TIMEOUT: Duration = Duration::from_secs(15);
-const BACKOFF: Duration = Duration::from_millis(600);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Reply {
@@ -32,20 +31,9 @@ pub fn ask(url: &str, key: &str, model: &str, state: &Value, questions: &Value) 
             .json(&body);
         send_json(rb, "Jev")
     };
-    let v = match send() {
-        Err(e) if retryable(&e.to_string()) => {
-            std::thread::sleep(BACKOFF);
-            send()?
-        }
-        r => r?,
-    };
+    let v = send()?; // send_json retries 429 / 5xx itself
     anyhow::ensure!(v["answers"].is_object(), "Jev: no answers in the response");
     Ok(Reply { cost: v["usage"]["cost"].as_f64().unwrap_or(0.0), answers: v["answers"].clone(), latency_ms: t.elapsed().as_millis() as u32 })
-}
-
-/// send_json's text for 429 and 529 (overloaded).
-fn retryable(e: &str) -> bool {
-    e.contains("(HTTP 429)") || e.contains("(HTTP 529)")
 }
 
 /// A Jev image part: only PNG and JPEG data URLs are accepted.
@@ -132,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn retries_once_on_429_and_529() {
+    fn retries_429_and_529_silently() {
         let mut srv = mockito::Server::new();
         let url = format!("{}/d", srv.url());
         let busy = srv.mock("POST", "/d").with_status(429).with_body(r#"{"error":{"code":429,"message":"Rate limit exceeded"}}"#).expect(1).create();
@@ -142,7 +130,7 @@ mod tests {
         ok.assert();
         busy.remove();
         ok.remove();
-        let over = srv.mock("POST", "/d").with_status(529).with_body("overloaded").expect(2).create();
+        let over = srv.mock("POST", "/d").with_status(529).with_body("overloaded").expect(4).create();
         let e = ask(&url, "k", "m", &json!("s"), &json!({})).unwrap_err().to_string();
         over.assert();
         assert!(e.contains("Jev server error (HTTP 529)"), "{e}");

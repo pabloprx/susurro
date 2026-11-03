@@ -36,8 +36,13 @@ pub fn key(s: &str) -> String {
     tokenize(s).into_iter().map(|t| t.norm).collect::<Vec<_>>().join(" ")
 }
 
+/// One of the `n` most frequent words of either language (the lists are by frequency). A rare call: no cache.
+pub(crate) fn is_top(w: &str, n: usize) -> bool {
+    [include_str!("../data/common_en.txt"), include_str!("../data/common_es.txt")].iter().any(|f| f.lines().take(n).any(|l| text::norm(l) == w))
+}
+
 /// Top 5000 words per language, from hermitdave/FrequencyWords (OpenSubtitles 2018, MIT).
-fn is_common(w: &str) -> bool {
+pub(crate) fn is_common(w: &str) -> bool {
     static SET: OnceLock<HashSet<String>> = OnceLock::new();
     SET.get_or_init(|| {
         [include_str!("../data/common_en.txt"), include_str!("../data/common_es.txt")]
@@ -50,7 +55,7 @@ fn is_common(w: &str) -> bool {
 }
 
 /// Damerau-Levenshtein (optimal string alignment).
-fn dl(a: &[char], b: &[char]) -> usize {
+pub(crate) fn dl(a: &[char], b: &[char]) -> usize {
     let (n, m) = (a.len(), b.len());
     let mut d = vec![vec![0usize; m + 1]; n + 1];
     for (i, row) in d.iter_mut().enumerate() {
@@ -566,6 +571,58 @@ pub fn record_uses(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Default words (next-queue 4, 7): the product names Pablo says and the slang he writes, with their spoken forms.
+/// `seed` adds them once (db v4), each only when nothing in the dictionary uses that text or correction yet.
+pub const SEEDS: &[(&str, &[&str])] = &[
+    ("Jev", &[]),
+    ("TypeSafe", &[]),
+    ("ElevenLabs", &[]),
+    ("OpenRouter", &[]),
+    ("Contaflow", &[]),
+    ("susurro", &[]),
+    ("Ghostty", &[]),
+    ("Claude", &[]),
+    ("xd", &["equis de", "x d"]),
+    ("67", &["six seven", "seis siete"]),
+    ("lol", &[]),
+    ("jaja", &[]),
+    ("jajaja", &[]),
+    ("wtf", &["w t f"]),
+    ("bro", &[]),
+    ("po", &[]),
+    ("cachai", &[]),
+];
+
+/// Default words added by db v5 (Pablo 2026-10-19: "PR, PR, PR... the transcriber got it wrong every time"): "PR"
+/// (pull request) as Whisper hears it said in Spanish ("pe erre") and in English ("pee are", "Pierre"). Starred, so it
+/// leads the Whisper prompt and the keyterms (the newest first among starred words: "PR" goes in last).
+pub const SEEDS_V5: &[(&str, &[&str])] = &[
+    ("PRs", &["pe erres", "pi ars", "piars", "pee ars"]),
+    ("PR", &["pe erre", "pe ere", "pi ar", "pi are", "piar", "pee are", "pee ar", "Pierre"]),
+];
+
+pub fn seed_input(text: &str, aliases: &[&str]) -> DictEntryInput {
+    DictEntryInput { id: None, kind: DictKind::Word, text: text.into(), aliases: aliases.iter().map(|a| a.to_string()).collect(), expansion: None, exact_only: false, starred: false }
+}
+
+/// Adds the SEEDS that do not clash with an entry (validate refuses a text or correction already in use).
+pub fn seed(conn: &Connection) {
+    seed_with(conn, SEEDS, false);
+}
+
+/// db v5: SEEDS_V5, starred.
+pub fn seed_v5(conn: &Connection) {
+    seed_with(conn, SEEDS_V5, true);
+}
+
+fn seed_with(conn: &Connection, list: &[(&str, &[&str])], starred: bool) {
+    for (text, aliases) in list {
+        if let Err(e) = upsert(conn, &DictEntryInput { starred, ..seed_input(text, aliases) }) {
+            log::info!("dictionary seed {text} skipped: {e}");
+        }
+    }
+}
+
 // ---------- commands ----------
 
 #[tauri::command]
@@ -644,6 +701,26 @@ mod tests {
     }
     fn dict() -> Dictionary {
         Dictionary::new(sample(), DictOpts { fuzzy: true })
+    }
+
+    #[test]
+    fn pr_seeds_fix_the_spoken_forms() {
+        let es: Vec<DictEntry> = SEEDS_V5.iter().enumerate().map(|(i, (t, a))| w(i as i64 + 1, t, a)).collect();
+        let d = Dictionary::new(es, DictOpts { fuzzy: true, ..Default::default() });
+        for (heard, want) in [
+            ("Abre el pe erre de susurro", "Abre el PR de susurro"),
+            ("revisa el pr que mandé", "revisa el PR que mandé"),
+            ("I opened a pee are for it", "I opened a PR for it"),
+            ("merge the Pierre please", "merge the PR please"),
+            ("check the P.R.", "check the PR."),
+            ("los pi ars de hoy", "los PRs de hoy"),
+            ("tengo dos pe erres abiertos", "tengo dos PRs abiertos"),
+            // other words stay
+            ("the price is right", "the price is right"),
+            ("vamos a pie", "vamos a pie"),
+        ] {
+            assert_eq!(d.apply(heard).text, want, "{heard}");
+        }
     }
 
     #[test]

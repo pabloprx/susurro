@@ -3,7 +3,7 @@
 //!   openai_compat_server:    SUSURRO_TEST_OAI_BASE=http://127.0.0.1:<port>/v1   (whisper-server)
 //!   elevenlabs_real:         ELEVENLABS_API_KEY
 //!   openrouter_real:         OPENROUTER_API_KEY
-//!   openrouter_mai_phrase_list, jev_set_of_mark: OPENROUTER_API_KEY
+//!   openrouter_mai_phrase_list, mai_chunk_latency, jev_set_of_mark: OPENROUTER_API_KEY
 //!   local_llm_down:          none (talks to a closed port and to Ollama if it runs)
 //! Cloud tests make few calls and use short fixtures. A recording proxy sits between the client and the real
 //! server, so the tests check what was sent (prompt, keyterms) and what came back.
@@ -371,6 +371,24 @@ fn openrouter_mai_phrase_list() {
     println!("MAI, phrase list + clean ({} ms): {:?}", t.elapsed().as_millis(), biased.text);
     assert!(found(&plain.text) <= 1, "MAI spells the rare words with no list: the clip cannot show the gain: {}", plain.text);
     assert_eq!(found(&biased.text), terms.len(), "the phrase list did not fix the rare words: {}", biased.text);
+}
+
+/// VOICE_CONTROL_V2 1.3 "needs to be measured": MAI latency on the short chunks a live command session sends
+/// (0.6 s, 1.5 s, 3 s cut from en_custom.wav), one call each, in sequence. Prints latency; asserts only that each
+/// answers. Cost: MAI is priced per hour of audio, 5 s total.
+#[test]
+#[ignore]
+fn mai_chunk_latency() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY");
+    let audio = wav("en_custom.wav");
+    let mai = OpenRouter { base: susurro_lib::stt::OPENROUTER_BASE.into(), key, model: "microsoft/mai-transcribe-2".into(), clean: true };
+    for secs in [0.6f32, 1.5, 3.0] {
+        let n = ((secs * 16000.0) as usize).min(audio.len());
+        let t = Instant::now();
+        let r = mai.transcribe(&SttRequest { audio: &audio[..n], language: Some("en"), hints: &Hints::default() });
+        println!("MAI chunk {secs:.1} s: {} ms -> {:?}", t.elapsed().as_millis(), r.as_ref().map(|o| o.text.clone()));
+        assert!(r.is_ok(), "{r:?}");
+    }
 }
 
 // ---------- Jev: Set-of-Mark target pick ----------

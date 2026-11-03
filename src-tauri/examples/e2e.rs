@@ -63,7 +63,7 @@ fn run() -> anyhow::Result<()> {
     );
     let t = Instant::now();
     let stt = |r: &SttRequest| whisper.transcribe(r);
-    let opts = pipeline::Opts { language: Some("auto"), style: Style::Formal, raw_app: false, press_enter_command: false };
+    let opts = pipeline::Opts { language: Some("auto"), style: Style::Formal, raw_app: false, press_enter_command: false, strip_inverted: false, slash: None };
     let done = match pipeline::run(&clip, &opts, &dict, &stt, None) {
         Outcome::Text(d) => d,
         other => anyhow::bail!("pipeline gave {other:?}"),

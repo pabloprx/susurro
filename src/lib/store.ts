@@ -1,5 +1,6 @@
 // Tiny shared stores (no state library, DESIGN 11) + formatting helpers used by many screens.
 import { useEffect, useSyncExternalStore } from "react";
+import { toast } from "../ui";
 import { api, on, type DeviceKind, type HotkeyStatus, type KeyStatus, type MicState, type Permissions, type Settings } from "./api";
 
 function store<T>(load: () => Promise<T>) {
@@ -82,6 +83,9 @@ export function saveSettings(mutate: (s: Settings) => void): Promise<void> {
   });
 }
 
+/** saveSettings for callers with no error UI of their own: a rejected save shows a toast, never a silent revert. */
+export const save = (mutate: (s: Settings) => void) => saveSettings(mutate).catch((e) => toast(`Not saved: ${e}`, { kind: "error" }));
+
 export * from "./format";
 
 export const KIND_LABEL: Record<DeviceKind, string> = {
@@ -103,7 +107,7 @@ export const words = (s: string) => (s.trim() ? s.trim().split(/\s+/).length : 0
 
 /** Voice control stays hidden until the command runner exists (command.rs has only the log): a dead switch otherwise.
  *  ponytail: a localStorage flag ("susurro.labs.voice" = "1") shows it for dev and the UI tests; drop it when the runner lands. */
-export const VOICE_CONTROL = localStorage.getItem("susurro.labs.voice") === "1";
+export const VOICE_CONTROL = true;
 
 /** Theme lives in localStorage, not Settings (PLAN 9). */
 export type Theme = "system" | "dark" | "light";

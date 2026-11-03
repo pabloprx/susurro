@@ -4,6 +4,7 @@
 pub mod elevenlabs;
 pub mod openai_compat;
 pub mod openrouter;
+pub mod scribe_rt;
 pub mod whisper_local;
 
 use crate::AppState;
@@ -51,7 +52,14 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
     let st = &s.stt;
     let primary: Box<dyn Transcriber> = match st.provider {
         SttProvider::WhisperLocal => {
-            return Ok(Box::new(whisper_local::Whisper::new(whisper_local::context(state, &st.whisper_model)?)));
+            let (file, note) = whisper_local::usable(&state.data_dir, &st.whisper_model);
+            anyhow::ensure!(
+                whisper_local::model_path(&state.data_dir, &file).exists(),
+                "No Whisper model is downloaded yet ({file}). Wait for the download to finish, or download one in Providers"
+            );
+            let mut w = whisper_local::Whisper::new(whisper_local::context(state, &file)?);
+            w.note = note;
+            return Ok(Box::new(w));
         }
         SttProvider::OpenAiCompat => Box::new(openai_compat::OpenAiCompat {
             base: st.openai_compat.base_url.clone(),
@@ -61,12 +69,11 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
         }),
         SttProvider::OpenRouter => {
             anyhow::ensure!(!st.openrouter_model.is_empty(), "Pick an OpenRouter transcription model first");
-            let clean_key = secrets::get(crate::cleanup::key_name(s));
             Box::new(openrouter::OpenRouter {
                 base: OPENROUTER_BASE.into(),
                 model: st.openrouter_model.clone(),
                 key: secrets::get(KeyName::Openrouter).ok_or_else(|| anyhow::anyhow!("Add an OpenRouter API key first"))?,
-                clean: crate::cleanup::effective_level(s, clean_key.as_deref()) != crate::contract::CleanupLevel::None,
+                clean: st.mai_clean,
             })
         }
         SttProvider::ElevenLabs => Box::new(elevenlabs::ElevenLabs {
@@ -74,16 +81,50 @@ pub fn build(s: &Settings, state: &AppState) -> anyhow::Result<Box<dyn Transcrib
             key: secrets::get(KeyName::Elevenlabs).ok_or_else(|| anyhow::anyhow!("Add an ElevenLabs API key first"))?,
             opts: st.elevenlabs.clone(),
         }),
+        // The live provider's batch path (Retry, the fallback after a failed socket): MAI, else Scribe v2 batch.
+        // ponytail: OpenAI Realtime falls back like Scribe Realtime (MAI, else Scribe batch); no OpenAI batch path.
+        SttProvider::ElevenLabsRealtime | SttProvider::OpenAiRealtime => {
+            let mut b = s.clone();
+            b.stt.provider = batch_for_realtime(secrets::get(KeyName::Openrouter).is_some() && !st.openrouter_model.is_empty());
+            return build(&b, state);
+        }
     };
     if !st.local_fallback {
         return Ok(primary);
     }
     // ponytail: only an already-loaded context is used (try_lock, no wait on a running preload).
-    let local = state.whisper.try_lock().ok().and_then(|g| g.as_ref().filter(|(f, _)| *f == st.whisper_model).map(|(_, c)| c.clone()));
+    let (file, _) = whisper_local::usable(&state.data_dir, &st.whisper_model);
+    let local = state.whisper.try_lock().ok().and_then(|g| g.as_ref().filter(|(f, _)| *f == file).map(|(_, c)| c.clone()));
     Ok(match local {
         Some(ctx) => Box::new(WithFallback { primary, local: whisper_local::Whisper::new(ctx) }),
         None => primary,
     })
+}
+
+/// The batch STT behind Scribe Realtime: MAI when the OpenRouter key exists, else Scribe v2 batch (same key).
+pub fn batch_for_realtime(openrouter: bool) -> SttProvider {
+    if openrouter { SttProvider::OpenRouter } else { SttProvider::ElevenLabs }
+}
+
+/// The STT of voice-control commands: the explicit choice, else (auto) the dictation's provider, so an order is heard
+/// the way a dictation is. Pablo 2026-10-19: "the dictation takes every word, the command mode gets the wrong words"
+/// (auto was local Whisper on 0.5 s chunks since agent v2).
+pub fn command_stt(s: &Settings) -> SttProvider {
+    s.command.stt.clone().unwrap_or_else(|| s.stt.provider.clone())
+}
+
+/// The realtime session options of provider `p`, or None when `p` is not a realtime provider or its key is
+/// missing. `keyterms`: dictionary words (commands always send them, vc-feedback 18a; dictation follows the Send
+/// keyterms toggle).
+pub fn realtime_opts(p: &SttProvider, s: &Settings, rate: u32, hints: &Hints, keyterms: bool) -> Option<scribe_rt::Opts> {
+    let (proto, url, k) = match p {
+        SttProvider::ElevenLabsRealtime => (scribe_rt::Proto::Scribe, scribe_rt::URL, KeyName::Elevenlabs),
+        SttProvider::OpenAiRealtime => (scribe_rt::Proto::OpenAi, scribe_rt::OPENAI_URL, KeyName::Openai),
+        _ => return None,
+    };
+    let key = secrets::get(k)?;
+    let keyterms = if keyterms { crate::dictionary::keyterms(hints, 50) } else { vec![] };
+    Some(scribe_rt::Opts { proto, url: url.into(), key, rate, language: Some(s.language.clone()), keyterms })
 }
 
 struct WithFallback {
@@ -117,8 +158,38 @@ pub(crate) fn http() -> &'static reqwest::blocking::Client {
     C.get_or_init(reqwest::blocking::Client::new)
 }
 
+/// Waits before each retry of a 429 / 5xx (vc-feedback 16: never show the first rate limit). A Retry-After header wins.
+#[cfg(not(test))]
+const BACKOFF_MS: [u64; 3] = [300, 800, 2000];
+#[cfg(test)]
+const BACKOFF_MS: [u64; 3] = [1, 1, 1];
+/// The longest Retry-After we honor; a longer one fails now (the user would wait for nothing).
+const RETRY_AFTER_MAX_MS: u64 = 5000;
+
 /// Sends the request and returns the JSON body. Maps transport and HTTP errors to clear messages.
-pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> anyhow::Result<serde_json::Value> {
+/// A 429 or 5xx is retried silently (3 times, 300 ms / 800 ms / 2 s, or Retry-After). Streamed bodies (multipart)
+/// cannot be cloned and get no retry.
+pub(crate) fn send_json(mut rb: reqwest::blocking::RequestBuilder, what: &str) -> anyhow::Result<serde_json::Value> {
+    for (i, wait) in BACKOFF_MS.iter().enumerate() {
+        let Some(again) = rb.try_clone() else { break };
+        match send_once(rb, what) {
+            Err((e, Some(after))) => {
+                let ms = after.unwrap_or(*wait);
+                if ms > RETRY_AFTER_MAX_MS {
+                    return Err(e);
+                }
+                log::info!("{what}: {e:#}; retry {} in {ms} ms", i + 1);
+                std::thread::sleep(Duration::from_millis(ms));
+                rb = again;
+            }
+            r => return r.map_err(|e| e.0),
+        }
+    }
+    send_once(rb, what).map_err(|e| e.0)
+}
+
+/// Err.1 = Some(Retry-After ms) when the error is worth a retry (429, 5xx).
+fn send_once(rb: reqwest::blocking::RequestBuilder, what: &str) -> Result<serde_json::Value, (anyhow::Error, Option<Option<u64>>)> {
     let resp = rb.send().map_err(|e| {
         if e.is_timeout() {
             anyhow::anyhow!("{what} timed out")
@@ -127,9 +198,15 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
         } else {
             anyhow::anyhow!("{what} request failed: {e}")
         }
-    })?;
+    }).map_err(|e| (e, None))?;
     let code = resp.status().as_u16();
-    let body = resp.text().map_err(|e| anyhow::anyhow!("{what}: reading the response failed: {e}"))?;
+    let after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok()).map(|s| (s * 1000.0) as u64);
+    let retry = (code == 429 || code >= 500).then_some(after);
+    let body = resp.text().map_err(|e| (anyhow::anyhow!("{what}: reading the response failed: {e}"), retry))?;
+    http_result(code, &body, what).map_err(|e| (e, retry))
+}
+
+fn http_result(code: u16, body: &str, what: &str) -> anyhow::Result<serde_json::Value> {
     let snippet: String = body.chars().take(300).collect();
     // OpenRouter 402/403-budget and ElevenLabs 401-quota_exceeded: the key is fine, the account is not.
     let out_of_credits = code == 402 || {
@@ -137,9 +214,9 @@ pub(crate) fn send_json(rb: reqwest::blocking::RequestBuilder, what: &str) -> an
         ["quota", "budget", "credit"].iter().any(|w| l.contains(w))
     };
     match code {
-        200..=299 => serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
+        200..=299 => serde_json::from_str(body).map_err(|_| anyhow::anyhow!("{what} returned invalid JSON: {snippet}")),
         401..=403 if out_of_credits => anyhow::bail!("{what}: out of credits or over quota (HTTP {code}): {snippet}"),
-        401 | 403 => match server_reason(&body) {
+        401 | 403 => match server_reason(body) {
             // "API key expired" vs a typo: pass the server's reason on.
             Some(r) => anyhow::bail!("{what}: invalid or missing API key (HTTP {code}): {r}"),
             None => anyhow::bail!("{what}: invalid or missing API key (HTTP {code})"),
@@ -202,6 +279,10 @@ fn run_test(app: &AppHandle, which: &str) -> anyhow::Result<String> {
     let state = app.state::<AppState>();
     let mut s = state.settings.read().unwrap().clone();
     match which {
+        "stt" if s.stt.provider.realtime() => {
+            let o = realtime_opts(&s.stt.provider, &s, 16000, &Hints::default(), false).ok_or_else(|| anyhow::anyhow!("Add the provider's API key first"))?;
+            Ok(scribe_rt::transcribe(o, &jfk(), false, Duration::from_secs(20))?.0)
+        }
         "stt" => {
             s.stt.local_fallback = false; // test the provider itself
             let t = build(&s, &state)?;
@@ -258,7 +339,8 @@ pub(crate) fn list_models(base: &str, kind: &str, key: Option<&str>) -> anyhow::
             let rank = RANKED.iter().position(|r| *r == id).map(|i| i as u32 + 1).filter(|_| stt);
             let price_hour = if stt { price_hour(&id, p("prompt"), p("completion")) } else { None };
             let keywords = stt && openrouter::options_for(&id, &["x".into()], false).is_some();
-            Some(OrModel { recommended: id == crate::contract::DEFAULT_OPENROUTER_STT, rank, price_hour, keywords, id, name })
+            let rec = if stt { crate::contract::DEFAULT_OPENROUTER_STT } else { crate::contract::DEFAULT_OPENROUTER_CLEANUP };
+            Some(OrModel { recommended: id == rec, rank, price_hour, keywords, id, name })
         })
         .collect();
     // Ranked first in ranking order, then the rest by name.
@@ -353,6 +435,33 @@ mod tests {
     }
 
     #[test]
+    fn rate_limits_and_5xx_retry_silently_then_fail() {
+        // vc-feedback 16: 429 / 5xx never reach the user on the first hit.
+        let mut srv = mockito::Server::new();
+        let busy = srv.mock("POST", "/x").with_status(429).with_header("retry-after", "0").expect(2).create();
+        let ok = srv.mock("POST", "/x").with_body(r#"{"ok":1}"#).expect(1).create();
+        let v = send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({"a": 1})), "Prov").unwrap();
+        assert_eq!(v["ok"], 1);
+        busy.assert();
+        ok.assert();
+        busy.remove();
+        ok.remove();
+        let down = srv.mock("POST", "/x").with_status(503).with_body("down").expect(4).create();
+        let e = send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").unwrap_err().to_string();
+        down.assert();
+        assert!(e.contains("server error (HTTP 503)"), "{e}");
+        down.remove();
+        // a 400 is the request's fault: no retry; a long Retry-After fails now
+        let bad = srv.mock("POST", "/x").with_status(400).expect(1).create();
+        assert!(send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").is_err());
+        bad.assert();
+        bad.remove();
+        let long = srv.mock("POST", "/x").with_status(429).with_header("retry-after", "60").expect(1).create();
+        assert!(send_json(http().post(format!("{}/x", srv.url())).json(&serde_json::json!({})), "Prov").is_err());
+        long.assert();
+    }
+
+    #[test]
     fn openrouter_model_lists() {
         let mut srv = mockito::Server::new();
         let stt = srv
@@ -429,5 +538,16 @@ mod ranking_tests {
         assert_eq!(ph(4), Some(0.3));
         assert!(m[0].recommended && !m[1].recommended);
         assert_eq!(m.iter().map(|m| m.keywords).collect::<Vec<_>>(), [true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn command_stt_auto_is_the_dictation_provider() {
+        let mut s = Settings::default();
+        s.stt.provider = SttProvider::OpenRouter;
+        assert_eq!(command_stt(&s), SttProvider::OpenRouter, "auto: what the dictation uses");
+        s.stt.provider = SttProvider::WhisperLocal;
+        assert_eq!(command_stt(&s), SttProvider::WhisperLocal);
+        s.command.stt = Some(SttProvider::ElevenLabs);
+        assert_eq!(command_stt(&s), SttProvider::ElevenLabs, "an explicit choice wins");
     }
 }

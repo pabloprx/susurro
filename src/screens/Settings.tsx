@@ -1,13 +1,12 @@
 // DESIGN 6.8
 import { useState, type ReactNode } from "react";
 import { Copy } from "lucide-react";
-import { api, type Settings as T } from "../lib/api";
-import { applyTheme, getTheme, saveSettings, settingsStore, type Theme } from "../lib/store";
+import { api } from "../lib/api";
+import { applyTheme, getTheme, save, settingsStore, type Theme } from "../lib/store";
 import { S } from "../lib/strings";
 import { copy, Label, Segmented, Sheet, Title, Toggle, toast } from "../ui";
 
 const DATA_DIR = "~/Library/Application Support/app.susurro.desktop";
-const save = (f: (s: T) => void) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 
 function Row({ title, help, children }: { title: string; help?: string; children: ReactNode }) {
   return (
@@ -113,10 +112,10 @@ export default function Settings() {
         </Row>
       </div>
 
-      <Label>Experimental</Label>
+      <Label>Sending</Label>
       <div className="card">
-        <Row title="Press-enter command" help={"End with “press enter” to send the message after the paste."}>
-          <Toggle label="Press-enter command" on={s.paste.press_enter_command} onChange={(v) => save((x) => void (x.paste.press_enter_command = v))} />
+        <Row title="Say “press enter” to send" help={"End a dictation with “press enter”, “dale enter” or “enviar”: susurro drops the words and presses Return after the paste."}>
+          <Toggle label="Say press enter to send" on={s.paste.press_enter_command} onChange={(v) => save((x) => void (x.paste.press_enter_command = v))} />
         </Row>
       </div>
 

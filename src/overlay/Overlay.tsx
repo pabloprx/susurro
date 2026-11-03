@@ -1,14 +1,17 @@
 // The overlay pill (DESIGN 5). Its own window: no router, no store, only the event listeners + the canvas.
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, Check, Clipboard, Lock, Mic, Square, X } from "lucide-react";
-import { api, isTauri, on, type CommandStep, type SessionState, type Settings, type Toast } from "../lib/api";
-import { hasDeadline, keysOf, mmss, VERB } from "../lib/format";
+import { AlertTriangle, Check, Clipboard, Hand, Lock, Mic, Square, X } from "lucide-react";
+import { api, isTauri, on, type CommandStep, type LiveState, type Recents, type SessionState, type Settings, type Toast } from "../lib/api";
+import { firstLine, hasDeadline, isPick, keysOf, mmss, opOf, pendingQuestion, VERB } from "../lib/format";
 import { Waveform } from "./waveform";
 import "../styles/tokens.css";
 import "../styles/overlay.css";
 
-type CmdView = "cmd-listening" | "cmd-thinking" | "cmd-acting" | "cmd-pick" | "cmd-confirm" | "cmd-done" | "cmd-stopped" | "cmd-unsure" | "cmd-blocked" | "cmd-setup";
-type View = "idle" | "listening" | "handsfree" | "processing" | "done" | "copied" | "error" | "notice" | CmdView;
+type CmdView = "cmd-listening" | "cmd-live" | "cmd-paused" | "cmd-thinking" | "cmd-acting" | "cmd-pick" | "cmd-confirm" | "cmd-done" | "cmd-stopped" | "cmd-unsure" | "cmd-blocked" | "cmd-setup";
+type View = "idle" | "listening" | "grace" | "handsfree" | "processing" | "done" | "copied" | "error" | "notice" | CmdView;
+/** Phases that own the pill: a notice from before them is cleared (vc-feedback 19). */
+const ACTIVE: SessionState["phase"][] = ["recording", "locked", "processing", "acting"];
+const HOVER_CAP_MS = 8000;
 const IDLE: SessionState = { phase: "idle", started_at: null, device: null, app: null, message: null, command: false };
 const HOLD: Partial<Record<View, number>> = {
   done: 700,
@@ -28,6 +31,7 @@ const CONFIRM_MS = 10_000;
 const SIZE: Record<View, [number, number]> = {
   idle: [44, 8],
   listening: [200, 36],
+  grace: [0, 36],
   handsfree: [232, 36],
   processing: [120, 36],
   done: [120, 36],
@@ -35,6 +39,8 @@ const SIZE: Record<View, [number, number]> = {
   error: [0, 36], // auto, measured
   notice: [0, 36],
   "cmd-listening": [176, 36],
+  "cmd-live": [272, 36], // fixed: the heard text grows per chunk, the pill must not jitter
+  "cmd-paused": [0, 36],
   "cmd-thinking": [0, 36],
   "cmd-acting": [0, 36],
   "cmd-pick": [0, 36],
@@ -70,7 +76,22 @@ function fixFor(msg: string | null): { label: string; run: () => unknown } | nul
 
 type Step = CommandStep & { at: number };
 
-function viewOf(s: SessionState, step: Step | null): View {
+/** A live session (VOICE_CONTROL_V2 1): on, or still draining its queue after the key went up. */
+const isLive = (l: LiveState | null): l is LiveState => !!l && (l.on || l.queue.length > 0);
+
+/** Agent mode: the marks window's panel on the right shows the heard words with the screen context (Pablo
+ *  2026-10-19: "what I said at the bottom is not related to the rest"), so the pill does not repeat them. */
+const wordsInPanel = (s: Settings | null) => !!s && s.command.agent && !s.command.fast_mode;
+
+function viewOf(s: SessionState, step: Step | null, live: LiveState | null, panel = false): View {
+  if (isLive(live)) {
+    if (isPick(live.pending) || step?.status === "pick") return "cmd-pick";
+    if (live.pending || step?.status === "confirm") return "cmd-confirm";
+    if (live.paused) return "cmd-paused";
+    if (live.buffer.trim() && !panel) return "cmd-live";
+    if (step && CMD_LIVE[step.status]) return CMD_LIVE[step.status]!;
+    return "cmd-listening";
+  }
   if (s.command && (s.phase === "recording" || s.phase === "locked")) return "cmd-listening";
   if (s.command && s.phase === "processing") return "cmd-thinking";
   if (step) {
@@ -81,7 +102,7 @@ function viewOf(s: SessionState, step: Step | null): View {
   }
   switch (s.phase) {
     case "recording":
-      return "listening";
+      return s.grace_ms ? "grace" : "listening";
     case "locked":
       return "handsfree";
     case "processing":
@@ -109,7 +130,10 @@ export default function Overlay() {
   });
   const [notice, setNotice] = useState<Toast | null>(null);
   const [step, setStep] = useState<Step | null>(null);
+  const [live, setLive] = useState<LiveState | null>(null);
+  const [recents, setRecents] = useState<Recents>({ items: [], picked: null });
   const [hover, setHover] = useState(false);
+  const phaseRef = useRef<SessionState["phase"]>("idle");
   const [snoozed, setSnoozed] = useState(false);
   const [, tick] = useState(0);
   const wave = useRef<Waveform | null>(null);
@@ -122,11 +146,21 @@ export default function Overlay() {
   useEffect(() => {
     const offs = [
       on("session_state", (s) => {
+        // vc-feedback 19: a new recording (or its processing / acting) always beats a notice left from idle.
+        const active = ACTIVE.includes(s.phase);
+        if (active && !ACTIVE.includes(phaseRef.current)) setNotice(null);
+        phaseRef.current = s.phase;
         setSess(s);
         if (s.phase === "recording" || s.phase === "locked") api.getSettings().then(setSettings);
       }),
       on("audio_level", (l) => wave.current?.push(l.db)),
-      on("command_step", (c) => setStep({ ...c, at: Date.now() })),
+      // step 0 = a marks board refresh (live.rs draw_board), not a step: the pill keeps what it shows
+      on("command_step", (c) => c.step !== 0 && setStep({ ...c, at: Date.now() })),
+      on("command_live", (l) => {
+        // the session just ended: its last step is the result to show (viewOf shows a fresh end step)
+        setLive((prev) => (isLive(prev) && !isLive(l) && setStep((st) => st && { ...st, at: Date.now() }), l));
+      }),
+      on("recents", setRecents),
       on("toast", async (t) => {
         // The main window keeps the toast stack when it is visible (DESIGN 6.6); the pill shows one notice otherwise.
         if (isTauri) {
@@ -156,12 +190,23 @@ export default function Overlay() {
 
   // notice lifetime: ttl, capped at 4 s unless it asks for a decision. Undo keeps the exact Rust deadline.
   const deadline = notice !== null && hasDeadline(notice);
+  const ttl = !notice ? 0 : deadline ? notice.ttl_ms : notice.actions.length ? Math.max(notice.ttl_ms, 6000) : Math.min(notice.ttl_ms || 2500, 4000);
   useEffect(() => {
     if (!notice) return;
-    const ttl = deadline ? notice.ttl_ms : notice.actions.length ? Math.max(notice.ttl_ms, 6000) : Math.min(notice.ttl_ms || 2500, 4000);
     const t = setTimeout(() => (deadline || !hover) && setNotice(null), ttl);
     return () => clearTimeout(t);
   }, [notice, deadline || hover]);
+  // a stuck hover (the window turned click-through before mouseleave fired) never holds a notice past 8 s
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice((n) => (n === notice ? null : n)), Math.max(ttl, HOVER_CAP_MS));
+    return () => clearTimeout(t);
+  }, [notice]);
+  useEffect(() => {
+    const off = () => setHover(false);
+    window.addEventListener("blur", off);
+    return () => window.removeEventListener("blur", off);
+  }, []);
 
   // a command result stops being the target 400 ms after it lands (viewOf): re-render then, so the HOLD logic takes over
   useEffect(() => {
@@ -172,7 +217,7 @@ export default function Overlay() {
 
   // session -> shown view, with the holds for done / copied / error
   useEffect(() => {
-    const target = viewOf(sess, step);
+    const target = viewOf(sess, step, live, wordsInPanel(settings));
     const hold = HOLD[shown.view];
     if (target === "idle" && hold && shown.view !== "idle") {
       const left = shown.since + hold - Date.now();
@@ -277,6 +322,14 @@ export default function Overlay() {
         </PillButton>
       </>
     ),
+    // a hold was released: the recording goes on for grace_ms; a tap now locks hands-free (session.rs Grace)
+    grace: (
+      <>
+        <span className="tally-dot pulse" />
+        <span className="msg dim-text">Tap {ptt} again for hands-free</span>
+        <span className="drain soft" key={sess.started_at ?? 0} style={{ animationDuration: `${sess.grace_ms ?? 0}ms` }} aria-hidden />
+      </>
+    ),
     handsfree: (
       <>
         <span className="tally-dot" />
@@ -298,36 +351,51 @@ export default function Overlay() {
         <span className="cmd-tag">CMD</span>
       </>
     ),
+    "cmd-live": (
+      <>
+        <Reticle live />
+        <span className="heard" title={live?.buffer}>
+          <span dir="ltr">{live?.buffer.slice(-120)}</span>
+        </span>
+        <Queue n={live?.queue.length ?? 0} />
+      </>
+    ),
+    "cmd-paused": (
+      <>
+        <Hand size={13} strokeWidth={1.75} className="dim" />
+        <span className="msg dim-text">Paused, you took over</span>
+        <Queue n={live?.queue.length ?? 0} />
+      </>
+    ),
     "cmd-thinking": (
       <>
-        {step && <Ticks n={step.max} done={step.step - 1} />}
+        {isLive(live) ? <Queue n={live.queue.length} /> : step && <Ticks n={step.max} done={step.step - 1} />}
         <span className="msg ellipsis instr">{step?.instruction || "Listening to the command"}</span>
         <Dots />
       </>
     ),
     "cmd-acting": (
       <>
-        {step && <Ticks n={step.max} done={step.step - 1} />}
-        <span className="cmd-verb">{VERB[step?.action ?? ""] ?? "ACT"}</span>
-        {target && <span className="msg ellipsis instr">{target.name}</span>}
+        {isLive(live) ? <Queue n={live.queue.length} /> : step && <Ticks n={step.max} done={step.step - 1} />}
+        <span className="cmd-verb">{VERB[step ? opOf(step) : ""] ?? "ACT"}</span>
+        {(target || step?.detail) && <span className="msg ellipsis instr">{target?.name ?? step?.detail}</span>}
       </>
     ),
     "cmd-pick": (
       <>
         <Reticle live />
         <span className="msg">Which one?</span>
-        <Keys k={cmdKey} />
         <span className="small-dim">say its number</span>
       </>
     ),
     "cmd-confirm": (
       <>
         <AlertTriangle size={13} strokeWidth={1.75} className="warn" />
-        <span className="msg ellipsis instr">{confirmText(step, target?.name)}</span>
+        <span className="msg ellipsis instr">{pendingQuestion(live?.pending ?? null) ?? confirmText(step, target?.name)}</span>
+        <span className="small-dim">say yes ·</span>
         <Keys k={cmdKey} />
-        <span className="small-dim">yes</span>
+        <span className="small-dim">·</span>
         <Keys k={["esc"]} />
-        <span className="small-dim">no</span>
         <span className="drain" style={{ animationDuration: `${CONFIRM_MS}ms` }} aria-hidden />
       </>
     ),
@@ -453,11 +521,12 @@ export default function Overlay() {
   }
 
   // a new step re-crossfades the thinking / acting content (the instruction or the verb changes)
-  const key = view === "notice" ? `n${notice?.id}` : `${view}${view === "error" ? shown.msg : ""}${view.startsWith("cmd-") && step ? `:${step.step}` : ""}`;
+  const key = view === "notice" ? `n${notice?.id}` : `${view}${view === "error" ? shown.msg : ""}${view.startsWith("cmd-") && view !== "cmd-live" && view !== "cmd-paused" && step ? `:${step.step}` : ""}`;
   const shake = view === "idle" && shown.from === "error" && !reduced.matches;
 
   return (
     <div className="pill-root">
+      {recents.items.length > 0 && <RecentsList r={recents} />}
       <div
         className={`pill v-${view}${hover ? " hover" : ""}${hidden ? " hidden" : ""}${snoozed && view === "idle" ? " snoozed" : ""}${warning ? " warning" : ""}${shake ? " shake" : ""}`}
         ref={pill}
@@ -497,6 +566,58 @@ function Reticle({ live }: { live?: boolean }) {
       <circle cx="6" cy="6" r="3" fill="none" stroke="currentColor" strokeWidth="1.5" />
       <path d="M6 0v2M6 10v2M0 6h2M10 6h2" stroke="currentColor" strokeWidth="1.5" />
     </svg>
+  );
+}
+
+/** Ctrl+ptt: the last 9 dictations above the pill. Rust owns the keys (1-9 paste, Cmd+1-9 copy, Esc) as temporary
+ *  global shortcuts, so the app in front keeps the focus. ponytail: no clicks on rows (a click would take the focus
+ *  from the app the paste must land in); add them when the overlay can take a click without activating. */
+function RecentsList({ r }: { r: Recents }) {
+  return (
+    <div className="recents" role="listbox" aria-label="Recent dictations">
+      {r.items.slice(0, 9).map((h, i) => {
+        const n = i + 1;
+        const flag = h.status === "copied" ? "not pasted" : h.status === "failed" ? "failed" : null;
+        return (
+          <div key={h.id} className={`rc-row${r.picked === n ? " picked" : ""}`} role="option" aria-selected={r.picked === n} aria-label={`${n}: ${firstLine(h.final_text || h.raw)}`}>
+            <kbd className="rc-n">{n}</kbd>
+            <span className="rc-text">{firstLine(h.final_text || h.raw) || "(empty)"}</span>
+            {flag && (
+              <span className={`rc-flag ${h.status}`} title={flag}>
+                {h.status === "copied" ? <Clipboard size={11} strokeWidth={1.75} /> : <AlertTriangle size={11} strokeWidth={1.75} />}
+                {flag}
+              </span>
+            )}
+            <span className="rc-app">{h.app_name ?? ""}</span>
+          </div>
+        );
+      })}
+      <div className="rc-foot">
+        <span>
+          <kbd>1</kbd>-<kbd>9</kbd> paste
+        </span>
+        <span>
+          <kbd>⌘</kbd>
+          <kbd>1</kbd>-<kbd>9</kbd> copy
+        </span>
+        <span>
+          <kbd>esc</kbd> close
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** One dot per action waiting in the live queue (max 6 dots, then +n). */
+function Queue({ n }: { n: number }) {
+  if (!n) return null;
+  return (
+    <span className="queue" aria-label={`${n} queued`}>
+      {Array.from({ length: Math.min(n, 6) }, (_, i) => (
+        <i key={i} />
+      ))}
+      {n > 6 && <b>+{n - 6}</b>}
+    </span>
   );
 }
 

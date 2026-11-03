@@ -1,18 +1,35 @@
-// Voice control (hold F2, say what to do). Plan: .lo/VOICE_CONTROL.md E.3, flow per .lo/som-experiment/RESULTS.md:
-// fixed intents first (no screenshot), then numbered AX marks + a Jev choice, a screenshot only when it is needed.
+// Voice control (hold or double-tap the command key, say what to do). v2 flow (.lo/VOICE_CONTROL_V2.md): the planner LLM
+// turns the spoken words into actions while Pablo talks, Jev grounds each click on numbered AX marks, a screenshot only
+// when it is needed. This screen: readiness, keys, the planner model (ranked by the bench), the memory, the last run.
 import { useEffect, useState } from "react";
 import { AlertTriangle, Check, MonitorUp, RotateCw } from "lucide-react";
-import { api, on, type CommandStep } from "../lib/api";
-import { keyLabel, keysOf, keyStore, permStore, saveSettings, settingsStore, VERB } from "../lib/store";
+import { api, on, type CommandStep, type MemKind, type MemoryEntry } from "../lib/api";
+import { clock, keyLabel, keysOf, keyStore, opOf, permStore, save, saveSettings, settingsStore, VERB } from "../lib/store";
 import { S } from "../lib/strings";
-import { Kbd, Label, Title, Toggle, toast } from "../ui";
+import { Kbd, Label, radioKeys, Segmented, Title, toast, Toggle } from "../ui";
 import { Diagram, usePermWatch } from "./Onboarding";
 import { DEFAULTS, PICKS, useRecorder } from "./Shortcuts";
 import type { Nav } from "../App";
+import type { SttProvider } from "../lib/contract.gen";
 
 const PINNED_MODEL = "typesafe/jev-1.14";
-const save = (f: Parameters<typeof saveSettings>[0]) => saveSettings(f).catch((e) => toast(String(e), { kind: "error" }));
 const ENDED: CommandStep["status"][] = ["done", "stopped", "unsure", "blocked", "setup", "error"];
+
+type Planner = { id: string; name: string; via: string; same: number; of: number; p50: number; p90: number; usd: number; tag?: string };
+/** .lo/planner-bench.md. v3 (2026-10-18): the app's prompt, 28 orders (20 old + 8 from Pablo's live log) x 2 runs, one
+ *  request at a time from this Mac; same = right end effect, out of 54 (the "41" case left out: no model could see mark
+ *  numbers then). v2 (2026-10-17, older prompt): 20 orders x 3 runs. p50 / p90 = wall clock of one request; usd = usage.cost.
+ *  ponytail: a fixed table; re-run the bench (and edit it here) to update it. */
+export const PLANNERS: Planner[] = [
+  { id: "openai/gpt-6-luna", name: "GPT-6 Luna", via: "reasoning minimal · 14/16 on your log", same: 52, of: 54, p50: 1.87, p90: 3.33, usd: 0.00006, tag: "DEFAULT" },
+  { id: "openai/gpt-oss-120b", name: "gpt-oss-120b", via: "Cerebras · 12/16 on your log", same: 52, of: 54, p50: 0.77, p90: 1.02, usd: 0.00061, tag: "FASTEST" },
+  { id: "google/gemini-3.8-flash", name: "Gemini 3.8 Flash", via: "reasoning minimal · 12/16 on your log · 2 of 58 over 6 s", same: 52, of: 54, p50: 2.91, p90: 4.19, usd: 0.0015 },
+  { id: "google/gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", via: "older bench (v2)", same: 60, of: 60, p50: 1.8, p90: 1.99, usd: 0.000349 },
+  { id: "anthropic/claude-haiku-5.5", name: "Claude Haiku 5.5", via: "older bench (v2)", same: 60, of: 60, p50: 2.05, p90: 2.86, usd: 0.000233 },
+];
+const SLOWEST = Math.max(...PLANNERS.map((p) => p.p90));
+
+const MEM_LABEL: Record<MemKind, string> = { said: "SAID", typed: "TYPED", deleted: "DELETED", copied: "COPIED", pasted: "PASTED", clicked: "CLICKED", key: "KEY", opened: "OPENED", failed: "FAILED" };
 
 export default function VoiceControl({ nav }: { nav: Nav }) {
   const s = settingsStore.use();
@@ -22,13 +39,21 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
   const [rec, setRec] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [asked, setAsked] = useState(false);
+  const [memory, setMemory] = useState<MemoryEntry[] | null>(null);
 
   useEffect(() => {
     const load = () => api.commandLog().then(setLog, () => setLog([]));
+    const loadMem = () => api.commandMemory().then((m) => setMemory(m ?? []), () => setMemory([]));
     load();
-    const off = on("command_step", (c) => ENDED.includes(c.status) && load());
-    return () => void off.then((f) => f());
+    loadMem();
+    const offs = [on("command_step", (c) => ENDED.includes(c.status) && (load(), loadMem())), on("command_live", (l) => !l.on && !l.queue.length && loadMem())];
+    return () => offs.forEach((o) => void o.then((f) => f()));
   }, []);
+  const clearMemory = () =>
+    api.commandMemoryClear().then(
+      () => setMemory([]),
+      (e) => toast(`Not cleared: ${e}`, { kind: "error" }),
+    );
 
   const set = (binding: string) => {
     setRec(false);
@@ -65,8 +90,8 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         }
       />
       <p className="vc-lede">
-        Hold <Kbd keys={key} /> and say what to do: <em>“open Slack”</em>, <em>“reply in thread”</em>, <em>“send the message”</em>. susurro numbers
-        the buttons of the front app and acts on the one you mean.
+        Hold <Kbd keys={key} /> and say what to do: <em>“new tab and run ls”</em>, <em>“copy the link”</em>, <em>“remove what you typed”</em>. Double-tap{" "}
+        <Kbd keys={key} /> for a live session: it acts while you keep talking, and a tap ends it.
       </p>
 
       {!screenOk && (neededScreen || relaunch) && (
@@ -133,8 +158,8 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
       <div className="card">
         <div className="sc-row">
           <div>
-            <div className="label">Hold to command</div>
-            <div className="sub">Hold, say it, release</div>
+            <div className="label">Command key</div>
+            <div className="sub">Hold, or double-tap for live</div>
           </div>
           <span className="inline">
             <button className={`bind${rec ? " recording" : ""}`} onClick={() => (setRec(!rec), setMsg(null))} aria-label={`Voice control key: ${keyName}. Press to record a new shortcut.`}>
@@ -177,8 +202,62 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
         <div className="sc-row">
           <div>
-            <div className="label">Model</div>
-            <div className="sub">Picks the target</div>
+            <div className="label">Clicks</div>
+            <div className="sub">Who picks what to click</div>
+          </div>
+          <span className="small">
+            {s.command.auto_click
+              ? "Clicks what Jev picks. Asks only when it is not sure."
+              : "Shows the 3-5 best matches, numbered. Say the number, or click it."}
+          </span>
+          <Segmented
+            label="Clicks"
+            value={s.command.auto_click ? "auto" : "choose"}
+            options={[
+              { value: "choose", label: "I choose" },
+              { value: "auto", label: "Auto" },
+            ]}
+            onChange={(v) => save((x) => void (x.command.auto_click = v === "auto"))}
+          />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Agent mode</div>
+            <div className="sub">{s.command.fast_mode ? "“Modo agente: …”, or an order that failed twice" : "Every order, except open app, new tab, scroll, a key, paste last, stop"}</div>
+          </div>
+          <span className="small">
+            {s.command.agent
+              ? `Claude Code (${s.command.agent_model || "default"}) drives the Mac and the mouse with susurro's own tools, and remembers what it did. No CLI or no login: ${s.command.agent_fallback}.`
+              : "Off. Orders go through the planner only."}
+          </span>
+          <Toggle label="Agent mode" on={s.command.agent} onChange={(v) => save((x) => void (x.command.agent = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Computer use</div>
+            <div className="sub">How the agent sees your screen</div>
+          </div>
+          <span className="small">
+            {s.command.agent_vision
+              ? "On. It looks at a screenshot of the whole screen after every action and clicks where it sees things."
+              : "Off. It reads the numbered marks and takes a screenshot only to see pixels."}
+          </span>
+          <Toggle label="Computer use" on={s.command.agent_vision} onChange={(v) => save((x) => void (x.command.agent_vision = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Fast mode (beta)</div>
+            <div className="sub">The planner plans each order, Jev picks the targets</div>
+          </div>
+          <span className="small">
+            {s.command.fast_mode ? "On. Faster, but it gets more orders wrong." : "Off. Orders go to the agent."}
+          </span>
+          <Toggle label="Fast mode (beta)" on={s.command.fast_mode} onChange={(v) => save((x) => void (x.command.fast_mode = v))} />
+        </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Target model</div>
+            <div className="sub">Picks the button you named</div>
           </div>
           <span className="inline">
             <span className="mono">{s.command.model || PINNED_MODEL}</span>
@@ -186,30 +265,93 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
           </span>
           <span />
         </div>
+        <div className="sc-row">
+          <div>
+            <div className="label">Speech to text</div>
+            <div className="sub">Hears your commands. Local Whisper ~0.33 s a phrase, Scribe Realtime ~0.2 s, MAI ~0.7 s</div>
+          </div>
+          <select
+            className="input"
+            aria-label="Speech to text for commands"
+            value={s.command.stt ?? "auto"}
+            onChange={(e) => save((x) => void (x.command.stt = e.target.value === "auto" ? null : (e.target.value as SttProvider)))}
+          >
+            <option value="auto">Auto · same as dictation</option>
+            <option value="elevenlabs_realtime">Scribe Realtime (live)</option>
+            <option value="openai_realtime" disabled={!keys?.openai}>
+              OpenAI Realtime (live){keys?.openai ? "" : " · add an OpenAI key in Providers"}
+            </option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="elevenlabs">ElevenLabs Scribe</option>
+            <option value="whisper_local">Local Whisper</option>
+          </select>
+          <span />
+        </div>
       </div>
 
-      <Label>How it picks</Label>
+      <Label right={<span className="small">measured, one request at a time</span>}>Planner</Label>
+      <PlannerPicker value={s.command.planner_model} onPick={(id) => save((x) => void (x.command.planner_model = id))} />
+      <p className="small vc-bench-note">
+        Measured on Oct 18 from this Mac: 28 orders, 8 of them from your live log, 2 runs each. Real screens send more text, so real
+        times run higher. Same effect = the plan did the right thing, even with other steps.
+      </p>
+
+      <Label>How it works</Label>
       <ol className="vc-how">
         <li>
-          <span className="label">Fast</span>
-          <span>“open Slack”, “new tab”, “paste the last one” run at once. No screenshot.</span>
+          <span className="label">Plan</span>
+          <span>The planner turns your words into keys, typing, clicks and copies. It plans each order as soon as you finish it.</span>
         </li>
         <li>
           <span className="label">Marks</span>
-          <span>It numbers the buttons of the front app and picks one by its name. Up to 6 steps.</span>
+          <span>Before each click it reads the screen again and numbers the buttons. Say a number you see (“41”) and it clicks that one.</span>
         </li>
         <li>
           <span className="label">Look</span>
           <span>Only for “the red one” or “next to Send”: one screenshot of one display. Nothing is saved.</span>
         </li>
         <li>
-          <span className="label">Ask</span>
-          <span>Under 80% sure, it shows the top 3 and asks “Which one?”. It never clicks a guess.</span>
+          <span className="label">Choose</span>
+          <span>
+            {s.command.auto_click
+              ? "Under 80% sure, it asks “Which one?”: say the number."
+              : "It shows the best 3-5 matches as big numbers 1-5: say “uno”, “the second”, the name, or click it. When it is sure, 1 is lit and “sí” takes it."}{" "}
+            Before Return in a chat or mail app, it asks: say “yes”.
+          </span>
         </li>
       </ol>
       <p className="small vc-safety">
         <kbd>esc</kbd> or <Kbd keys={key} /> stops at once. susurro never types in or clicks a password field.
       </p>
+
+      <Label
+        right={
+          memory && memory.length > 0 && (
+            <span className="inline">
+              <span className="small mono">{memory.length} / 50</span>
+              <button className="btn ghost sm" onClick={clearMemory}>
+                Clear memory
+              </button>
+            </span>
+          )
+        }
+      >
+        Memory
+      </Label>
+      {!memory || !memory.length ? (
+        <p className="small vc-empty">Nothing yet. susurro remembers what it typed, copied and clicked, so “remove that” knows what “that” is. RAM only.</p>
+      ) : (
+        <div className="card rows vc-mem" aria-label="Memory">
+          {[...memory].reverse().map((m, i) => (
+            <div className={`row k-${m.kind}`} key={`${m.at}:${i}`}>
+              <span className="mono dim">{clock(m.at)}</span>
+              <span className="mono vc-verb">{MEM_LABEL[m.kind] ?? m.kind.toUpperCase()}</span>
+              <span className="ellipsis vc-mem-text">{m.kind === "said" ? `“${m.text}”` : m.text}</span>
+              <span className="ellipsis small">{[m.app, m.field].filter(Boolean).join(" · ")}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <Label right={log && log.length > 0 && <span className="small mono">{total(log)}</span>}>Last run</Label>
       {!log || !log.length ? (
@@ -225,7 +367,7 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
           {log.map((c, i) => (
             <div className="row" key={i}>
               <span className="mono dim">{String(c.step).padStart(2, "0")}</span>
-              <span className="mono vc-verb">{c.status === "done" ? "DONE" : (VERB[c.action ?? ""] ?? c.status.toUpperCase())}</span>
+              <span className="mono vc-verb">{c.status === "done" ? "DONE" : (VERB[opOf(c)] ?? c.status.toUpperCase())}</span>
               <span className="ellipsis vc-what">{what(c)}</span>
               <span className="mono num">{(c.latency_ms / 1000).toFixed(2)} s</span>
               <span className="mono num">${c.cost_usd.toFixed(6)}</span>
@@ -234,6 +376,69 @@ export default function VoiceControl({ nav }: { nav: Nav }) {
         </div>
       )}
     </>
+  );
+}
+
+/** The bench table as a radio list: same-effect score, p50 with a p90 whisker, cost per 1000 orders. An id that is
+ *  not in the table (set by hand) shows as its own row, unmeasured. */
+function PlannerPicker({ value, onPick }: { value: string; onPick: (id: string) => void }) {
+  const rows: (Planner | { id: string; name: string; via: string; custom: true })[] = PLANNERS.some((p) => p.id === value)
+    ? PLANNERS
+    : [...PLANNERS, { id: value, name: value, via: "not measured", custom: true }];
+  return (
+    <div className="card rows vc-planner" role="radiogroup" aria-label="Planner model" onKeyDown={radioKeys}>
+      <div className="row vc-pl-head" aria-hidden>
+        <span />
+        <span>Model</span>
+        <span>Same effect</span>
+        <span>Latency p50 · p90</span>
+        <span>per 1000 orders</span>
+      </div>
+      {rows.map((p) => {
+        const sel = p.id === value;
+        return (
+          <div
+            key={p.id}
+            className={`row hoverable vc-pl${sel ? " sel" : ""}`}
+            role="radio"
+            aria-checked={sel}
+            aria-label={p.name}
+            tabIndex={sel ? 0 : -1}
+            onClick={() => !sel && onPick(p.id)}
+          >
+            <span className="vc-radio" aria-hidden />
+            <span className="vc-pl-name">
+              <span className="n">
+                {p.name}
+                {"tag" in p && p.tag && <span className="tag">{p.tag}</span>}
+              </span>
+              <span className="small">{p.via}</span>
+            </span>
+            {"custom" in p ? (
+              <>
+                <span className="mono dim">-</span>
+                <span className="mono dim">-</span>
+                <span className="mono dim">-</span>
+              </>
+            ) : (
+              <>
+                <span className={`mono vc-pl-score${p.same / p.of < 0.9 ? " miss" : ""}`}>
+                  {p.same}/{p.of}
+                </span>
+                <span className="vc-pl-lat" title={`p50 ${p.p50.toFixed(2)} s, p90 ${p.p90.toFixed(2)} s`}>
+                  <span className="bar" aria-hidden>
+                    <i className="p90" style={{ width: `${(p.p90 / SLOWEST) * 100}%` }} />
+                    <i className="p50" style={{ width: `${(p.p50 / SLOWEST) * 100}%` }} />
+                  </span>
+                  <span className="mono num">{p.p50.toFixed(2)} s</span>
+                </span>
+                <span className="mono num">${(p.usd * 1000).toFixed(2)}</span>
+              </>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

@@ -27,6 +27,8 @@ pub struct Node {
     pub frame: Option<PtRect>,
     pub children: Vec<Node>,
     pub h: usize,
+    /// AXURL of a link (copy the link without keys).
+    pub url: String,
 }
 
 /// A mark plus what the Jev criteria and the actions need.
@@ -37,6 +39,41 @@ pub struct El {
     pub state: Option<String>,
     /// The reader's handle index (AXPress / focus).
     pub h: usize,
+    /// AXURL (links).
+    pub url: Option<String>,
+    /// AXValue of a text field, 200 chars max (never for secure fields: they are not marked).
+    pub value: Option<String>,
+}
+
+/// The focused element, read right before an action (VOICE_CONTROL_V2 2.1). Ranges are UTF-16 units (AX).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Field {
+    pub app: String,
+    pub bundle: String,
+    pub pid: i32,
+    /// AX role ("AXTextField") or "" when nothing answers (Electron without a tree).
+    pub role: String,
+    pub name: String,
+    /// None = not readable. Never read for a secure field.
+    pub value: Option<String>,
+    /// AXSelectedTextRange (location, length).
+    pub sel: Option<(usize, usize)>,
+    pub selected: Option<String>,
+    /// AXURL of the focused element (a focused link).
+    pub url: Option<String>,
+    pub secure: bool,
+}
+
+/// Value tail sent to the planner.
+pub const VALUE_TAIL: usize = 200;
+
+impl Field {
+    /// The last `VALUE_TAIL` chars of the value.
+    pub fn tail(&self) -> String {
+        let v = self.value.as_deref().unwrap_or("");
+        let n = v.chars().count();
+        v.chars().skip(n.saturating_sub(VALUE_TAIL)).collect()
+    }
 }
 
 /// AX role -> (label, takes text). Anything else is not actionable.
@@ -132,30 +169,44 @@ pub fn region_of(r: PtRect, win: PtRect) -> &'static str {
     }
 }
 
-fn overlaps(a: PtRect, b: PtRect) -> bool {
-    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
-}
-
-fn same_rect(a: PtRect, b: PtRect) -> bool {
+pub fn same_rect(a: PtRect, b: PtRect) -> bool {
     (a.x - b.x).abs() < 2.0 && (a.y - b.y).abs() < 2.0 && (a.w - b.w).abs() < 2.0 && (a.h - b.h).abs() < 2.0
 }
 
+/// Roles that wrap the real clickable thing (vc-feedback 24: a Slack row > link, a Gmail row > link). A container
+/// with an actionable leaf inside is not a mark: the leaf is, and the click lands on it.
+const CONTAINERS: [&str; 2] = ["AXRow", "AXCell"];
+
+/// `r` cut to `win` (the visible part: a half-scrolled row is clicked where it shows).
+pub fn clip_to(r: PtRect, win: PtRect) -> PtRect {
+    let (x, y) = (r.x.max(win.x), r.y.max(win.y));
+    PtRect { x, y, w: ((r.x + r.w).min(win.x + win.w) - x).max(0.0), h: ((r.y + r.h).min(win.y + win.h) - y).max(0.0) }
+}
+
 /// Actionable, enabled, named-or-not elements visible in `win`, numbered 1.. in reading order (top to bottom,
-/// then left to right). A nested element with the same rect as one already taken is a duplicate.
+/// then left to right). Leaves first (post-order): a wrapper with the same rect as a leaf already taken is a
+/// duplicate, and a container (row, cell) with an actionable leaf inside is dropped for its leaves.
 pub fn collect(root: &Node, win: PtRect) -> Vec<El> {
     fn walk(n: &Node, win: PtRect, depth: usize, out: &mut Vec<El>) {
         if out.len() >= MAX_MARKS || depth > MAX_DEPTH || is_secure(n) {
             return;
         }
-        if let (Some(label), Some(r)) = (role_label(&n.role, &n.subrole), n.frame) {
-            let visible = r.w >= 4.0 && r.h >= 4.0 && overlaps(r, win);
-            if n.enabled && visible && !out.iter().any(|e| same_rect(e.mark.rect, r)) {
-                let mark = Mark { id: 0, rect: r, name: name_of(n), role: label.into(), region: region_of(r, win).into() };
-                out.push(El { mark, state: state_of(n), h: n.h });
-            }
-        }
+        let before = out.len();
         for c in &n.children {
             walk(c, win, depth + 1, out);
+        }
+        if out.len() >= MAX_MARKS || (CONTAINERS.contains(&n.role.as_str()) && out.len() > before) {
+            return;
+        }
+        if let (Some(label), Some(r)) = (role_label(&n.role, &n.subrole), n.frame) {
+            let r = clip_to(r, win);
+            let visible = r.w >= 4.0 && r.h >= 4.0;
+            if n.enabled && visible && !out.iter().any(|e| same_rect(e.mark.rect, r)) {
+                let mark = Mark { id: 0, rect: r, name: name_of(n), role: label.into(), region: region_of(r, win).into() };
+                let value = (takes_text(label) && !n.value.is_empty()).then(|| n.value.chars().take(VALUE_TAIL).collect());
+                let url = (!n.url.is_empty()).then(|| n.url.clone());
+                out.push(El { mark, state: state_of(n), h: n.h, url, value });
+            }
         }
     }
     let mut out = vec![];
@@ -179,6 +230,32 @@ pub fn describe(e: &El) -> String {
         Some(s) => format!("{name} ({}, {}, {s})", m.role, m.region),
         None => format!("{name} ({}, {})", m.role, m.region),
     }
+}
+
+/// The frame of the first web page in the tree (AXWebArea): marks inside it are page content, the rest is the
+/// browser's own chrome (tabs, toolbar, vertical tabs). Case 23 prefers the page when two targets tie.
+pub fn web_area(n: &Node) -> Option<PtRect> {
+    if n.role == "AXWebArea" {
+        return n.frame;
+    }
+    n.children.iter().find_map(web_area)
+}
+
+/// A hash of what the screen shows (roles, names, values, states, frames to the point): the verify step compares
+/// it before and after a click (vc-feedback 21). Handles are not part of it.
+pub fn tree_hash(n: &Node) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn feed(n: &Node, h: &mut std::collections::hash_map::DefaultHasher) {
+        (&n.role, &n.subrole, &n.title, &n.desc, &n.value, &n.url, n.enabled).hash(h);
+        if let Some(r) = n.frame {
+            [r.x, r.y, r.w, r.h].map(|v| v.round() as i64).hash(h);
+        }
+        n.children.len().hash(h);
+        n.children.iter().for_each(|c| feed(c, h));
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    feed(n, &mut h);
+    h.finish()
 }
 
 // ---------- macOS reader ----------
@@ -239,6 +316,13 @@ pub mod mac {
         v.downcast::<CFNumber>().and_then(|n| n.to_i64()).map(|n| n.to_string()).unwrap_or_default()
     }
 
+    fn url_text(v: &CFType) -> String {
+        if let Some(u) = v.downcast::<core_foundation::url::CFURL>() {
+            return u.get_string().to_string();
+        }
+        text(v)
+    }
+
     fn ax_value<T: Default>(v: &CFType, ty: u32) -> Option<T> {
         if v.type_of() as usize != unsafe { AXValueGetTypeID() } || unsafe { AXValueGetType(v.as_CFTypeRef()) } != ty {
             return None;
@@ -292,6 +376,9 @@ pub mod mac {
             if n.role == "AXStaticText" || role_label(&n.role, &n.subrole).is_some() {
                 n.value = attr(&el, "AXValue").map(|v| text(&v)).unwrap_or_default();
             }
+            if n.role == "AXLink" {
+                n.url = attr(&el, "AXURL").map(|v| url_text(&v)).unwrap_or_default();
+            }
             let kids = get(9).filter(|_| depth < MAX_DEPTH).and_then(|v| array(&v));
             self.handles.push(el);
             if let Some(kids) = kids {
@@ -331,6 +418,8 @@ pub mod mac {
     /// No AX answer = false: the secure input check after the focus still stops a type.
     pub fn secure_at(p: (f64, f64)) -> bool {
         let sys = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+        // on the system-wide element = the global AX timeout (default 6 s): a hung app must not stall a click
+        unsafe { AXUIElementSetMessagingTimeout(sys.as_CFTypeRef(), 0.25) };
         let mut out: CFTypeRef = std::ptr::null();
         if unsafe { AXUIElementCopyElementAtPosition(sys.as_CFTypeRef(), p.0 as f32, p.1 as f32, &mut out) } != 0 || out.is_null() {
             return false;
@@ -340,15 +429,133 @@ pub mod mac {
         is_secure(&Node { role: s("AXRole"), subrole: s("AXSubrole"), ..Default::default() })
     }
 
-    /// AXPress. false = the element has no press action (the caller clicks its center instead).
+    /// AXPress -> the AX error code. 0 = pressed. kAXErrorCannotComplete (-25204) can still mean pressed (research 5):
+    /// the verify step decides, never a blind second click.
+    pub fn press_code(el: &CFType) -> i32 {
+        unsafe { AXUIElementPerformAction(el.as_CFTypeRef(), CFString::new("AXPress").as_concrete_TypeRef()) }
+    }
+
+    /// AXPress. false = refused (no press action, or the app did not answer).
     pub fn press(el: &CFType) -> bool {
-        unsafe { AXUIElementPerformAction(el.as_CFTypeRef(), CFString::new("AXPress").as_concrete_TypeRef()) == 0 }
+        press_code(el) == 0
+    }
+    pub const CANNOT_COMPLETE: i32 = -25204;
+
+    /// The topmost element at a global point (top-left origin) and its pid. None = no AX answer.
+    pub fn element_at(p: (f64, f64)) -> Option<(CFType, i32)> {
+        let sys = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+        // on the system-wide element = the global AX timeout (default 6 s): a hung app must not stall a click
+        unsafe { AXUIElementSetMessagingTimeout(sys.as_CFTypeRef(), 0.25) };
+        let mut out: CFTypeRef = std::ptr::null();
+        if unsafe { AXUIElementCopyElementAtPosition(sys.as_CFTypeRef(), p.0 as f32, p.1 as f32, &mut out) } != 0 || out.is_null() {
+            return None;
+        }
+        let el = unsafe { CFType::wrap_under_create_rule(out) };
+        let mut pid = 0;
+        unsafe { AXUIElementGetPid(el.as_CFTypeRef(), &mut pid) };
+        Some((el, pid))
+    }
+
+    /// `el` is `target` or inside it: up the AXParent chain (Chromium answers with the text node inside a link).
+    pub fn within(el: &CFType, target: &CFType) -> bool {
+        let mut cur = Some(el.clone());
+        for _ in 0..12 {
+            let Some(c) = cur else { return false };
+            if c == *target {
+                return true;
+            }
+            cur = attr(&c, "AXParent");
+        }
+        false
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CFRange {
+        location: isize,
+        length: isize,
+    }
+    const AX_CFRANGE: u32 = 4;
+
+    unsafe extern "C" {
+        fn AXUIElementGetPid(el: CFTypeRef, pid: *mut i32) -> i32;
+        fn AXValueCreate(ty: u32, ptr: *const c_void) -> CFTypeRef;
+    }
+
+    /// The focused element (system-wide) and its handle, for set_selection. None = no AX answer.
+    pub fn focused() -> Option<(Field, CFType)> {
+        let sys = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateSystemWide()) };
+        unsafe { AXUIElementSetMessagingTimeout(sys.as_CFTypeRef(), 0.25) };
+        let el = attr(&sys, "AXFocusedUIElement")?;
+        let s = |a| attr(&el, a).map(|v| text(&v)).unwrap_or_default();
+        let mut f = Field { role: s("AXRole"), ..Default::default() };
+        let subrole = s("AXSubrole");
+        unsafe { AXUIElementGetPid(el.as_CFTypeRef(), &mut f.pid) };
+        f.secure = is_secure(&Node { role: f.role.clone(), subrole, ..Default::default() });
+        f.name = [s("AXTitle"), s("AXDescription"), s("AXPlaceholderValue")].into_iter().find(|t| !t.trim().is_empty()).unwrap_or_default();
+        if f.secure {
+            return Some((f, el));
+        }
+        f.value = attr(&el, "AXValue").and_then(|v| v.downcast::<CFString>()).map(|v| v.to_string());
+        f.selected = attr(&el, "AXSelectedText").and_then(|v| v.downcast::<CFString>()).map(|v| v.to_string());
+        f.sel = attr(&el, "AXSelectedTextRange").and_then(|v| ax_value::<CFRange>(&v, AX_CFRANGE)).map(|r| (r.location.max(0) as usize, r.length.max(0) as usize));
+        f.url = attr(&el, "AXURL").map(|v| url_text(&v)).filter(|u| !u.is_empty());
+        Some((f, el))
+    }
+
+    /// AXSelectedTextRange = (start, len), UTF-16 units. false = refused (the caller tries the next strategy).
+    pub fn set_selection(el: &CFType, start: usize, len: usize) -> bool {
+        let r = CFRange { location: start as isize, length: len as isize };
+        let v = unsafe { AXValueCreate(AX_CFRANGE, &r as *const _ as *const c_void) };
+        if v.is_null() {
+            return false;
+        }
+        let v = unsafe { CFType::wrap_under_create_rule(v) };
+        unsafe { AXUIElementSetAttributeValue(el.as_CFTypeRef(), CFString::new("AXSelectedTextRange").as_concrete_TypeRef(), v.as_CFTypeRef()) == 0 }
     }
 
     /// Keyboard focus on a field (AXFocused = true). false = refused.
     pub fn focus(el: &CFType) -> bool {
         let yes = CFBoolean::true_value();
         unsafe { AXUIElementSetAttributeValue(el.as_CFTypeRef(), CFString::new("AXFocused").as_concrete_TypeRef(), yes.as_CFTypeRef()) == 0 }
+    }
+
+    fn frame_of(el: &CFType) -> Option<PtRect> {
+        let p = attr(el, "AXPosition").and_then(|v| ax_value::<P2>(&v, AX_CGPOINT))?;
+        let z = attr(el, "AXSize").and_then(|v| ax_value::<P2>(&v, AX_CGSIZE))?;
+        Some(PtRect { x: p.a, y: p.b, w: z.a, h: z.b })
+    }
+
+    /// The frame of the AXWebArea of app `pid` under a global point (web.rs: the page viewport in screen points,
+    /// exact with side panels and page zoom). None = another app's window is there, or no web area.
+    pub fn web_area_at(pid: i32, p: (f64, f64)) -> Option<PtRect> {
+        let (mut el, owner) = element_at(p)?;
+        if owner != pid {
+            return None;
+        }
+        // Chromium answers a text node deep in the page: walk up to the web area
+        for _ in 0..60 {
+            if attr(&el, "AXRole").map(|v| text(&v)).as_deref() == Some("AXWebArea") {
+                return frame_of(&el);
+            }
+            el = attr(&el, "AXParent")?;
+        }
+        None
+    }
+
+    /// Opens the menu-bar menu of app `pid` that holds an item titled `item` (web.rs guide: "Developer").
+    /// false = no such menu. Not verified on a real app.
+    pub fn open_menu_with(pid: i32, item: &str) -> bool {
+        let app = unsafe { CFType::wrap_under_create_rule(AXUIElementCreateApplication(pid)) };
+        let kids = |e: &CFType| attr(e, "AXChildren").and_then(|v| array(&v)).map(|a| a.iter().map(|x| x.clone()).collect::<Vec<_>>()).unwrap_or_default();
+        let Some(bar) = attr(&app, "AXMenuBar") else { return false };
+        for top in kids(&bar) {
+            let holds = kids(&top).iter().flat_map(|menu| kids(menu)).any(|i| attr(&i, "AXTitle").map(|v| text(&v)).as_deref() == Some(item));
+            if holds {
+                return press(&top);
+            }
+        }
+        false
     }
 }
 
@@ -381,7 +588,7 @@ pub(crate) mod tests {
                 n("AXGroup", "", (0.0, 0.0, 320.0, 900.0), vec![
                     n("AXLink", "", (64.0, 120.0, 260.0, 26.0), vec![label("# general")]),
                     n("AXLink", "", (64.0, 146.0, 260.0, 26.0), vec![label("# design")]),
-                    // a link inside a row with the same rect: one mark
+                    // a link inside a row with the same rect: one mark, the link (the leaf)
                     n("AXRow", "", (64.0, 172.0, 260.0, 26.0), vec![n("AXLink", "# random", (64.0, 172.0, 260.0, 26.0), vec![])]),
                 ]),
                 desc_only,
@@ -406,7 +613,7 @@ pub(crate) mod tests {
                 "1 Channel details (button, toolbar)",
                 "2 # general (link, sidebar)",
                 "3 # design (link, sidebar)",
-                "4 # random (row, sidebar)",
+                "4 # random (link, sidebar)",
                 "5 Dark mode (switch, main, on)",
                 "6 Message #general (text field, bottom)",
                 "7 Send now (button, bottom)",
@@ -432,6 +639,60 @@ pub(crate) mod tests {
         let els = collect(&n("AXWindow", "", (0.0, 0.0, 1440.0, 900.0), kids), WIN);
         assert_eq!(els.len(), MAX_MARKS);
         assert_eq!(els.last().unwrap().mark.id, 150);
+    }
+
+    /// vc-feedback 24: nested trees as Slack, Gmail and a search page expose them. The leaf is the mark.
+    #[test]
+    fn leaves_not_containers() {
+        let text = |t: &str| Node { role: "AXStaticText".into(), value: t.into(), ..Default::default() };
+        // Slack sidebar: row > group > link "Comercial X" + a hover "Close" button; a row with no leaf stays a row
+        let slack_row = n("AXRow", "", (64.0, 300.0, 260.0, 28.0), vec![n("AXGroup", "", (64.0, 300.0, 260.0, 28.0), vec![
+            n("AXLink", "", (72.0, 302.0, 200.0, 24.0), vec![text("Comercial X")]),
+            n("AXButton", "Close", (290.0, 304.0, 20.0, 20.0), vec![]),
+        ])]);
+        let bare_row = n("AXRow", "", (64.0, 330.0, 260.0, 28.0), vec![text("Pablo (tú)")]);
+        // Gmail: row > checkbox, star, link (subject); a search result: group card > link
+        let gmail = n("AXRow", "", (340.0, 200.0, 1000.0, 40.0), vec![
+            n("AXCheckBox", "Select", (350.0, 210.0, 20.0, 20.0), vec![]),
+            n("AXButton", "Not starred", (380.0, 210.0, 20.0, 20.0), vec![]),
+            n("AXLink", "", (420.0, 205.0, 800.0, 30.0), vec![text("Invoice October")]),
+        ]);
+        let card = n("AXGroup", "", (340.0, 400.0, 700.0, 120.0), vec![n("AXLink", "", (360.0, 410.0, 400.0, 24.0), vec![text("Ultra Miami 2015 - YouTube")])]);
+        let win = n("AXWindow", "", (0.0, 0.0, 1440.0, 900.0), vec![slack_row, bare_row, gmail, card]);
+        let got: Vec<String> = collect(&win, WIN).iter().map(describe).collect();
+        assert_eq!(got, [
+            "Invoice October (link, main)".to_string(),
+            "Select (checkbox, main, off)".into(),
+            "Not starred (button, main)".into(),
+            "Comercial X (link, sidebar)".into(),
+            "Close (button, sidebar)".into(),
+            "Pablo (tú) (row, sidebar)".into(),
+            "Ultra Miami 2015 - YouTube (link, main)".into(),
+        ]);
+    }
+
+    #[test]
+    fn rects_are_cut_to_the_window() {
+        // a row half scrolled out of the top of the window: its visible half is the mark (the click lands there)
+        let w = PtRect { x: 0.0, y: 100.0, w: 800.0, h: 600.0 };
+        let tree = n("AXWindow", "", (0.0, 100.0, 800.0, 600.0), vec![n("AXButton", "Half", (10.0, 80.0, 100.0, 40.0), vec![]), n("AXButton", "Gone", (10.0, 40.0, 100.0, 40.0), vec![])]);
+        let els = collect(&tree, w);
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].mark.rect, PtRect { x: 10.0, y: 100.0, w: 100.0, h: 20.0 });
+    }
+
+    #[test]
+    fn web_area_and_tree_hash() {
+        let page = n("AXWebArea", "", (0.0, 90.0, 1440.0, 810.0), vec![n("AXLink", "Docs", (20.0, 120.0, 60.0, 20.0), vec![])]);
+        let mut tree = n("AXWindow", "Edge", (0.0, 0.0, 1440.0, 900.0), vec![n("AXGroup", "", (0.0, 0.0, 1440.0, 90.0), vec![page.clone()])]);
+        assert_eq!(web_area(&tree), Some(PtRect { x: 0.0, y: 90.0, w: 1440.0, h: 810.0 }));
+        assert_eq!(web_area(&slack()), None);
+        let h = tree_hash(&tree);
+        let mut same = tree.clone();
+        same.children[0].h = 99; // handles are not what the screen shows
+        assert_eq!(tree_hash(&same), h);
+        tree.title = "Docs - Edge".into(); // a navigation renames the window
+        assert_ne!(tree_hash(&tree), h);
     }
 
     #[test]
